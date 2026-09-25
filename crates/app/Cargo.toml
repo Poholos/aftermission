@@ -1,0 +1,31 @@
+[package]
+name = "aftermission"
+description = "Aftermission, a post-mission review tool for ArduPilot dataflash logs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aftermission"
+path = "src/main.rs"
+
+[dependencies]
+dflog.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_plot.workspace = true
+rfd.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
+ron.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

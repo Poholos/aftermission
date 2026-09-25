@@ -1,0 +1,98 @@
+[workspace]
+resolver = "3"
+members = ["crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+authors = ["Ivan Petrouchtchak"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/Poholos/aftermission"
+publish = false
+
+[workspace.dependencies]
+dflog = "0.1.0"
+
+eframe = { version = "0.36", features = ["persistence"] }
+egui = "0.36"
+egui_plot = "0.37"
+egui_kittest = "0.36"
+rfd = "0.17"
+
+serde = { version = "1.0.229", features = ["derive"] }
+ron = "0.12.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+ambiguous_negative_literals = "warn"
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+
+# Panic hygiene: a panic site must carry a written justification. `unwrap`
+# is banned in production code while `expect` (with its reason string)
+# stays allowed; tests keep `unwrap` via clippy.toml.
+unwrap_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+panic_in_result_fn = "deny"
+string_slice = "deny"
+exit = "deny"
+unchecked_time_subtraction = "deny"
+
+# Selected `restriction` lints for consistency and brevity
+allow_attributes_without_reason = "warn"
+as_pointer_underscore = "warn"
+assertions_on_result_states = "warn"
+clone_on_ref_ptr = "warn"
+deref_by_slicing = "warn"
+disallowed_script_idents = "warn"
+empty_drop = "warn"
+empty_enum_variants_with_brackets = "warn"
+empty_structs_with_brackets = "warn"
+fn_to_numeric_cast_any = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+redundant_type_annotations = "warn"
+renamed_function_params = "warn"
+semicolon_outside_block = "warn"
+undocumented_unsafe_blocks = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+unneeded_field_pattern = "warn"
+unused_result_ok = "warn"
+
+# May cause issues with structured logging otherwise.
+literal_string_with_formatting_args = "allow"
+
+# Sample counts, record indices and pixel widths move between integers
+# and floats throughout the plotting code; the conversions are meant.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+
+# Fires on transitive duplicates we cannot fix (the egui/wgpu stack pulls
+# several); deny.toml reports these instead.
+multiple_crate_versions = "allow"
+
+[profile.dev.package."*"]
+# The egui and wgpu stack is unusably slow unoptimized; our own crate stays
+# at opt-level 0.
+opt-level = 2

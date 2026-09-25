@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Aftermission third-party notices</title>
+    <style>
+        @media (prefers-color-scheme: dark) {
+            body {
+                background: #333;
+                color: white;
+            }
+            a {
+                color: skyblue;
+            }
+        }
+        .container {
+            font-family: sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .intro {
+            text-align: center;
+        }
+        .licenses-list {
+            list-style-type: none;
+            margin: 0;
+            padding: 0;
+        }
+        .license-used-by {
+            margin-top: -10px;
+        }
+        .license-text {
+            max-height: 200px;
+            overflow-y: scroll;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+
+<body>
+    <main class="container">
+        <div class="intro">
+            <h1>Third-party notices</h1>
+            <p>The Aftermission web bundle links the open-source components below, each under its own license. Their copyright notices and license texts follow.</p>
+        </div>
+
+        <h2>Licenses</h2>
+        <ul class="licenses-overview">
+            {{#each overview}}
+            <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+            {{/each}}
+        </ul>
+
+        <h2>Components and license texts</h2>
+        <ul class="licenses-list">
+            {{#each licenses}}
+            <li class="license">
+                <h3 id="{{id}}">{{name}}</h3>
+                <h4>Used by:</h4>
+                <ul class="license-used-by">
+                    {{#each used_by}}
+                    <li><a href="{{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}">{{crate.name}} {{crate.version}}</a></li>
+                    {{/each}}
+                </ul>
+                <pre class="license-text">{{text}}</pre>
+            </li>
+            {{/each}}
+        </ul>
+
+        <h2>Fonts served with the bundle</h2>
+        <p>These are not linked into the bundle: the viewer fetches one when a
+            name needs a script the bundled faces do not draw, and a reader who
+            opens none never receives them. Each is cut from a Noto original to
+            the repertoires DICOM can carry, and each is under the
+            <a href="#OFL-1.1">SIL Open Font License 1.1</a> above, with its own
+            copyright and a copy of the license in its name table.</p>
+        <ul class="licenses-list">
+            <li>Noto Sans Hebrew 3.001, Copyright 2024 The Noto Project Authors
+                (<a href="https://github.com/notofonts/hebrew">github.com/notofonts/hebrew</a>)</li>
+            <li>Noto Sans Arabic 2.013, Copyright 2022 The Noto Project Authors
+                (<a href="https://github.com/notofonts/arabic">github.com/notofonts/arabic</a>)</li>
+            <li>Noto Sans Thai 2.002, Copyright 2022 The Noto Project Authors
+                (<a href="https://github.com/notofonts/thai">github.com/notofonts/thai</a>)</li>
+            <li>Noto Sans CJK JP 2.004 and Noto Sans CJK KR 2.004, Copyright
+                2014-2021 Adobe (<a href="https://www.adobe.com/">adobe.com</a>)</li>
+        </ul>
+    </main>
+</body>
+
+</html>

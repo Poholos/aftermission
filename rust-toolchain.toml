@@ -1,0 +1,5 @@
+# Every machine builds with this exact compiler so artifacts differ by
+# target, not toolchain. Bump deliberately, not as a side effect.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

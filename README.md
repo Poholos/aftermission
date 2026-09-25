@@ -1,0 +1,72 @@
+# Aftermission
+
+Post-mission review of ArduPilot dataflash (`.bin`) logs: a desktop tool
+written in Rust on [egui](https://github.com/emilk/egui), reading logs
+through [dflog](https://github.com/Poholos/dflog). It is for looking at
+what a vehicle did after the flight, drive or dive: plotting any field of
+any message against time, over the flight modes, with the values under
+the cursor read out.
+
+The tool is early. What works today:
+
+- **Opening a log** by drag and drop, the file dialog (Ctrl+O) or a path on
+  the command line. The file is mapped and indexed on a worker thread, so
+  the window stays live; the last eight logs are kept under File > Open
+  recent.
+- **The side panel** lists every message type in the log with its record
+  count, and unfolds each to its fields, labeled with the units the log's
+  own `UNIT`, `MULT` and `FMTU` records give them (`Roll (deg)`,
+  `GyrX (rad/s)`). A type logged in several instances, such as `IMU` on a
+  board with three, unfolds to `IMU[0]`, `IMU[1]` and so on, each with its
+  own fields. A filter box narrows the list by type or field name.
+- **The plot** draws any number of fields at once. Each series sits on the
+  left or the right axis, chosen from its chip above the plot; the right
+  axis is scaled to the series on it and labeled in their values. Drag or
+  scroll to pan, Ctrl+scroll or pinch to zoom, right-drag a box to zoom
+  into it, double-click to see the whole flight again. Long series are
+  thinned to the pixels on screen, keeping every spike. A legend names the
+  series, and the readout under the plot gives every series' value at the
+  cursor.
+- **Time** reads in seconds since boot, or in UTC through the first GPS fix
+  (View > Time axis). Fields are converted to their unit where the log
+  says how, so `TimeUS` plots in seconds.
+- **Flight modes** from the `MODE` records show as colored bands behind
+  the plot, named per vehicle (Copter, Plane, Rover, Sub, AntennaTracker
+  and Blimp mode tables), the vehicle read from the firmware banner.
+- **Preferences** persist: theme, time axis, mode bands, side panel and the
+  recent files.
+
+A plot set up on one log carries over when another opens: series the new
+log also has are re-read, the rest are dropped.
+
+Planned next: a map of the GPS track with the cursor synced to the plot,
+an events list (`MSG`, `ERR`, `EV`, mode changes), the parameter table, CSV
+and Parquet export, and a browser build.
+
+## Building and running
+
+The toolchain is pinned in `rust-toolchain.toml`.
+
+```bash
+cargo run --release -- path/to/flight.bin
+```
+
+On Linux, eframe and the file dialog need the GTK and X11/Wayland
+development libraries; the CI workflow lists the Debian packages.
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo deny check
+```
+
+The tests build their logs with dflog's writer, so no flight data is in the
+repository.
+
+## License
+
+Aftermission is licensed under the GNU Affero General Public License,
+version 3.0 only, and is also available under a commercial license; see
+[LICENSING.md](LICENSING.md). The dflog parser it is built on is a separate
+project under `MIT OR Apache-2.0`.
