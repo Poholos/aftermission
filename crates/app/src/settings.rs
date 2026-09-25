@@ -1,5 +1,5 @@
-//! Preferences that survive a restart: theme, time axis, mode bands, the
-//! side panel fold and recent files. Stored through eframe's key-value
+//! Preferences that survive a restart: theme, time axis, mode bands, which
+//! panels are open, map tiles and recent files. Stored through eframe's key-value
 //! storage, a file next to the app's config on native.
 
 use std::path::{Path, PathBuf};
@@ -22,6 +22,10 @@ pub enum TimeAxis {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent toggles, each a setting in its own right"
+)]
 pub struct Settings {
     /// Dark unless the user asks otherwise: plots read better on a dark
     /// ground, whatever the desktop is set to.
@@ -31,6 +35,11 @@ pub struct Settings {
     pub show_modes: bool,
     /// The side panel unfolded.
     pub side_panel: bool,
+    pub show_map: bool,
+    pub show_events: bool,
+    /// Map tiles downloaded from OpenStreetMap; off, the track draws on a
+    /// plain background and nothing leaves the machine.
+    pub online_tiles: bool,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
 }
@@ -42,6 +51,9 @@ impl Default for Settings {
             time_axis: TimeAxis::default(),
             show_modes: true,
             side_panel: true,
+            show_map: true,
+            show_events: true,
+            online_tiles: true,
             recent: Vec::new(),
         }
     }
@@ -93,6 +105,7 @@ mod tests {
         assert_eq!(partial.theme, ThemePreference::Dark);
         assert_eq!(partial.time_axis, TimeAxis::Boot);
         assert!(partial.show_modes);
+        assert!(partial.show_map && partial.show_events && partial.online_tiles);
         assert!(partial.recent.is_empty());
     }
 

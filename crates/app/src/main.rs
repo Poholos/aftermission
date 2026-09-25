@@ -2,6 +2,9 @@
 //! dflog and egui.
 
 mod app;
+mod codes;
+mod events;
+mod map;
 mod model;
 mod modes;
 mod plot;
@@ -9,6 +12,9 @@ mod settings;
 mod timefmt;
 mod tree;
 mod worker;
+
+/// The id eframe files settings under, and the map its tile cache beside.
+pub const APP_ID: &str = "aftermission";
 
 /// Log filter when `RUST_LOG` is unset.
 const DEFAULT_LOG: &str = "aftermission=info,wgpu_core=warn,wgpu_hal=error,naga=warn";
@@ -35,7 +41,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native(
-        "aftermission",
+        APP_ID,
         options,
         Box::new(move |cc| Ok(Box::new(app::AftermissionApp::new(cc, initial)))),
     )

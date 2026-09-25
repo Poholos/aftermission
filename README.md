@@ -2,10 +2,11 @@
 
 Post-mission review of ArduPilot dataflash (`.bin`) logs: a desktop tool
 written in Rust on [egui](https://github.com/emilk/egui), reading logs
-through [dflog](https://github.com/Poholos/dflog). It is for looking at
-what a vehicle did after the flight, drive or dive: plotting any field of
-any message against time, over the flight modes, with the values under
-the cursor read out.
+through [dflog](https://github.com/Poholos/dflog) and drawing the map
+with [walkers](https://github.com/podusowski/walkers). It is for looking
+at what a vehicle did after the flight, drive or dive: plotting any field
+of any message against time, over the flight modes, with the values under
+the cursor read out, the track on a map and the log's events in a list.
 
 The tool is early. What works today:
 
@@ -33,15 +34,26 @@ The tool is early. What works today:
 - **Flight modes** from the `MODE` records show as colored bands behind
   the plot, named per vehicle (Copter, Plane, Rover, Sub, AntennaTracker
   and Blimp mode tables), the vehicle read from the firmware banner.
-- **Preferences** persist: theme, time axis, mode bands, side panel and the
-  recent files.
+- **The map** draws the vehicle's track from the EKF's `POS` records, or
+  from `GPS` when a log has none, over OpenStreetMap tiles, with the
+  plot's cursor marked on it. Hovering the track reads a point's time and
+  altitude; a click seeks the plot to it. The tiles come from
+  `tile.openstreetmap.org` under its [usage
+  policy](https://operations.osmfoundation.org/policies/tiles/), cached on
+  disk next to the settings; View > Map tiles turns them off, and the
+  track then draws on a plain background with nothing downloaded.
+- **Events**: the `MSG` texts, the `ERR` faults and `EV` events named per
+  ArduPilot's tables, and the mode changes, in one list in time order with
+  a toggle per kind and a filter. A click on a row seeks the plot and the
+  map to its time; the row the cursor has passed is highlighted.
+- **Preferences** persist: theme, time axis, mode bands, which panels are
+  open, map tiles and the recent files.
 
 A plot set up on one log carries over when another opens: series the new
 log also has are re-read, the rest are dropped.
 
-Planned next: a map of the GPS track with the cursor synced to the plot,
-an events list (`MSG`, `ERR`, `EV`, mode changes), the parameter table, CSV
-and Parquet export, and a browser build.
+Planned next: the parameter table, CSV and Parquet export, and a browser
+build.
 
 ## Building and running
 

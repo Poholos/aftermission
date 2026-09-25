@@ -10,8 +10,8 @@ use egui_plot::{
     Span, VLine,
 };
 
-use crate::model::{LoadedLog, ModeChange, Series, SeriesKey};
-use crate::settings::{Settings, TimeAxis};
+use crate::model::{LoadedLog, ModeChange, Series, SeriesKey, extent, nearest_index};
+use crate::settings::Settings;
 use crate::timefmt;
 
 /// Which vertical axis a series reads against.
@@ -61,13 +61,6 @@ impl Selected {
     }
 }
 
-/// The lowest and highest of `values`, which are finite.
-fn extent(values: &[f64]) -> Option<(f64, f64)> {
-    values.iter().fold(None, |range: Option<(f64, f64)>, &y| {
-        Some(range.map_or((y, y), |(a, b)| (a.min(y), b.max(y))))
-    })
-}
-
 /// One series' sample nearest the cursor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Readout {
@@ -97,6 +90,8 @@ pub struct PlotPanel {
     /// The series hidden through the legend, by the id their line carries,
     /// as of the last frame; they stay out of the readout.
     hidden: Vec<Id>,
+    /// A time to bring into view on the next frame.
+    pending_seek: Option<f64>,
 }
 
 /// The plot's id, fixed so its memory can be read back.
@@ -168,6 +163,14 @@ impl PlotPanel {
         self.selected.clear();
         self.readout.clear();
         self.cursor = None;
+    }
+
+    /// Put the cursor at `time`, panning the view there when it is off
+    /// screen: what a click in the events list or on the map does.
+    pub fn seek(&mut self, time: f64) {
+        self.cursor = Some(time);
+        self.pending_seek = Some(time);
+        self.refresh_readout();
     }
 
     /// Re-extract every series from a newly opened log, dropping those it
@@ -244,10 +247,7 @@ impl PlotPanel {
 
     fn plot(&mut self, ui: &mut egui::Ui, log: &LoadedLog, settings: &Settings, height: f32) {
         let map = AxisMap::new(&self.selected);
-        let time_base = match settings.time_axis {
-            TimeAxis::Utc => log.time_base,
-            TimeAxis::Boot => None,
-        };
+        let time_base = log.wall_clock(settings.time_axis);
         let x_formatter = move |mark: GridMark, _: &RangeInclusive<f64>| match time_base {
             Some(base) => {
                 timefmt::utc_time(base.wall_clock_unix_ms(mark.value * 1000.0), mark.step_size)
@@ -255,10 +255,17 @@ impl PlotPanel {
             None => timefmt::boot_time(mark.value, mark.step_size),
         };
 
-        // A series hidden through the legend leaves the readout too.
-        let mut hidden: Vec<Id> = PlotMemory::load(ui.ctx(), Id::new(PLOT_ID))
-            .map(|memory| memory.hidden_items.into_iter().collect())
-            .unwrap_or_default();
+        // A series hidden through the legend leaves the readout too. A
+        // reset rebuilds the plot's memory with nothing hidden, so on that
+        // frame the stored set no longer holds.
+        let reset = std::mem::take(&mut self.reset_view);
+        let mut hidden: Vec<Id> = if reset {
+            Vec::new()
+        } else {
+            PlotMemory::load(ui.ctx(), Id::new(PLOT_ID))
+                .map(|memory| memory.hidden_items.into_iter().collect())
+                .unwrap_or_default()
+        };
         // sorted, so the same set always compares equal
         hidden.sort_unstable_by_key(Id::value);
         if hidden != self.hidden {
@@ -274,7 +281,7 @@ impl PlotPanel {
             .legend(Legend::default().position(Corner::LeftTop))
             .x_axis_formatter(x_formatter)
             .allow_boxed_zoom(true);
-        if std::mem::take(&mut self.reset_view) {
+        if reset {
             plot = plot.reset();
         }
         if let Some(map) = map.filter(|m| m.two_sided) {
@@ -291,20 +298,32 @@ impl PlotPanel {
         let selected = &self.selected;
         let hidden = &self.hidden;
         let last_cursor = self.cursor;
+        let seek = self.pending_seek.take();
         let show_modes = settings.show_modes;
         let response = plot.show(ui, |plot_ui| {
             let bounds = plot_ui.plot_bounds();
+            // A seek to a time off screen pans the view there, keeping its
+            // width; a view showing the whole log already has it. The pan
+            // takes effect after this closure, so what is drawn here follows
+            // the new window rather than last frame's.
+            let mut visible = bounds.range_x();
+            if let Some(time) = seek.filter(|t| !plot_ui.auto_bounds().x && !visible.contains(t)) {
+                let half = bounds.width() / 2.0;
+                visible = time - half..=time + half;
+                plot_ui.set_plot_bounds_x(visible.clone());
+            }
             // With the bounds following the data, every point counts, so a
             // reset zooms back out to the whole flight.
-            let x_range = if plot_ui.auto_bounds().x {
-                full_range(selected).unwrap_or_else(|| bounds.range_x())
-            } else {
-                bounds.range_x()
+            let auto_x = plot_ui.auto_bounds().x;
+            let data_range = full_range(selected, hidden);
+            let x_range = match (auto_x, &data_range) {
+                (true, Some(range)) => range.clone(),
+                _ => visible.clone(),
             };
             let width = plot_ui.transform().frame().width();
 
             if show_modes {
-                mode_bands(plot_ui, log, &bounds.range_x());
+                mode_bands(plot_ui, log, &visible);
             }
             for s in selected {
                 let to_plot = |y: f64| match (s.axis, map) {
@@ -320,12 +339,17 @@ impl PlotPanel {
             }
 
             // The cursor line marks the pointer, or where it last was, so it
-            // agrees with the readout kept underneath.
+            // agrees with the readout kept underneath. As a plot item it
+            // sits under the legend, and it is left out where it would
+            // stretch a view that follows the data.
             let pointer = plot_ui
                 .pointer_coordinate()
                 .filter(|_| plot_ui.response().hovered())
                 .map(|p| p.x);
-            if let Some(x) = pointer.or(last_cursor) {
+            if let Some(x) = pointer
+                .or(last_cursor)
+                .filter(|&x| cursor_fits(x, auto_x, data_range.as_ref()))
+            {
                 plot_ui.vline(VLine::new("", x).color(Color32::from_gray(160)).width(1.0));
             }
             pointer.map(|x| (x, readout_at(selected, x, hidden)))
@@ -353,14 +377,7 @@ impl PlotPanel {
                 );
                 return;
             };
-            let time = match (settings.time_axis, log.time_base) {
-                (TimeAxis::Utc, Some(base)) => {
-                    let ms = base.wall_clock_unix_ms(cursor * 1000.0);
-                    format!("{} {}", timefmt::utc_date(ms), timefmt::utc_time(ms, 0.001))
-                }
-                _ => timefmt::boot_time(cursor, 0.001),
-            };
-            ui.monospace(time);
+            ui.monospace(timefmt::stamp(log.wall_clock(settings.time_axis), cursor));
             for r in &self.readout {
                 ui.colored_label(r.color, "\u{25A0}");
                 ui.label(format!(
@@ -417,10 +434,15 @@ fn title(log: &LoadedLog, key: &SeriesKey) -> String {
     }
 }
 
-/// The earliest to the latest sample over every series.
-fn full_range(selected: &[Selected]) -> Option<RangeInclusive<f64>> {
+/// The earliest to the latest sample over the series shown, those whose
+/// line ids are in `hidden` left out, as the plot leaves them out of the
+/// bounds it fits.
+fn full_range(selected: &[Selected], hidden: &[Id]) -> Option<RangeInclusive<f64>> {
     let mut range: Option<(f64, f64)> = None;
-    for s in selected {
+    for s in selected
+        .iter()
+        .filter(|s| !hidden.contains(&line_id(&s.key)))
+    {
         if let (Some(&first), Some(&last)) = (s.data.xs.first(), s.data.xs.last()) {
             range = Some(range.map_or((first, last), |(a, b)| (a.min(first), b.max(last))));
         }
@@ -540,23 +562,7 @@ pub fn decimate(
 
 /// The sample of `series` nearest in time to `x`.
 fn nearest(series: &Series, x: f64) -> Option<(f64, f64)> {
-    if series.xs.is_empty() {
-        return None;
-    }
-    let after = series.xs.partition_point(|t| *t < x);
-    let candidates = [
-        after.checked_sub(1),
-        (after < series.xs.len()).then_some(after),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
-        .min_by(|&a, &b| {
-            let da = (series.xs[a] - x).abs();
-            let db = (series.xs[b] - x).abs();
-            da.total_cmp(&db)
-        })
-        .map(|i| (series.xs[i], series.ys[i]))
+    nearest_index(&series.xs, x).map(|i| (series.xs[i], series.ys[i]))
 }
 
 /// A hue per mode number, spread so neighboring numbers differ.
@@ -597,6 +603,14 @@ fn mode_bands(plot_ui: &mut egui_plot::PlotUi<'_>, log: &LoadedLog, visible: &Ra
             Span::new("", mode.time..=end).fill(mode_color(mode.number).gamma_multiply(0.14)),
         );
     }
+}
+
+/// Whether a cursor line at `x` can be a plot item: always when the view
+/// is set by hand, since items then leave the bounds alone; within the
+/// data when the bounds follow it, since a line outside would widen the
+/// view to reach it, and keep it wide.
+fn cursor_fits(x: f64, auto_x: bool, data: Option<&RangeInclusive<f64>>) -> bool {
+    !auto_x || data.is_some_and(|range| range.contains(&x))
 }
 
 /// Each visible band's mode name at its top left, a band that starts off
@@ -855,6 +869,13 @@ mod tests {
         let shown = readout_at(&both, 0.21, &[line_id(&key("b"))]);
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].title, "a");
+        // and from the range the cursor line is kept within
+        assert_eq!(full_range(&both, &[]), Some(0.0..=1.0));
+        assert_eq!(full_range(&both, &[line_id(&key("b"))]), Some(0.0..=0.3));
+        assert_eq!(
+            full_range(&both, &[line_id(&key("a")), line_id(&key("b"))]),
+            None
+        );
 
         // removing a series refreshes the readout at the same cursor
         let mut plot = PlotPanel {
@@ -878,6 +899,67 @@ mod tests {
         plot.remove(0);
         assert!(plot.readout.is_empty());
         assert_eq!(plot.cursor, Some(0.21), "the cursor stays");
+
+        // a seek moves the cursor and reads out there
+        plot.selected.extend(both);
+        plot.seek(1.0);
+        assert_eq!(plot.cursor, Some(1.0));
+        assert_eq!(plot.pending_seek, Some(1.0));
+        assert_eq!(plot.readout.len(), 2);
+        assert_eq!((plot.readout[1].time, plot.readout[1].value), (1.0, 20.0));
+    }
+
+    #[test]
+    fn the_cursor_line_never_widens_a_view_that_follows_the_data() {
+        let data = 2.0..=5.0;
+        assert!(cursor_fits(3.0, true, Some(&data)));
+        assert!(cursor_fits(2.0, true, Some(&data)));
+        assert!(
+            !cursor_fits(0.3, true, Some(&data)),
+            "before the first sample"
+        );
+        assert!(!cursor_fits(9.0, true, Some(&data)));
+        assert!(!cursor_fits(3.0, true, None), "nothing plotted");
+        assert!(cursor_fits(0.3, false, Some(&data)), "a view set by hand");
+        assert!(cursor_fits(0.3, false, None));
+    }
+
+    /// A series hidden through the legend is shown again when a new log
+    /// resets the plot, from the reset frame on.
+    #[test]
+    fn a_reset_frame_reads_nothing_as_hidden() {
+        let log = LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::bytes()),
+            "test.bin".into(),
+        );
+        let settings = Settings::default();
+        let roll = SeriesKey {
+            type_name: "ATT".into(),
+            field: "Roll".into(),
+            instance: None,
+        };
+        let mut plot = PlotPanel::default();
+        plot.toggle(roll.clone(), &log);
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, plot: &mut PlotPanel| plot.show(ui, &log, &settings),
+            plot,
+        );
+        harness.run();
+
+        // hide the series as a click on its legend entry would
+        let id = Id::new(PLOT_ID);
+        let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        memory.hidden_items.insert(line_id(&roll));
+        memory.store(&harness.ctx, id);
+        harness.step();
+        assert_eq!(harness.state().hidden, [line_id(&roll)]);
+
+        harness.state_mut().reload(&log);
+        harness.step();
+        assert!(harness.state().hidden.is_empty(), "shown from the reset on");
+        assert!(!harness.state().resets_view());
+        harness.step();
+        assert!(harness.state().hidden.is_empty(), "and after it");
     }
 
     #[test]

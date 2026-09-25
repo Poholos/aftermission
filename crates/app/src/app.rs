@@ -1,10 +1,12 @@
 //! The application: menus, the side panel with the log's types, the plot,
-//! and the ways a log gets opened.
+//! the map and the events list, and the ways a log gets opened.
 
 use std::path::{Path, PathBuf};
 
 use egui::{Align2, Color32, Context};
 
+use crate::events::EventsPanel;
+use crate::map::MapPanel;
 use crate::model::LoadedLog;
 use crate::plot::PlotPanel;
 use crate::settings::{Settings, TimeAxis};
@@ -21,6 +23,8 @@ pub struct AftermissionApp {
     /// Why the last open failed, until the next one starts.
     error: Option<String>,
     plot: PlotPanel,
+    map: MapPanel,
+    events: EventsPanel,
     /// The side panel's type and field filter.
     filter: String,
     /// Whether the filter was in use last frame: the headers it unfolded
@@ -81,6 +85,7 @@ impl AftermissionApp {
                 // only a log that opened is worth offering again
                 self.settings.remember(&path);
                 self.plot.reload(&log);
+                self.map.reload();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
                     "{} - Aftermission",
                     log.name
@@ -205,6 +210,13 @@ impl AftermissionApp {
             });
             ui.checkbox(&mut self.settings.show_modes, "Mode bands");
             ui.checkbox(&mut self.settings.side_panel, "Side panel");
+            ui.checkbox(&mut self.settings.show_map, "Map");
+            ui.checkbox(&mut self.settings.show_events, "Events");
+            ui.checkbox(
+                &mut self.settings.online_tiles,
+                "Map tiles from OpenStreetMap",
+            )
+            .on_hover_text("Off, the track draws on a plain background and nothing is downloaded");
             ui.separator();
             if ui.button("Clear plot").clicked() {
                 ui.close();
@@ -278,6 +290,30 @@ impl AftermissionApp {
             });
             return;
         };
+        // The map to the right and the events below share the width and
+        // height with the plot, which takes what is left.
+        if self.settings.show_map {
+            egui::Panel::right("map_panel")
+                .default_size(420.0)
+                .show(ui, |ui| {
+                    let cursor = self.plot.cursor;
+                    let clock = log.wall_clock(self.settings.time_axis);
+                    let online = self.settings.online_tiles;
+                    if let Some(time) = self.map.show(ui, log, cursor, clock, online) {
+                        self.plot.seek(time);
+                    }
+                });
+        }
+        if self.settings.show_events {
+            egui::Panel::bottom("events_panel")
+                .default_size(180.0)
+                .show(ui, |ui| {
+                    let cursor = self.plot.cursor;
+                    if let Some(time) = self.events.show(ui, log, &self.settings, cursor) {
+                        self.plot.seek(time);
+                    }
+                });
+        }
         self.plot.show(ui, log, &self.settings);
     }
 
@@ -335,6 +371,8 @@ mod tests {
         let path = dir.join("flight.bin");
         std::fs::write(&path, crate::model::testlog::bytes()).unwrap();
         let mut app = AftermissionApp::default();
+        // tests draw the map without downloading anything
+        app.settings.online_tiles = false;
         let ctx = Context::default();
         app.open_path(&path, &ctx);
         assert!(app.job.is_some(), "the open runs in the background");
@@ -348,9 +386,12 @@ mod tests {
         app
     }
 
-    /// Run a frame of the app and look at it.
+    /// Run a frame of the app in a window with room for every panel, and
+    /// look at it.
     fn with_ui(app: &mut AftermissionApp, check: impl FnOnce(&mut Harness<'_>)) {
-        let mut harness = Harness::new_ui(|ui| app.show(ui));
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui(|ui| app.show(ui));
         harness.run();
         check(&mut harness);
     }
@@ -401,6 +442,33 @@ mod tests {
         });
         assert_eq!(app.plot().selected.len(), 2);
         assert_eq!(app.plot().selected[1].key.label(), "IMU[1].GyrX");
+    }
+
+    #[test]
+    fn the_map_shows_the_track_and_a_clicked_event_seeks_the_plot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Track from POS (3 points)");
+            harness.get_by_label_contains("MSG  ArduCopter V4.7.0");
+            harness.get_by_label_contains("ERR  Compass: resolved");
+            harness.get_by_label_contains("MODE Loiter").click();
+            harness.run();
+        });
+        assert_eq!(app.plot().cursor, Some(2.25));
+        assert!(app.plot().readout.is_empty(), "nothing plotted yet");
+
+        // the panels can be turned off
+        app.settings.show_map = false;
+        app.settings.show_events = false;
+        with_ui(&mut app, |harness| {
+            assert!(
+                harness
+                    .query_by_label("Track from POS (3 points)")
+                    .is_none()
+            );
+            assert!(harness.query_by_label_contains("MODE Loiter").is_none());
+        });
     }
 
     #[test]

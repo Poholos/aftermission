@@ -25,6 +25,10 @@ allow = [
     # font, which does not affect bundling it unchanged.
     "OFL-1.1",
     "Ubuntu-font-1.0",
+    # Mozilla's root certificate store as data (webpki-root-certs), behind
+    # the TLS verifier of the map's tile downloads (walkers -> reqwest ->
+    # rustls-platform-verifier). A permissive data license.
+    "CDLA-Permissive-2.0",
 ]
 # Our own crate is unpublished and carries the workspace license.
 private = { ignore = true }

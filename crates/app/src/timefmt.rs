@@ -1,6 +1,8 @@
 //! Time axis labels: board time as a clock reading since boot, and wall
 //! clock time in UTC once the log's GPS records give a base for it.
 
+use dflog::time::TimeBase;
+
 /// Decimal places that write marks `step` apart exactly: none for a step
 /// of a second or more, otherwise the fewest that make the step a whole
 /// number of the last place, up to six.
@@ -74,6 +76,19 @@ pub fn utc_time(unix_ms: f64, step_seconds: f64) -> String {
     format!("{hours:02}:{minutes:02}:{secs:0width$.places$}")
 }
 
+/// A moment at millisecond resolution: the UTC date and time through
+/// `base`, or the boot clock without one.
+#[must_use]
+pub fn stamp(base: Option<TimeBase>, seconds: f64) -> String {
+    match base {
+        Some(base) => {
+            let ms = base.wall_clock_unix_ms(seconds * 1000.0);
+            format!("{} {}", utc_date(ms), utc_time(ms, 0.001))
+        }
+        None => boot_time(seconds, 0.001),
+    }
+}
+
 /// Unix milliseconds as a UTC calendar date, `YYYY-MM-DD`.
 #[must_use]
 pub fn utc_date(unix_ms: f64) -> String {
@@ -137,6 +152,14 @@ mod tests {
         // the last instant of a day rounds into the next one
         assert_eq!(utc_time(86_399_999.6, 1.0), "00:00:00");
         assert_eq!(utc_time(ms + 59_999.6, 0.001), "22:14:20.000");
+
+        // a stamp reads through the base when there is one
+        assert_eq!(stamp(None, 65.25), "1:05.250");
+        let base = TimeBase {
+            gps_start_unix_ms: 1_700_000_000_000,
+            ms_offset: 60_000,
+        };
+        assert_eq!(stamp(Some(base), 65.25), "2023-11-14 22:13:25.250");
     }
 
     #[test]

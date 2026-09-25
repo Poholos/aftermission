@@ -1,13 +1,16 @@
 //! A scanned log as the review tool sees it: message types with their
 //! fields, units and instances, a time for every record, the flight mode
-//! changes and the wall-clock base. Built once, off the UI thread, from a
-//! [`dflog::Log`]; series are extracted from it on demand.
+//! changes, the wall-clock base, the vehicle's track and its events. Built
+//! once, off the UI thread, from a [`dflog::Log`]; series are extracted
+//! from it on demand.
 
 use dflog::columns::{self, ColumnError};
 use dflog::time::TimeBase;
 use dflog::{FmtDef, Log, ScanStats};
 
+use crate::codes;
 use crate::modes::Vehicle;
+use crate::settings::TimeAxis;
 
 /// One field of a message type, with the units metadata the log carries
 /// for it.
@@ -130,6 +133,95 @@ pub struct Series {
     pub ys: Vec<f64>,
 }
 
+/// Where the vehicle was, from the EKF's `POS` records, or from `GPS`
+/// when a log has none; empty when it has neither.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Track {
+    /// Seconds since boot, in log order.
+    pub times: Vec<f64>,
+    /// Degrees.
+    pub lats: Vec<f64>,
+    /// Degrees.
+    pub lons: Vec<f64>,
+    /// Meters above sea level; NaN where the record had none.
+    pub alts: Vec<f64>,
+    /// The type the track was read from: `POS` or `GPS`.
+    pub source: &'static str,
+    /// The edges, found once; None for an empty track.
+    pub bounds: Option<Bounds>,
+}
+
+/// The edges of a track, in degrees.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bounds {
+    pub south: f64,
+    pub west: f64,
+    pub north: f64,
+    pub east: f64,
+}
+
+impl Track {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.times.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.times.len()
+    }
+
+    /// The point nearest in time to `time`.
+    #[must_use]
+    pub fn nearest(&self, time: f64) -> Option<usize> {
+        nearest_index(&self.times, time)
+    }
+
+    /// The edges of the track; None when it is empty.
+    #[must_use]
+    pub fn bounds(&self) -> Option<Bounds> {
+        self.bounds
+    }
+}
+
+/// What kind of record an event came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// A `MSG` text from the firmware.
+    Message,
+    /// An `ERR` record: a subsystem reporting a fault, or its end.
+    Error,
+    /// An `EV` record: something the vehicle did.
+    Event,
+    /// A flight mode change.
+    Mode,
+}
+
+/// One line of the events list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Event {
+    /// Seconds since boot.
+    pub time: f64,
+    pub kind: EventKind,
+    pub text: String,
+}
+
+/// The rows of some fields of one type, each with its time.
+struct TimedColumns {
+    /// Seconds since boot, one per row.
+    times: Vec<f64>,
+    /// Field by field, `rows` values each.
+    values: Vec<f64>,
+    rows: usize,
+}
+
+impl TimedColumns {
+    /// The values of the `index`th field asked for.
+    fn column(&self, index: usize) -> &[f64] {
+        &self.values[index * self.rows..(index + 1) * self.rows]
+    }
+}
+
 /// A scanned log with everything the panels show derived from it.
 #[derive(Debug)]
 pub struct LoadedLog {
@@ -147,6 +239,9 @@ pub struct LoadedLog {
     pub modes: Vec<ModeChange>,
     pub vehicle: Vehicle,
     pub stats: ScanStats,
+    pub track: Track,
+    /// In time order.
+    pub events: Vec<Event>,
 }
 
 impl LoadedLog {
@@ -214,9 +309,9 @@ impl LoadedLog {
             .records_of(&["MSG"])
             .find_map(|record| Vehicle::from_banner(record.value("Message")?.as_str()?))
             .unwrap_or_default();
-        let modes = mode_changes(&log, &types, &timeline, vehicle);
+        let modes = mode_changes(&log, &timeline, vehicle);
 
-        LoadedLog {
+        let mut loaded = LoadedLog {
             name,
             types,
             timeline,
@@ -225,7 +320,12 @@ impl LoadedLog {
             vehicle,
             stats: log.stats,
             log,
-        }
+            track: Track::default(),
+            events: Vec::new(),
+        };
+        loaded.track = track(&loaded);
+        loaded.events = events(&loaded);
+        loaded
     }
 
     #[must_use]
@@ -237,6 +337,16 @@ impl LoadedLog {
     #[must_use]
     pub fn records(&self) -> usize {
         self.log.index.len()
+    }
+
+    /// The base the time axis reads through: the GPS one when UTC is
+    /// chosen and the log has it, none for the boot clock.
+    #[must_use]
+    pub fn wall_clock(&self, axis: TimeAxis) -> Option<TimeBase> {
+        match axis {
+            TimeAxis::Utc => self.time_base,
+            TimeAxis::Boot => None,
+        }
     }
 
     /// Seconds from the first record's time to the last one's; None for a
@@ -281,33 +391,78 @@ impl LoadedLog {
             return Err(format!("{}.{} is text, not a number", t.name, key.field));
         }
         let factor = field.multiplier.unwrap_or(1.0);
-        let describe = |e: ColumnError| format!("{}: {e}", key.label());
-
-        let (xs, ys): (Vec<f64>, Vec<f64>) = if let Some(time) = t.time {
-            let column = columns::get_columns_filtered(
-                &self.log,
-                &t.name,
-                &[time.label, &key.field],
-                key.instance,
-            )
-            .map_err(describe)?;
-            let rows = column.rows as usize;
-            let times = column.values[..rows].iter().map(|t| t * time.scale);
-            let values = column.values[rows..2 * rows].iter().map(|v| v * factor);
-            times.zip(values).filter(finite).unzip()
-        } else {
-            let column =
-                columns::get_columns_filtered(&self.log, &t.name, &[&key.field], key.instance)
-                    .map_err(describe)?;
-            let times = column
-                .linenos
-                .iter()
-                .map(|&lineno| self.timeline[lineno as usize]);
-            let values = column.values.iter().map(|v| v * factor);
-            times.zip(values).filter(finite).unzip()
-        };
+        let cols = self
+            .timed_columns(t, &[&key.field], key.instance)
+            .map_err(|e| format!("{}: {e}", key.label()))?;
+        let values = cols.column(0).iter().map(|v| v * factor);
+        let (xs, ys) = cols
+            .times
+            .iter()
+            .copied()
+            .zip(values)
+            .filter(finite)
+            .unzip();
         Ok(Series { xs, ys })
     }
+
+    /// The rows of `fields` of type `t`, of one instance when given, each
+    /// row with its time in seconds since boot: from the type's own time
+    /// field, or from the timeline for a type without one.
+    fn timed_columns(
+        &self,
+        t: &MessageType,
+        fields: &[&str],
+        instance: Option<i64>,
+    ) -> Result<TimedColumns, ColumnError> {
+        let requested: Vec<&str> = t
+            .time
+            .map(|time| time.label)
+            .into_iter()
+            .chain(fields.iter().copied())
+            .collect();
+        let column = columns::get_columns_filtered(&self.log, &t.name, &requested, instance)?;
+        let rows = column.rows as usize;
+        let mut values = column.values;
+        let times = match t.time {
+            Some(time) => {
+                let rest = values.split_off(rows);
+                let times = values.into_iter().map(|t| t * time.scale).collect();
+                values = rest;
+                times
+            }
+            None => column
+                .linenos
+                .iter()
+                .map(|&lineno| self.timeline[lineno as usize])
+                .collect(),
+        };
+        Ok(TimedColumns {
+            times,
+            values,
+            rows,
+        })
+    }
+}
+
+/// The lowest and highest of `values`, which are finite; None when there
+/// are none.
+#[must_use]
+pub fn extent(values: &[f64]) -> Option<(f64, f64)> {
+    values.iter().fold(None, |range: Option<(f64, f64)>, &y| {
+        Some(range.map_or((y, y), |(a, b)| (a.min(y), b.max(y))))
+    })
+}
+
+/// The index of the value of `xs`, which are non-decreasing, nearest to
+/// `x`; None for an empty slice.
+#[must_use]
+pub fn nearest_index(xs: &[f64], x: f64) -> Option<usize> {
+    let after = xs.partition_point(|t| *t < x);
+    let candidates = [after.checked_sub(1), (after < xs.len()).then_some(after)];
+    candidates
+        .into_iter()
+        .flatten()
+        .min_by(|&a, &b| (xs[a] - x).abs().total_cmp(&(xs[b] - x).abs()))
 }
 
 fn finite((x, y): &(f64, f64)) -> bool {
@@ -370,14 +525,128 @@ fn timeline(log: &Log, types: &[MessageType]) -> Vec<f64> {
     times
 }
 
+/// The vehicle's positions: the EKF's `POS` records when the log has them,
+/// otherwise the `GPS` records with a fix, from the first receiver that
+/// has one when a log has several.
+fn track(log: &LoadedLog) -> Track {
+    let sources: [(&'static str, Option<&str>); 2] = [("POS", None), ("GPS", Some("Status"))];
+    for (name, fix_field) in sources {
+        let Some(t) = log.type_named(name) else {
+            continue;
+        };
+        let instances: Vec<Option<i64>> = if t.instances.is_empty() {
+            vec![None]
+        } else {
+            t.instances.iter().map(|&i| Some(i)).collect()
+        };
+        for instance in instances {
+            if let Some(track) = positions(log, t, instance, fix_field, name)
+                && !track.is_empty()
+            {
+                return track;
+            }
+        }
+    }
+    Track::default()
+}
+
+/// The `Lat`, `Lng` and `Alt` of type `t`'s records, of one `instance`
+/// when it has several, each in its unit; rows without a finite time and
+/// position, or at 0, 0, are left out, and with `fix_field`, rows whose
+/// value there is under 3 (no 3D fix).
+fn positions(
+    log: &LoadedLog,
+    t: &MessageType,
+    instance: Option<i64>,
+    fix_field: Option<&str>,
+    source: &'static str,
+) -> Option<Track> {
+    let scale = |label: &str| t.field(label).and_then(|f| f.multiplier).unwrap_or(1.0);
+    let scales = [scale("Lat"), scale("Lng"), scale("Alt")];
+    let mut fields = vec!["Lat", "Lng", "Alt"];
+    fields.extend(fix_field);
+    let cols = log.timed_columns(t, &fields, instance).ok()?;
+    let mut track = Track {
+        source,
+        ..Track::default()
+    };
+    for row in 0..cols.rows {
+        let time = cols.times[row];
+        let [lat, lon, alt] = [0, 1, 2].map(|i| cols.column(i)[row] * scales[i]);
+        let fixed = fix_field.is_none() || cols.column(3)[row] >= 3.0;
+        let placed = time.is_finite() && lat.is_finite() && lon.is_finite();
+        if !fixed || !placed || (lat == 0.0 && lon == 0.0) {
+            continue;
+        }
+        track.times.push(time);
+        track.lats.push(lat);
+        track.lons.push(lon);
+        track.alts.push(alt);
+    }
+    if let (Some((south, north)), Some((west, east))) = (extent(&track.lats), extent(&track.lons)) {
+        track.bounds = Some(Bounds {
+            south,
+            west,
+            north,
+            east,
+        });
+    }
+    Some(track)
+}
+
+/// The `MSG`, `ERR` and `EV` records and the mode changes, in time order.
+fn events(log: &LoadedLog) -> Vec<Event> {
+    let mut events: Vec<Event> = log
+        .modes
+        .iter()
+        .map(|m| Event {
+            time: m.time,
+            kind: EventKind::Mode,
+            text: m.name.clone(),
+        })
+        .collect();
+    let sources = [
+        ("MSG", EventKind::Message),
+        ("ERR", EventKind::Error),
+        ("EV", EventKind::Event),
+    ];
+    for (name, kind) in sources {
+        for record in log.log.records_of(&[name]) {
+            let byte = |field: &str| record.value(field)?.as_f64().map(|v| v as u8);
+            let text = match kind {
+                EventKind::Message => record
+                    .value("Message")
+                    .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty()),
+                EventKind::Error => match (byte("Subsys"), byte("ECode")) {
+                    (Some(subsys), Some(code)) => {
+                        Some(codes::error_label(subsys, code, log.vehicle))
+                    }
+                    _ => None,
+                },
+                EventKind::Event => byte("Id").map(codes::event_label),
+                EventKind::Mode => None,
+            };
+            let Some(text) = text else {
+                continue;
+            };
+            let time = time_of(&log.timeline, record.lineno);
+            if time.is_finite() {
+                events.push(Event { time, kind, text });
+            }
+        }
+    }
+    events.sort_by(|a, b| a.time.total_cmp(&b.time));
+    events
+}
+
+/// Seconds since boot of the record at `lineno` of the timeline.
+fn time_of(timeline: &[f64], lineno: u64) -> f64 {
+    timeline.get(lineno as usize).copied().unwrap_or(f64::NAN)
+}
+
 /// The `MODE` records as mode changes, a run of the same mode as one.
-fn mode_changes(
-    log: &Log,
-    types: &[MessageType],
-    timeline: &[f64],
-    vehicle: Vehicle,
-) -> Vec<ModeChange> {
-    let time_field = types.iter().find(|t| t.name == "MODE").and_then(|t| t.time);
+fn mode_changes(log: &Log, timeline: &[f64], vehicle: Vehicle) -> Vec<ModeChange> {
     let mut changes: Vec<ModeChange> = Vec::new();
     for record in log.records_of(&["MODE"]) {
         let number = record
@@ -391,10 +660,7 @@ fn mode_changes(
         if changes.last().is_some_and(|last| last.number == number) {
             continue;
         }
-        let time = time_field
-            .and_then(|f| record.value(f.label)?.as_f64().map(|t| t * f.scale))
-            .or_else(|| timeline.get(record.lineno as usize).copied())
-            .unwrap_or(f64::NAN);
+        let time = time_of(timeline, record.lineno);
         changes.push(ModeChange {
             time,
             number,
@@ -413,8 +679,8 @@ pub(crate) mod testlog {
     use dflog::write::LogWriter;
 
     /// A copter log: units and multipliers, one mode change, `ATT` with a
-    /// scaled field, `IMU` in two instances and a `PARM`-like type without
-    /// a time field.
+    /// scaled field, `IMU` in two instances, a `PARM`-like type without a
+    /// time field, three `POS` positions, an error and an event.
     pub fn bytes() -> Vec<u8> {
         let mut w = LogWriter::new();
         define(&mut w);
@@ -456,9 +722,30 @@ pub(crate) mod testlog {
                 )
                 .unwrap();
             }
+            if i == 0 {
+                w.record("ERR", &[us(2_020_000), Value::U64(3), Value::U64(0)])
+                    .unwrap();
+                w.record("EV", &[us(2_030_000), Value::U64(10)]).unwrap();
+            }
             if i == 1 {
                 w.record("NOTM", &[Value::U64(7), Value::F64(42.0)])
                     .unwrap();
+            }
+            if i < 3 {
+                // a short hop north-east, 50 ms after each attitude sample
+                let step = 1e-4 * i as f64;
+                w.record(
+                    "POS",
+                    &[
+                        us(t + 50_000),
+                        Value::F64(47.0 + step),
+                        Value::F64(8.0 + step),
+                        Value::F64(500.0 + i as f64),
+                        Value::F64(10.0),
+                        Value::F64(10.0),
+                    ],
+                )
+                .unwrap();
             }
         }
         w.record(
@@ -489,6 +776,16 @@ pub(crate) mod testlog {
         w.define(7, "IMU", "QBfff", &["TimeUS", "I", "GyrX", "GyrY", "GyrZ"])
             .unwrap();
         w.define(8, "NOTM", "Bf", &["Idx", "Value"]).unwrap();
+        w.define(
+            9,
+            "POS",
+            "QLLfff",
+            &["TimeUS", "Lat", "Lng", "Alt", "RelHomeAlt", "RelOriginAlt"],
+        )
+        .unwrap();
+        w.define(10, "ERR", "QBB", &["TimeUS", "Subsys", "ECode"])
+            .unwrap();
+        w.define(11, "EV", "QB", &["TimeUS", "Id"]).unwrap();
     }
 
     /// The banner and the units tables, all at one second.
@@ -536,7 +833,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "ATT", "FMT", "FMTU", "IMU", "MODE", "MSG", "MULT", "NOTM", "UNIT"
+                "ATT", "ERR", "EV", "FMT", "FMTU", "IMU", "MODE", "MSG", "MULT", "NOTM", "POS",
+                "UNIT"
             ]
         );
         let att = log.type_named("ATT").unwrap();
@@ -639,6 +937,53 @@ mod tests {
         assert_eq!(log.stats, ScanStats::default());
     }
 
+    #[test]
+    fn the_track_comes_from_pos_and_the_events_sort_by_time() {
+        let log = loaded();
+        let track = &log.track;
+        assert_eq!(track.source, "POS");
+        assert_eq!(track.len(), 3);
+        assert!(
+            close(&track.times, &[2.05, 2.15, 2.25]),
+            "{:?}",
+            track.times
+        );
+        assert!(close(&track.lats, &[47.0, 47.0001, 47.0002]));
+        assert!(close(&track.lons, &[8.0, 8.0001, 8.0002]));
+        assert_eq!(track.alts, [500.0, 501.0, 502.0]);
+        let b = track.bounds().unwrap();
+        assert!(close(
+            &[b.south, b.west, b.north, b.east],
+            &[47.0, 8.0, 47.0002, 8.0002]
+        ));
+        assert_eq!(track.nearest(2.16), Some(1));
+        assert_eq!(track.nearest(9.0), Some(2));
+        assert_eq!(Track::default().nearest(1.0), None);
+        assert_eq!(Track::default().bounds(), None);
+        assert_eq!(nearest_index(&[0.0, 1.0, 2.0], 0.4), Some(0));
+        assert_eq!(nearest_index(&[0.0, 1.0, 2.0], 0.6), Some(1));
+        assert_eq!(nearest_index(&[], 0.6), None);
+        assert!((time_of(&[1.0, 2.0], 1) - 2.0).abs() < 1e-12);
+        assert!(time_of(&[1.0, 2.0], 5).is_nan());
+
+        let lines: Vec<String> = log
+            .events
+            .iter()
+            .map(|e| format!("{:.3} {:?} {}", e.time, e.kind, e.text))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "1.000 Message ArduCopter V4.7.0 (0000000)",
+                "1.500 Mode Stabilize",
+                "2.020 Error Compass: resolved",
+                "2.030 Event Armed",
+                "2.250 Mode Loiter",
+            ]
+        );
+        assert_eq!(log.wall_clock(TimeAxis::Utc), None, "no GPS");
+    }
+
     /// Before `TimeUS`, types carried `TimeMS` as board time, except GPS,
     /// whose `TimeMS` is the GPS time of week and whose board time is `T`.
     #[test]
@@ -704,6 +1049,79 @@ mod tests {
             "board time, not time of week"
         );
         assert!((log.duration().unwrap() - 0.2).abs() < 1e-9);
+
+        // without POS the track comes from the GPS fix
+        assert_eq!(log.track.source, "GPS");
+        assert_eq!(log.track.len(), 1);
+        assert!(close(&log.track.lats, &[47.0]) && close(&log.track.lons, &[8.0]));
+        assert!((log.track.alts[0] - 450.0).abs() < 1e-6);
+        assert!((log.track.times[0] - 5.2).abs() < 1e-9);
+        assert!(log.events.is_empty());
+    }
+
+    /// A log with two receivers and no `POS`: the first receiver never
+    /// gets a fix, so the track comes from the second.
+    #[test]
+    fn the_track_takes_the_first_receiver_with_a_fix() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let mut w = LogWriter::new();
+        w.define(1, "UNIT", "QbZ", &["TimeUS", "Id", "Label"])
+            .unwrap();
+        w.define(
+            2,
+            "FMTU",
+            "QBNN",
+            &["TimeUS", "FmtType", "UnitIds", "MultIds"],
+        )
+        .unwrap();
+        w.define(
+            3,
+            "GPS",
+            "QBBLLe",
+            &["TimeUS", "I", "Status", "Lat", "Lng", "Alt"],
+        )
+        .unwrap();
+        let t = Value::U64(1_000_000);
+        let text = |s: &str| Value::Str(s.into());
+        w.record(
+            "UNIT",
+            &[t.clone(), Value::I64(i64::from(b'#')), text("instance")],
+        )
+        .unwrap();
+        w.record(
+            "FMTU",
+            &[t.clone(), Value::U64(3), text("s#-DUm"), text("F-----")],
+        )
+        .unwrap();
+        for (instance, status, lat) in [(0, 1, 0.0), (1, 3, 47.5), (0, 1, 0.0), (1, 3, 47.5001)] {
+            w.record(
+                "GPS",
+                &[
+                    t.clone(),
+                    Value::U64(instance),
+                    Value::U64(status),
+                    Value::F64(lat),
+                    Value::F64(8.5),
+                    Value::F64(400.0),
+                ],
+            )
+            .unwrap();
+        }
+        let log = LoadedLog::build(Log::from_bytes(&w.into_bytes()), "gps2.bin".into());
+        assert_eq!(log.type_named("GPS").unwrap().instances, [0, 1]);
+        assert_eq!(log.track.source, "GPS");
+        assert!(
+            close(&log.track.lats, &[47.5, 47.5001]),
+            "{:?}",
+            log.track.lats
+        );
+        let b = log.track.bounds().unwrap();
+        assert!(close(
+            &[b.south, b.north, b.west, b.east],
+            &[47.5, 47.5001, 8.5, 8.5]
+        ));
     }
 
     #[test]
@@ -730,5 +1148,7 @@ mod tests {
         assert_eq!(log.duration(), None);
         assert!(log.modes.is_empty());
         assert_eq!(log.vehicle, Vehicle::Unknown);
+        assert!(log.track.is_empty());
+        assert!(log.events.is_empty());
     }
 }
