@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use egui::{Align2, Color32, Context};
 
@@ -16,6 +17,8 @@ use crate::map::MapPanel;
 use crate::model::LoadedLog;
 use crate::paramfile::{self, ParamFile};
 use crate::params::ParamsPanel;
+#[cfg(feature = "parquet")]
+use crate::parquetdir;
 use crate::plot::PlotPanel;
 use crate::settings::{BottomTab, Settings, TimeAxis};
 use crate::tree;
@@ -45,10 +48,19 @@ struct ParamDialog {
     boot: bool,
 }
 
+/// The choices made before a Parquet export.
+#[cfg(feature = "parquet")]
+#[derive(Debug, Default)]
+struct ParquetDialog {
+    /// One file per instance value of a type with instances.
+    split: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct AftermissionApp {
     settings: Settings,
-    log: Option<LoadedLog>,
+    /// Shared with an export job that reads the whole log on a worker.
+    log: Option<Arc<LoadedLog>>,
     /// The one job running: an open or an export.
     job: Option<Job>,
     /// Why the last open failed, until the next one starts.
@@ -59,6 +71,9 @@ pub struct AftermissionApp {
     csv_dialog: Option<CsvDialog>,
     /// The `.param` export's confirmation window, while it is open.
     param_dialog: Option<ParamDialog>,
+    /// The Parquet export's confirmation window, while it is open.
+    #[cfg(feature = "parquet")]
+    parquet_dialog: Option<ParquetDialog>,
     plot: PlotPanel,
     map: MapPanel,
     events: EventsPanel,
@@ -69,6 +84,8 @@ pub struct AftermissionApp {
     /// fold again when it is cleared.
     filter_was_active: bool,
     about_open: bool,
+    /// A close was held while an export ran; the next one closes.
+    close_held: bool,
 }
 
 impl AftermissionApp {
@@ -110,10 +127,30 @@ impl AftermissionApp {
         false
     }
 
+    /// Whether to hold a request to close the window. Ending the process
+    /// while an export writes would leave its file, or its Parquet folder,
+    /// unfinished, so the first request is held with a notice; a second
+    /// closes anyway, so an export that never ends cannot keep the window
+    /// open. Opening a log writes nothing and never holds it.
+    fn hold_close(&mut self) -> bool {
+        let Some(job) = &self.job else {
+            return false;
+        };
+        if job.kind != Kind::Export || self.close_held {
+            return false;
+        }
+        self.close_held = true;
+        self.notice = Some(Notice {
+            text: format!("{}\u{2026} Close again to quit anyway", job.label),
+            error: true,
+        });
+        true
+    }
+
     /// The loaded log, for tests.
     #[cfg(test)]
     pub(crate) fn log(&self) -> Option<&LoadedLog> {
-        self.log.as_ref()
+        self.log.as_deref()
     }
 
     #[cfg(test)]
@@ -154,6 +191,8 @@ impl AftermissionApp {
         };
         let kind = job.kind;
         self.job = None;
+        // the next close during another export is held again
+        self.close_held = false;
         // a refusal made while the job ran is over with it
         self.notice = None;
         match result {
@@ -166,12 +205,14 @@ impl AftermissionApp {
                 // an export set up on the log before would write the wrong one
                 self.csv_dialog = None;
                 self.param_dialog = None;
+                #[cfg(feature = "parquet")]
+                self.parquet_dialog.take();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
                     "{} - Aftermission",
                     log.name
                 )));
                 tracing::info!(name = %log.name, records = log.records(), "log opened");
-                self.log = Some(*log);
+                self.log = Some(Arc::from(log));
             }
             Ok(Done::Exported { path, summary }) => {
                 tracing::info!(%summary, "export done");
@@ -231,6 +272,9 @@ impl AftermissionApp {
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        if ctx.input(|i| i.viewport().close_requested()) && self.hold_close() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         self.handle_drop(&ctx);
         self.shortcuts(&ctx);
 
@@ -254,6 +298,8 @@ impl AftermissionApp {
         self.about_ui(&ctx);
         self.csv_dialog_ui(&ctx);
         self.param_dialog_ui(&ctx);
+        #[cfg(feature = "parquet")]
+        self.parquet_dialog_ui(&ctx);
         Self::drop_overlay(&ctx);
     }
 
@@ -284,6 +330,8 @@ impl AftermissionApp {
             // save dialog, with the chosen path lost
             let plotted = self.log.is_some() && self.plot.showing().next().is_some();
             let has_params = self.log.as_ref().is_some_and(|l| !l.params.is_empty());
+            #[cfg(feature = "parquet")]
+            let has_records = self.log.as_ref().is_some_and(|l| l.records() > 0);
             let idle = self.job.is_none();
             let why = |reason| {
                 if idle {
@@ -314,6 +362,18 @@ impl AftermissionApp {
                 {
                     ui.close();
                     self.param_dialog = Some(ParamDialog::default());
+                }
+                #[cfg(feature = "parquet")]
+                if ui
+                    .add_enabled(
+                        has_records && idle,
+                        egui::Button::new("Whole log as Parquet\u{2026}"),
+                    )
+                    .on_disabled_hover_text(why("The log has no records"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.parquet_dialog = Some(ParquetDialog::default());
                 }
             });
             ui.separator();
@@ -603,6 +663,94 @@ impl AftermissionApp {
                 self.export_params_to(file, path, ctx);
             }
         }
+    }
+
+    /// The choices before a Parquet export, then the folder picker.
+    #[cfg(feature = "parquet")]
+    fn parquet_dialog_ui(&mut self, ctx: &Context) {
+        // a job started underneath, by a dropped file, would refuse the export
+        if self.job.is_some() {
+            self.parquet_dialog = None;
+        }
+        let (Some(dialog), Some(log)) = (&mut self.parquet_dialog, &self.log) else {
+            return;
+        };
+        // with no type logged as two instances, splitting would only rename
+        // the files of types with an instance field, `GPS` to `GPS_0`
+        let instanced = log.types.iter().any(|t| !t.instances.is_empty());
+        if !instanced {
+            dialog.split = false;
+        }
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Export Parquet")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} message types, {} records",
+                    log.types.len(),
+                    log.records()
+                ));
+                ui.label(format!(
+                    "One file per type, in a new folder {} in the folder you choose, numbered when the name is taken",
+                    parquetdir::folder_name(&log.name)
+                ));
+                ui.add_enabled(
+                    instanced,
+                    egui::Checkbox::new(&mut dialog.split, "One file per instance"),
+                )
+                .on_disabled_hover_text("No message type has more than one instance");
+                ui.horizontal(|ui| {
+                    save = ui.button("Save to folder\u{2026}").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        let split = dialog.split;
+        if !open || cancel {
+            self.parquet_dialog = None;
+        }
+        if save {
+            self.parquet_dialog = None;
+            if let Some(parent) = self.folder_dialog() {
+                self.export_parquet_to(parent, split, ctx);
+            }
+        }
+    }
+
+    /// Ask for the folder a Parquet export makes its own folder in,
+    /// starting in the last export folder.
+    #[cfg(feature = "parquet")]
+    fn folder_dialog(&self) -> Option<PathBuf> {
+        let mut picker = rfd::FileDialog::new().set_title("Choose where the Parquet folder goes");
+        if let Some(dir) = &self.settings.export_dir {
+            picker = picker.set_directory(dir);
+        }
+        picker.pick_folder()
+    }
+
+    /// Write every message type of the log into a new folder in `parent`,
+    /// on a worker, which shares the log rather than copying it. Refused
+    /// while a job runs.
+    #[cfg(feature = "parquet")]
+    pub(crate) fn export_parquet_to(&mut self, parent: PathBuf, split: bool, ctx: &Context) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        let log = Arc::clone(log);
+        if self.busy() {
+            return;
+        }
+        let label = format!("Writing Parquet files for {}", log.name);
+        self.job = Some(Job::run(
+            Kind::Export,
+            parent.clone(),
+            label,
+            ctx.clone(),
+            move || parquetdir::export(&log, &parent, split),
+        ));
     }
 
     /// Ask where to save a file named `name`, starting in the last export
@@ -1298,6 +1446,256 @@ mod tests {
         });
         assert!(app.param_dialog.is_none());
         wait(&mut app, &ctx);
+    }
+
+    /// The names of the files in a Parquet export's folder, sorted, each
+    /// checked to be finished: a file the exporter did not close lacks the
+    /// footer's closing magic.
+    #[cfg(feature = "parquet")]
+    fn parquet_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                assert!(
+                    bytes.starts_with(b"PAR1") && bytes.ends_with(b"PAR1"),
+                    "{}",
+                    path.display()
+                );
+                worker::file_name(&path)
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn the_whole_log_exports_as_parquet_into_a_folder_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let log = app.log().unwrap();
+        let (types, records) = (log.types.len(), log.records());
+        let mut expected: Vec<String> = log
+            .types
+            .iter()
+            .map(|t| format!("{}.parquet", t.name))
+            .collect();
+        expected.sort();
+
+        // the window counts the log and offers the split for its two IMUs
+        app.parquet_dialog = Some(ParquetDialog::default());
+        with_ui(&mut app, |harness| {
+            let window =
+                harness.get_by_role_and_label(egui::accesskit::Role::Window, "Export Parquet");
+            window.get_by_label(&format!("{types} message types, {records} records"));
+            window.get_by_label(
+                "One file per type, in a new folder flight_parquet in the folder you \
+                 choose, numbered when the name is taken",
+            );
+            window.get_by_label("One file per instance").click();
+            harness.run();
+        });
+        assert!(app.parquet_dialog.as_ref().unwrap().split);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Cancel").click();
+            harness.run();
+        });
+        assert!(app.parquet_dialog.is_none());
+
+        // one file per type, in a folder named after the log
+        app.export_parquet_to(dir.path().to_path_buf(), false, &ctx);
+        assert_eq!(
+            app.job.as_ref().unwrap().label,
+            "Writing Parquet files for flight.bin"
+        );
+        wait(&mut app, &ctx);
+        assert_eq!(
+            app.notice,
+            Some(Notice {
+                text: format!("Wrote flight_parquet: {types} files, {records} rows"),
+                error: false,
+            })
+        );
+        // the next export opens in the folder chosen, not the one made
+        assert_eq!(app.settings.export_dir.as_deref(), Some(dir.path()));
+        let first = dir.path().join("flight_parquet");
+        assert_eq!(parquet_files(&first), expected);
+
+        // again, split: a new folder beside the first, the IMU in two files
+        app.export_parquet_to(dir.path().to_path_buf(), true, &ctx);
+        wait(&mut app, &ctx);
+        let split = parquet_files(&dir.path().join("flight_parquet (2)"));
+        assert!(split.contains(&"IMU_0.parquet".to_string()), "{split:?}");
+        assert!(split.contains(&"IMU_1.parquet".to_string()), "{split:?}");
+        assert!(!split.contains(&"IMU.parquet".to_string()), "{split:?}");
+        assert_eq!(parquet_files(&first), expected, "the first is untouched");
+
+        // a folder that cannot be made is an error, and nothing is left
+        let missing = dir.path().join("gone");
+        app.export_parquet_to(missing.clone(), false, &ctx);
+        wait(&mut app, &ctx);
+        let notice = app.notice.clone().unwrap();
+        assert!(notice.error);
+        assert!(
+            notice
+                .text
+                .starts_with(&missing.join("flight_parquet").display().to_string()),
+            "{}",
+            notice.text
+        );
+        assert!(!missing.exists());
+
+        // a job underneath the window closes it
+        app.parquet_dialog = Some(ParquetDialog::default());
+        let path = app.settings.recent[0].clone();
+        app.open_path(&path, &ctx);
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label("Export Parquet").is_none());
+        });
+        assert!(app.parquet_dialog.is_none());
+        wait(&mut app, &ctx);
+    }
+
+    #[test]
+    fn a_close_during_an_export_is_held_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+
+        // idle, or opening a log: nothing to lose
+        assert!(!app.hold_close());
+        let path = app.settings.recent[0].clone();
+        app.open_path(&path, &ctx);
+        assert!(!app.hold_close());
+        wait(&mut app, &ctx);
+
+        // an export that has not finished: held once, with a notice
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        app.job = Some(Job::run(
+            Kind::Export,
+            dir.path().join("flight.csv"),
+            "Writing flight.csv".into(),
+            ctx.clone(),
+            move || {
+                // held until the test lets it finish
+                let _ = rx.recv();
+                Ok(Done::Exported {
+                    path: "flight.csv".into(),
+                    summary: "Wrote flight.csv: 3 rows, 1 series".into(),
+                })
+            },
+        ));
+        assert!(app.hold_close());
+        assert_eq!(
+            app.notice,
+            Some(Notice {
+                text: "Writing flight.csv\u{2026} Close again to quit anyway".into(),
+                error: true,
+            })
+        );
+        assert!(!app.hold_close(), "the second close closes");
+
+        // a later export is held again
+        tx.send(()).unwrap();
+        wait(&mut app, &ctx);
+        assert!(!app.close_held);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        app.job = Some(Job::run(
+            Kind::Export,
+            dir.path().join("flight.param"),
+            "Writing flight.param".into(),
+            ctx.clone(),
+            move || {
+                let _ = rx.recv();
+                Err("disk full".into())
+            },
+        ));
+        assert!(app.hold_close());
+        tx.send(()).unwrap();
+        wait(&mut app, &ctx);
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn the_parquet_export_needs_a_log_and_splits_only_what_has_instances() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let menu_item_disabled = |app: &mut AftermissionApp| {
+            let mut disabled = false;
+            with_ui(app, |harness| {
+                harness.get_by_label("File").click();
+                harness.run();
+                harness.get_by_label("Export \u{23F5}").hover();
+                harness.run();
+                disabled = harness
+                    .get_by_label("Whole log as Parquet\u{2026}")
+                    .accesskit_node()
+                    .is_disabled();
+            });
+            disabled
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        // no log, or one without records: nothing to export
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        assert!(menu_item_disabled(&mut app));
+        let path = dir.path().join("empty.bin");
+        std::fs::write(&path, b"not a log").unwrap();
+        reopen(&mut app, &path);
+        assert_eq!(app.log().unwrap().records(), 0);
+        assert!(menu_item_disabled(&mut app));
+
+        // a log whose one type has no instances: the split changes nothing
+        let mut w = LogWriter::new();
+        w.define(1, "BAT", "Qf", &["TimeUS", "Volt"]).unwrap();
+        for (us, volt) in [(1_000_000, 15.2), (2_000_000, 15.1)] {
+            w.record("BAT", &[Value::U64(us), Value::F64(volt)])
+                .unwrap();
+        }
+        let path = dir.path().join("bench.bin");
+        std::fs::write(&path, w.into_bytes()).unwrap();
+        reopen(&mut app, &path);
+        assert!(!menu_item_disabled(&mut app));
+        app.parquet_dialog = Some(ParquetDialog { split: true });
+        with_ui(&mut app, |harness| {
+            let window =
+                harness.get_by_role_and_label(egui::accesskit::Role::Window, "Export Parquet");
+            window.get_by_label(
+                "One file per type, in a new folder bench_parquet in the folder you \
+                 choose, numbered when the name is taken",
+            );
+            assert!(
+                window
+                    .get_by_label("One file per instance")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        });
+        assert!(!app.parquet_dialog.as_ref().unwrap().split);
+    }
+
+    #[cfg(not(feature = "parquet"))]
+    #[test]
+    fn without_the_parquet_feature_the_menu_has_no_parquet_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("File").click();
+            harness.run();
+            harness.get_by_label("Export \u{23F5}").hover();
+            harness.run();
+            harness.get_by_label("Parameters as .param\u{2026}");
+            assert!(
+                harness
+                    .query_by_label("Whole log as Parquet\u{2026}")
+                    .is_none()
+            );
+        });
     }
 
     #[test]

@@ -11,6 +11,8 @@ mod model;
 mod modes;
 mod paramfile;
 mod params;
+#[cfg(feature = "parquet")]
+mod parquetdir;
 mod plot;
 mod settings;
 mod timefmt;

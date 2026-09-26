@@ -34,8 +34,15 @@ jobs:
       - name: Clippy
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # the build without the Parquet export, which the web build will be
+      - name: Clippy without default features
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Test without default features
+        if: runner.os == 'Linux'
+        run: cargo test --workspace --no-default-features
 
   deny:
     name: Dependency policy

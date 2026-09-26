@@ -8,6 +8,11 @@
 # offer a copyleft license only as an alternative to MIT or Apache are fine;
 # cargo-deny picks the permitted option.
 
+[graph]
+# The Parquet export is a feature; its arrow tree is checked whatever the
+# default.
+all-features = true
+
 [licenses]
 allow = [
     "MIT",
@@ -32,6 +37,15 @@ allow = [
 ]
 # Our own crate is unpublished and carries the workspace license.
 private = { ignore = true }
+
+# tiny-keccak, through const-random and ahash's compile-time-rng, which
+# arrow-array (the Parquet export) takes on wasm32 only: a dependency of a
+# proc-macro that runs at build time, never linked into the app. CC0-1.0
+# waives all rights, so it bars no relicensing; allowed for this crate
+# alone rather than for any crate.
+[[licenses.exceptions]]
+crate = "tiny-keccak"
+allow = ["CC0-1.0"]
 
 [bans]
 # The egui/wgpu/winit stack pulls dozens of transitive duplicates that we

@@ -65,6 +65,15 @@ The tool is early. What works today:
 - **Parameter file export** (File > Export) as a `.param` file of
   `NAME,VALUE` lines, which Mission Planner and MAVProxy load: each
   parameter's last value in the log, or its value at boot.
+- **Parquet export** (File > Export) of the whole log, one Snappy-compressed
+  file per message type, or per instance value, with the record index and,
+  when the log has a GPS clock, a UTC timestamp column. The files go into
+  a new folder named after the log inside the folder chosen, never over
+  an earlier export; an export that fails leaves nothing behind. Built by
+  default through the `parquet` feature; `--no-default-features` leaves
+  it and the Arrow dependency tree out.
+- **Closing during an export asks twice**: the first close while one
+  writes is held with a notice, and a second close quits anyway.
 - **Preferences** persist: theme, time axis, mode bands, which panels are
   open and which tab the bottom one shows, map tiles, the recent files and
   the export folder.
@@ -72,7 +81,7 @@ The tool is early. What works today:
 A plot set up on one log carries over when another opens: series the new
 log also has are re-read, the rest are dropped.
 
-Planned next: Parquet export and a browser build.
+Planned next: a browser build.
 
 ## Building and running
 
@@ -90,6 +99,8 @@ development libraries; the CI workflow lists the Debian packages.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+cargo test --workspace --no-default-features
 cargo deny check
 ```
 

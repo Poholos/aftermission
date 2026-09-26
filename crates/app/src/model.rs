@@ -352,6 +352,23 @@ impl LoadedLog {
         self.log.index.len()
     }
 
+    /// Write every message type of the log into `dir` as Parquet, one file
+    /// per type, or per instance value with `split_instances`; see
+    /// [`dflog::parquet::export`].
+    ///
+    /// # Errors
+    ///
+    /// Any error from the exporter, which leaves the files it opened
+    /// unfinished in `dir`.
+    #[cfg(feature = "parquet")]
+    pub fn export_parquet(
+        &self,
+        dir: &std::path::Path,
+        split_instances: bool,
+    ) -> Result<dflog::parquet::ExportSummary, dflog::parquet::ExportError> {
+        dflog::parquet::export(&self.log, dir, None, split_instances)
+    }
+
     /// The base the time axis reads through: the GPS one when UTC is
     /// chosen and the log has it, none for the boot clock.
     #[must_use]

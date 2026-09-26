@@ -12,7 +12,7 @@ repository = "https://github.com/Poholos/aftermission"
 publish = false
 
 [workspace.dependencies]
-dflog = "0.1.0"
+dflog = "0.2.0"
 
 eframe = { version = "0.36", features = ["persistence"] }
 egui = "0.36"
