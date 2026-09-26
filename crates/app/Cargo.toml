@@ -21,6 +21,7 @@ egui_extras.workspace = true
 rfd.workspace = true
 walkers.workspace = true
 serde.workspace = true
+tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
@@ -33,7 +34,6 @@ parquet = ["dflog/parquet"]
 [dev-dependencies]
 egui_kittest.workspace = true
 ron.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

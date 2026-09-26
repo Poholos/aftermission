@@ -352,6 +352,18 @@ impl LoadedLog {
         self.log.index.len()
     }
 
+    /// What the Parquet export writes: the number of message types and of
+    /// records. A record goes by its type's name, so an id whose name a
+    /// later `FMT` gave to another id is left out, with its records.
+    #[cfg(feature = "parquet")]
+    #[must_use]
+    pub fn parquet_counts(&self) -> (usize, usize) {
+        self.types
+            .iter()
+            .filter(|t| self.log.name_to_id.get(&t.name) == Some(&t.id))
+            .fold((0, 0), |(types, records), t| (types + 1, records + t.count))
+    }
+
     /// Write every message type of the log into `dir` as Parquet, one file
     /// per type, or per instance value with `split_instances`; see
     /// [`dflog::parquet::export`].
@@ -508,8 +520,9 @@ pub enum Scale {
     /// through a float cast, so the factor standing for 0.1 arrives as
     /// 0.100000001490116, and multiplying by it puts a raw 41 at
     /// 4.100000061094761; even by an exact 0.1 it is 4.1000000000000005.
-    /// Dividing by the power the factor stands for gives 4.1.
-    Divide(f64),
+    /// Dividing by the power the factor stands for gives 4.1. The value is
+    /// the exponent: 1 for a tenth, 9 for a billionth.
+    Divide(u8),
     /// Multiplied by any other factor, such as 3.6 or 100; by 100 the
     /// product is exact anyway.
     Multiply(f64),
@@ -530,18 +543,28 @@ impl Scale {
         // and neighboring powers differ tenfold, so nothing else matches
         POWERS_OF_TEN
             .iter()
-            .find(|&&power| (factor * power - 1.0).abs() < 1e-6)
-            .map_or(Scale::Multiply(factor), |&power| Scale::Divide(power))
+            .position(|&power| (factor * power - 1.0).abs() < 1e-6)
+            .map_or(Scale::Multiply(factor), |index| {
+                Scale::Divide(u8::try_from(index + 1).expect("nine powers at most"))
+            })
     }
 
     #[must_use]
     pub fn apply(self, value: f64) -> f64 {
         match self {
             Scale::Unit => value,
-            Scale::Divide(power) => value / power,
+            Scale::Divide(exponent) => value / power_of_ten(exponent),
             Scale::Multiply(factor) => value * factor,
         }
     }
+}
+
+/// Ten to `exponent`. Exact for exponents up to 22, since a double holds
+/// five to the twenty-second power in its 53 bits and not the next; a
+/// [`Scale::Divide`] holds 1 to 9, well inside that.
+#[must_use]
+pub fn power_of_ten(exponent: u8) -> f64 {
+    10f64.powi(i32::from(exponent))
 }
 
 /// The factor a plotted value is scaled by. A format character that
@@ -1259,6 +1282,39 @@ mod tests {
         assert!(log.events.is_empty());
     }
 
+    /// A log whose `ATT` moves to a new id by a second `FMT`: the model
+    /// keeps both ids, the Parquet export writes only the one that owns
+    /// the name.
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn the_parquet_counts_leave_out_an_id_that_lost_its_name() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let mut w = LogWriter::new();
+        w.define(1, "ATT", "Qf", &["TimeUS", "Roll"]).unwrap();
+        for t in [1_000_000, 2_000_000] {
+            w.record("ATT", &[Value::U64(t), Value::F64(0.5)]).unwrap();
+        }
+        w.define(2, "ATT", "Qff", &["TimeUS", "Roll", "Pitch"])
+            .unwrap();
+        w.record(
+            "ATT",
+            &[Value::U64(3_000_000), Value::F64(0.5), Value::F64(0.25)],
+        )
+        .unwrap();
+        let log = LoadedLog::build(Log::from_bytes(&w.into_bytes()), "twice.bin".into());
+
+        // FMT and both ATT ids, with every record: three FMT records, one
+        // of them FMT's own, and three ATT
+        let names: Vec<&str> = log.types.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["ATT", "ATT", "FMT"]);
+        assert_eq!(log.records(), 6);
+        // FMT and the ATT that owns the name: two types, with FMT's three
+        // records and the one ATT record under the new id
+        assert_eq!(log.parquet_counts(), (2, 4));
+    }
+
     /// A log with two receivers and no `POS`: the first receiver never
     /// gets a fix, so the track comes from the second.
     #[test]
@@ -1327,10 +1383,11 @@ mod tests {
     #[test]
     fn factors_snap_to_the_power_of_ten_they_stand_for_and_divide() {
         // the copter corpus's A and F, cast through float32
-        assert_eq!(Scale::of(Some(f64::from(0.1f32))), Scale::Divide(1e1));
-        assert_eq!(Scale::of(Some(f64::from(1e-6f32))), Scale::Divide(1e6));
-        assert_eq!(Scale::of(Some(f64::from(1e-9f32))), Scale::Divide(1e9));
-        assert_eq!(Scale::of(Some(0.01)), Scale::Divide(1e2));
+        assert_eq!(Scale::of(Some(f64::from(0.1f32))), Scale::Divide(1));
+        assert_eq!(Scale::of(Some(f64::from(1e-6f32))), Scale::Divide(6));
+        assert_eq!(Scale::of(Some(f64::from(1e-9f32))), Scale::Divide(9));
+        assert_eq!(Scale::of(Some(0.01)), Scale::Divide(2));
+        assert_eq!(power_of_ten(9).to_bits(), 1e9f64.to_bits());
         assert_eq!(Scale::of(Some(3.6)), Scale::Multiply(3.6));
         assert_eq!(Scale::of(Some(100.0)), Scale::Multiply(100.0));
         assert_eq!(Scale::of(None), Scale::Unit);

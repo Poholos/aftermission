@@ -3,18 +3,18 @@
 //! table, the ways a log gets opened, and the exports.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::BufWriter;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui::{Align2, Color32, Context};
 
-use crate::csv::{self, Column, Export};
+use crate::csv::{self, Column, Digits, Export};
 use crate::events::EventsPanel;
 use crate::filter::Filter;
 use crate::map::MapPanel;
-use crate::model::LoadedLog;
+use crate::model::{LoadedLog, Scale};
 use crate::paramfile::{self, ParamFile};
 use crate::params::ParamsPanel;
 #[cfg(feature = "parquet")]
@@ -117,10 +117,13 @@ impl AftermissionApp {
     /// does. A job that may start clears the last notice.
     fn busy(&mut self) -> bool {
         if let Some(job) = &self.job {
-            self.notice = Some(Notice {
-                text: format!("Still busy: {}\u{2026}", job.label),
-                error: false,
-            });
+            // a held close keeps its warning, which the refusal would hide
+            if !self.close_held {
+                self.notice = Some(Notice {
+                    text: format!("Still busy: {}\u{2026}", job.label),
+                    error: false,
+                });
+            }
             return true;
         }
         self.notice = None;
@@ -128,10 +131,11 @@ impl AftermissionApp {
     }
 
     /// Whether to hold a request to close the window. Ending the process
-    /// while an export writes would leave its file, or its Parquet folder,
-    /// unfinished, so the first request is held with a notice; a second
-    /// closes anyway, so an export that never ends cannot keep the window
-    /// open. Opening a log writes nothing and never holds it.
+    /// while an export writes would leave its Parquet folder unfinished, or
+    /// a CSV or `.param` export's `.tmp` file beside its target and the
+    /// target not written, so the first request is held with a notice; a
+    /// second closes anyway, so an export that never ends cannot keep the
+    /// window open. Opening a log writes nothing and never holds it.
     fn hold_close(&mut self) -> bool {
         let Some(job) = &self.job else {
             return false;
@@ -331,15 +335,10 @@ impl AftermissionApp {
             let plotted = self.log.is_some() && self.plot.showing().next().is_some();
             let has_params = self.log.as_ref().is_some_and(|l| !l.params.is_empty());
             #[cfg(feature = "parquet")]
-            let has_records = self.log.as_ref().is_some_and(|l| l.records() > 0);
+            let has_records = self.log.as_ref().is_some_and(|l| l.parquet_counts().1 > 0);
             let idle = self.job.is_none();
-            let why = |reason| {
-                if idle {
-                    reason
-                } else {
-                    "Wait for the running job"
-                }
-            };
+            let has_log = self.log.is_some();
+            let why = |reason| disabled_reason(idle, has_log, reason);
             ui.menu_button("Export", |ui| {
                 if ui
                     .add_enabled(
@@ -689,11 +688,8 @@ impl AftermissionApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "{} message types, {} records",
-                    log.types.len(),
-                    log.records()
-                ));
+                let (types, records) = log.parquet_counts();
+                ui.label(format!("{types} message types, {records} records"));
                 ui.label(format!(
                     "One file per type, in a new folder {} in the folder you choose, numbered when the name is taken",
                     parquetdir::folder_name(&log.name)
@@ -784,9 +780,23 @@ impl AftermissionApp {
         });
     }
 
-    /// Create `path` and fill it through `write` on a worker; `write` is
-    /// given the file's name and returns the summary the menu bar shows.
-    /// Refused while a job runs.
+    /// Write `path` through `write` on a worker: into a new file beside it,
+    /// `flight.csv.k3Yx0a.tmp`, synced to disk and moved over `path` once
+    /// `write` is done. A failure part way leaves the file that was there,
+    /// and the new one goes. A process ended mid-write, by a second close,
+    /// a kill or a power loss, leaves the file that was there too, with
+    /// the `.tmp` file beside it. `write` is given the file's name and
+    /// returns the summary the menu bar shows. Refused while a job runs.
+    ///
+    /// The move replaces what is at `path` rather than writing into it: a
+    /// symbolic link there is replaced, not written through; on Unix a
+    /// read-only file is replaced as well, while on Windows the move fails
+    /// on one, as writing in place would; and a folder the user cannot make
+    /// files in fails, even when the file in it is writable. On Windows the
+    /// move takes no long-path prefix, so a target path near 260 characters
+    /// fails where writing it in place would not. The sync is a hard
+    /// failure on a mount without one, and the move has no retry against
+    /// a program holding the just-closed file for a moment.
     fn write_file(
         &mut self,
         path: PathBuf,
@@ -806,9 +816,31 @@ impl AftermissionApp {
             ctx.clone(),
             move || {
                 let describe = |e: std::io::Error| format!("{}: {e}", path.display());
-                let mut out = BufWriter::new(File::create(&path).map_err(describe)?);
+                let dir = path
+                    .parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let prefix = format!("{name}.");
+                let mut builder = tempfile::Builder::new();
+                builder.prefix(&prefix).suffix(".tmp");
+                // a temporary file is owner-only by default; an export is an
+                // ordinary file, so it asks for everything and the umask
+                // takes its usual share
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    builder.permissions(std::fs::Permissions::from_mode(0o666))
+                };
+                // `temp` removes the file on any return before the move
+                let (file, temp) = builder.tempfile_in(dir).map_err(describe)?.into_parts();
+                let mut out = BufWriter::new(file);
                 let summary = write(&mut out, &name).map_err(describe)?;
-                out.flush().map_err(describe)?;
+                let file = out.into_inner().map_err(|e| describe(e.into_error()))?;
+                // on disk before it takes the place of the file that was
+                // there, and a late write error reported, not lost at close
+                file.sync_all().map_err(describe)?;
+                drop(file);
+                temp.persist(&path).map_err(|e| describe(e.error))?;
                 Ok(Done::Exported { path, summary })
             },
         ));
@@ -835,20 +867,38 @@ impl AftermissionApp {
     }
 }
 
-/// The series showing on `plot`, as the CSV writes them: a value from an
-/// `f` field prints as the float32 the log stored.
+/// The series showing on `plot`, as the CSV writes them, each column's
+/// digits chosen by its field's type and scaling; see [`Digits::of`].
 fn csv_export(log: &LoadedLog, plot: &PlotPanel, range: Option<RangeInclusive<f64>>) -> Export {
     Export {
         columns: plot
             .showing()
-            .map(|s| Column {
-                title: s.title.clone(),
-                data: s.data.clone(),
-                single: log.field_of(&s.key).is_some_and(|f| f.code == 'f'),
+            .map(|s| {
+                let field = log.field_of(&s.key);
+                Column {
+                    title: s.title.clone(),
+                    data: s.data.clone(),
+                    digits: Digits::of(
+                        field.is_some_and(|f| f.code == 'f'),
+                        Scale::of(field.and_then(|f| f.multiplier)),
+                    ),
+                }
             })
             .collect(),
         time_base: log.time_base,
         range,
+    }
+}
+
+/// Why an export item is disabled: a running job comes first, then no log
+/// to export from, then what the item itself lacks.
+fn disabled_reason(idle: bool, has_log: bool, reason: &'static str) -> &'static str {
+    if !idle {
+        "Wait for the running job"
+    } else if !has_log {
+        "Open a log first"
+    } else {
+        reason
     }
 }
 
@@ -864,6 +914,9 @@ impl eframe::App for AftermissionApp {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+    use std::sync::mpsc;
+
     use super::*;
     use egui_kittest::{
         Harness,
@@ -898,14 +951,50 @@ mod tests {
         assert!(app.log().is_some());
     }
 
-    /// Run a frame of the app in a window with room for every panel, and
-    /// look at it.
-    fn with_ui(app: &mut AftermissionApp, check: impl FnOnce(&mut Harness<'_>)) {
-        let mut harness = Harness::builder()
+    /// The app in a window with room for every panel.
+    fn harness(app: &mut AftermissionApp) -> Harness<'_> {
+        Harness::builder()
             .with_size(egui::vec2(1400.0, 900.0))
-            .build_ui(|ui| app.show(ui));
+            .build_ui(|ui| app.show(ui))
+    }
+
+    /// Run a frame of the app and look at it.
+    fn with_ui(app: &mut AftermissionApp, check: impl FnOnce(&mut Harness<'_>)) {
+        let mut harness = harness(app);
         harness.run();
         check(&mut harness);
+    }
+
+    /// [`with_ui`] while a job runs: the spinner asks for frames without
+    /// end, so the run stops at the step limit rather than when the window
+    /// is still.
+    fn with_busy_ui(app: &mut AftermissionApp, check: impl FnOnce(&mut Harness<'_>)) {
+        let mut harness = harness(app);
+        harness.run_ok();
+        check(&mut harness);
+    }
+
+    /// Start an export of `path` that runs until the returned sender fires,
+    /// so what the window shows while a job runs can be checked with no
+    /// race against the job's end. It ends with the summary "Released".
+    fn hold_job(app: &mut AftermissionApp, ctx: &Context, path: PathBuf) -> mpsc::Sender<()> {
+        let (release, held) = mpsc::channel::<()>();
+        let label = format!("Writing {}", worker::file_name(&path));
+        let job_path = path.clone();
+        app.job = Some(Job::run(
+            Kind::Export,
+            path,
+            label,
+            ctx.clone(),
+            move || {
+                let _ = held.recv();
+                Ok(Done::Exported {
+                    path: job_path,
+                    summary: "Released".into(),
+                })
+            },
+        ));
+        release
     }
 
     #[test]
@@ -1292,12 +1381,12 @@ mod tests {
 
         // a job underneath the window closes it
         app.csv_dialog = Some(CsvDialog::default());
-        let path = app.settings.recent[0].clone();
-        app.open_path(&path, &ctx);
-        with_ui(&mut app, |harness| {
+        let release = hold_job(&mut app, &ctx, dir.path().join("held.csv"));
+        with_busy_ui(&mut app, |harness| {
             assert!(harness.query_by_label("Export CSV").is_none());
         });
         assert!(app.csv_dialog.is_none());
+        release.send(()).unwrap();
         wait(&mut app, &ctx);
     }
 
@@ -1324,8 +1413,8 @@ mod tests {
             ["time_s", "ATT.Roll (deg)", "IMU[1].GyrX (rad/s)"]
         );
         assert_eq!(
-            export.columns.iter().map(|c| c.single).collect::<Vec<_>>(),
-            [false, true]
+            export.columns.iter().map(|c| c.digits).collect::<Vec<_>>(),
+            [Digits::Double, Digits::Single]
         );
         let out = dir.path().join("out").join("flight.csv");
         std::fs::create_dir(out.parent().unwrap()).unwrap();
@@ -1439,12 +1528,12 @@ mod tests {
 
         // a job underneath the window closes it
         app.param_dialog = Some(ParamDialog::default());
-        let path = app.settings.recent[0].clone();
-        app.open_path(&path, &ctx);
-        with_ui(&mut app, |harness| {
+        let release = hold_job(&mut app, &ctx, dir.path().join("held.csv"));
+        with_busy_ui(&mut app, |harness| {
             assert!(harness.query_by_label("Export parameters").is_none());
         });
         assert!(app.param_dialog.is_none());
+        release.send(()).unwrap();
         wait(&mut app, &ctx);
     }
 
@@ -1477,7 +1566,8 @@ mod tests {
         let mut app = opened(dir.path());
         let ctx = Context::default();
         let log = app.log().unwrap();
-        let (types, records) = (log.types.len(), log.records());
+        let (types, records) = log.parquet_counts();
+        assert_eq!((types, records), (log.types.len(), log.records()));
         let mut expected: Vec<String> = log
             .types
             .iter()
@@ -1550,12 +1640,12 @@ mod tests {
 
         // a job underneath the window closes it
         app.parquet_dialog = Some(ParquetDialog::default());
-        let path = app.settings.recent[0].clone();
-        app.open_path(&path, &ctx);
-        with_ui(&mut app, |harness| {
+        let release = hold_job(&mut app, &ctx, dir.path().join("held.csv"));
+        with_busy_ui(&mut app, |harness| {
             assert!(harness.query_by_label("Export Parquet").is_none());
         });
         assert!(app.parquet_dialog.is_none());
+        release.send(()).unwrap();
         wait(&mut app, &ctx);
     }
 
@@ -1589,13 +1679,14 @@ mod tests {
             },
         ));
         assert!(app.hold_close());
-        assert_eq!(
-            app.notice,
-            Some(Notice {
-                text: "Writing flight.csv\u{2026} Close again to quit anyway".into(),
-                error: true,
-            })
-        );
+        let warning = Some(Notice {
+            text: "Writing flight.csv\u{2026} Close again to quit anyway".into(),
+            error: true,
+        });
+        assert_eq!(app.notice, warning);
+        // a refusal while the close is held leaves the warning showing
+        app.open_path(&path, &ctx);
+        assert_eq!(app.notice, warning);
         assert!(!app.hold_close(), "the second close closes");
 
         // a later export is held again
@@ -1831,7 +1922,7 @@ mod tests {
     }
 
     #[test]
-    fn a_running_job_shows_a_refusal_and_holds_back_the_export() {
+    fn a_running_job_shows_a_refusal_and_holds_back_every_export() {
         use crate::model::SeriesKey;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1843,52 +1934,121 @@ mod tests {
             instance: None,
         });
         // a job that runs until the test lets it go
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let out = dir.path().join("held.csv");
-        let job_out = out.clone();
-        app.job = Some(Job::run(
-            Kind::Export,
-            out,
-            "Writing held.csv".into(),
-            ctx.clone(),
-            move || {
-                let _ = held.recv();
-                Ok(Done::Exported {
-                    path: job_out,
-                    summary: "Released".into(),
-                })
-            },
-        ));
+        let release = hold_job(&mut app, &ctx, dir.path().join("held.csv"));
         app.open_path(&dir.path().join("other.bin"), &ctx);
 
         // the spinner asks for frames without end, so each run stops at the
         // step limit rather than when the window is still
-        let export_enabled = |harness: &mut Harness<'_>| {
+        let export_items = |harness: &mut Harness<'_>| -> Vec<bool> {
             harness.get_by_label("File").click();
             harness.run_ok();
             harness.get_by_label("Export \u{23F5}").hover();
             harness.run_ok();
-            !harness
-                .get_by_label("Plotted series as CSV\u{2026}")
-                .accesskit_node()
-                .is_disabled()
+            let mut items = vec![
+                "Plotted series as CSV\u{2026}",
+                "Parameters as .param\u{2026}",
+            ];
+            if cfg!(feature = "parquet") {
+                items.push("Whole log as Parquet\u{2026}");
+            }
+            items
+                .iter()
+                .map(|item| !harness.get_by_label(item).accesskit_node().is_disabled())
+                .collect()
         };
-        let mut harness = Harness::builder()
-            .with_size(egui::vec2(1400.0, 900.0))
-            .build_ui(|ui| app.show(ui));
+        let mut harness = harness(&mut app);
         harness.run_ok();
         // the refusal shows beside the job it waits for
         harness.get_by_label("Writing held.csv\u{2026}");
         harness.get_by_label("Still busy: Writing held.csv\u{2026}");
-        assert!(!export_enabled(&mut harness), "not while a job runs");
+        let busy = export_items(&mut harness);
+        assert!(
+            busy.iter().all(|&on| !on),
+            "none while a job runs: {busy:?}"
+        );
         drop(harness);
 
         release.send(()).unwrap();
         wait(&mut app, &ctx);
         with_ui(&mut app, |harness| {
             harness.get_by_label("Released");
-            assert!(export_enabled(harness), "once the job is done");
+            let idle = export_items(harness);
+            assert!(
+                idle.iter().all(|&on| on),
+                "all once the job is done: {idle:?}"
+            );
         });
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_file_that_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let out = dir.path().join("flight.csv");
+        std::fs::write(&out, "the export before").unwrap();
+
+        // a write that fails part way: the file before stays, and the
+        // half-written one goes
+        app.write_file(out.clone(), &ctx, |file, _| {
+            file.write_all(b"half a row")?;
+            Err(std::io::Error::other("disk full"))
+        });
+        wait(&mut app, &ctx);
+        assert_eq!(
+            app.notice,
+            Some(Notice {
+                text: format!("{}: disk full", out.display()),
+                error: true,
+            })
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "the export before");
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| worker::file_name(&entry.unwrap().path()))
+            .collect();
+        names.sort();
+        assert_eq!(names, ["flight.bin", "flight.csv"]);
+
+        // a write that finishes replaces it
+        app.write_file(out.clone(), &ctx, |file, name| {
+            file.write_all(b"the export after")?;
+            Ok(format!("Wrote {name}"))
+        });
+        wait(&mut app, &ctx);
+        assert_eq!(
+            app.notice,
+            Some(Notice {
+                text: "Wrote flight.csv".into(),
+                error: false,
+            })
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "the export after");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        // an ordinary file, not an owner-only temporary one; the usual
+        // umask leaves it readable to others
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+            assert_eq!(mode & 0o044, 0o044, "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_export_says_what_comes_first() {
+        assert_eq!(
+            disabled_reason(false, false, "Plot a series first"),
+            "Wait for the running job"
+        );
+        assert_eq!(
+            disabled_reason(true, false, "Plot a series first"),
+            "Open a log first"
+        );
+        assert_eq!(
+            disabled_reason(true, true, "Plot a series first"),
+            "Plot a series first"
+        );
     }
 
     #[test]

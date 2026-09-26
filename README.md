@@ -6,7 +6,9 @@ through [dflog](https://github.com/Poholos/dflog) and drawing the map
 with [walkers](https://github.com/podusowski/walkers). It is for looking
 at what a vehicle did after the flight, drive or dive: plotting any field
 of any message against time, over the flight modes, with the values under
-the cursor read out, the track on a map and the log's events in a list.
+the cursor read out, the track on a map, the log's events in a list and
+its parameters in a table, and the data out again as CSV, a `.param` file
+or Parquet.
 
 The tool is early. What works today:
 
@@ -58,8 +60,10 @@ The tool is early. What works today:
   sample time, one column per series, a cell empty where a series has no
   sample at that time, and nothing interpolated. A `time_s` column in
   seconds since boot and, when the log has a GPS clock, a `utc` column in
-  ISO 8601 to the microsecond come first. Values scaled by a power of ten
-  and values from float32 fields print exactly as the log stored them. The
+  ISO 8601 to the microsecond come first. Each value prints with the
+  fewest digits that read back as it: a whole number scaled by a power of
+  ten as the decimal it stands for, and a float32 field as the float32 the
+  log stored, divided by that power when it has one. The
   whole log, or only the time range in view when the plot is zoomed.
   Series hidden through the legend stay out.
 - **Parameter file export** (File > Export) as a `.param` file of
@@ -72,6 +76,8 @@ The tool is early. What works today:
   an earlier export; an export that fails leaves nothing behind. Built by
   default through the `parquet` feature; `--no-default-features` leaves
   it and the Arrow dependency tree out.
+- **A failed export leaves the file that was there**: a CSV or `.param`
+  file is written beside its target and moved over it only when complete.
 - **Closing during an export asks twice**: the first close while one
   writes is held with a notice, and a second close quits anyway.
 - **Preferences** persist: theme, time axis, mode bands, which panels are

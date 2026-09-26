@@ -21,10 +21,10 @@ pub struct Param {
     /// value at boot: normally the dump's record, or the record of a set
     /// made while the dump was still streaming.
     pub initial: f32,
-    /// The first finite default among the name's records. None when the
-    /// log's `PARM` format has no `Default` field, or every record's is
-    /// NaN, which ArduPilot writes when it has none and on the records it
-    /// logs for a set.
+    /// The first default among the name's records that is finite as a
+    /// float32. None when the log's `PARM` format has no `Default` field,
+    /// or every record's is too large for a float32 or NaN, which ArduPilot
+    /// writes when it has none and on the records it logs for a set.
     pub default: Option<f32>,
     /// Later records whose value differs from the one before, with the
     /// board time of each, in seconds.
@@ -78,15 +78,17 @@ pub fn read(log: &Log, timeline: &[f64]) -> Vec<Param> {
         let (Some(name), Some(value)) = (name, value) else {
             continue;
         };
+        // finite as the float32 a parameter is, not only as the wider
+        // number a nonstandard layout may log: 1e300 narrows to infinity
+        let value = value as f32;
         if name.is_empty() || !value.is_finite() {
             continue;
         }
-        let value = value as f32;
         let default = record
             .value("Default")
             .and_then(|v| v.as_f64())
-            .filter(|d| d.is_finite())
-            .map(|d| d as f32);
+            .map(|d| d as f32)
+            .filter(|d| d.is_finite());
         if let Some(param) = params.get_mut(&name) {
             if param.last() != value {
                 param
@@ -319,7 +321,7 @@ mod tests {
     use dflog::access::Value;
     use dflog::write::LogWriter;
 
-    /// The `PARM` layouts ArduPilot has logged.
+    /// The `PARM` layouts ArduPilot has logged, and one it never has.
     #[derive(Clone, Copy, PartialEq)]
     enum Layout {
         /// `TimeUS,Name,Value,Default`.
@@ -328,6 +330,9 @@ mod tests {
         Timed,
         /// `Name,Value`, without a time.
         Untimed,
+        /// A value and default logged as doubles, which no ArduPilot
+        /// writes; what a float32 cannot hold shows only here.
+        Double,
     }
 
     /// A log whose `PARM` type has `layout`, with `records` as (time in us,
@@ -338,6 +343,7 @@ mod tests {
             Layout::Current => ("QNff", &["TimeUS", "Name", "Value", "Default"]),
             Layout::Timed => ("QNf", &["TimeUS", "Name", "Value"]),
             Layout::Untimed => ("Nf", &["Name", "Value"]),
+            Layout::Double => ("QNdd", &["TimeUS", "Name", "Value", "Default"]),
         };
         let mut w = LogWriter::new();
         w.define(1, "PARM", format, labels).unwrap();
@@ -353,7 +359,7 @@ mod tests {
             }
             values.push(Value::Str(name.into()));
             values.push(Value::F64(value));
-            if layout == Layout::Current {
+            if matches!(layout, Layout::Current | Layout::Double) {
                 values.push(Value::F64(default.unwrap_or(f64::NAN)));
             }
             w.record("PARM", &values).unwrap();
@@ -466,6 +472,23 @@ mod tests {
         assert_eq!(untimed.len(), 1);
         // the change takes the time of the last timed record before it
         assert!((untimed[0].changes[0].0 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn what_a_float32_cannot_hold_is_left_out() {
+        // a value beyond float32 is skipped like a NaN, a default beyond it
+        // is dropped, and a value that fits keeps its float32 digits
+        let params = read_log(&log(
+            Layout::Double,
+            &[
+                (1_000_000, "TOO_BIG", 1e300, Some(1.0)),
+                (1_000_000, "FITS", 0.137, Some(1e300)),
+            ],
+        ));
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["FITS"]);
+        assert_eq!(params[0].default, None);
+        assert_eq!(value_text(params[0].initial), "0.137");
     }
 
     #[test]

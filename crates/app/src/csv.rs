@@ -1,13 +1,13 @@
 //! CSV export of the plotted series: one row per sample time, one column
-//! per series, nothing interpolated, and values exact where the log's
-//! scaling allows: through a power of ten, or from a float32 field.
+//! per series, nothing interpolated, and every value the log's, with the
+//! fewest digits that read back as it; see [`Digits`].
 
 use std::io::{self, Write};
 use std::ops::{Range, RangeInclusive};
 
 use dflog::time::TimeBase;
 
-use crate::model::Series;
+use crate::model::{Scale, Series, power_of_ten};
 use crate::timefmt;
 use crate::worker;
 
@@ -17,11 +17,86 @@ pub struct Column {
     /// `IMU[1].GyrX (rad/s)`
     pub title: String,
     pub data: Series,
-    /// Whether the values came from an `f` field, a float32 in the log,
-    /// and so print as one: a stored 123.4 scaled by 1e-3 in `f64` is
-    /// 0.1234000015258789, and cast back to the nearest float32 it is
-    /// 0.1234. A quotient of a float32 has no more precision than that.
-    pub single: bool,
+    /// How the cells print.
+    pub digits: Digits,
+}
+
+/// How a column's cells print: the fewest digits that read back as the
+/// value the log stored, after its scaling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Digits {
+    /// The fewest digits that read back as the `f64` plotted: an integer
+    /// field, scaled or not, or a float32 field under a [`Scale::Multiply`]
+    /// factor, such as 3.6 or 100. An integer divided by a power of ten
+    /// prints as the decimal it stands for, 41 over 10 as `4.1`.
+    Double,
+    /// A float32 field, as the log stored it: the fewest digits that read
+    /// back as that float32, `0.3` rather than `0.30000001192092896`.
+    Single,
+    /// A float32 field divided by ten to this power: the stored float32's
+    /// digits with the decimal point moved that many places, so the cell
+    /// is exact. Rounding the quotient to a float32 instead would lose
+    /// digits: 1.7000004 and 1.7000005 are neighboring float32 values,
+    /// and over 10 both would round to 0.17000005.
+    SingleOver(u8),
+}
+
+impl Digits {
+    /// The digits of a field's cells: `single` when it is a float32 in the
+    /// log, with the scaling its values went through.
+    #[must_use]
+    pub fn of(single: bool, scale: Scale) -> Digits {
+        match (single, scale) {
+            (false, _) | (true, Scale::Multiply(_)) => Digits::Double,
+            (true, Scale::Unit) => Digits::Single,
+            (true, Scale::Divide(exponent)) => Digits::SingleOver(exponent),
+        }
+    }
+
+    fn write(self, out: &mut impl Write, value: f64) -> io::Result<()> {
+        match self {
+            Digits::Double => write!(out, "{value}"),
+            Digits::Single => write!(out, "{}", value as f32),
+            Digits::SingleOver(places) => {
+                // the stored float32 back from the quotient: the division's
+                // rounding in f64 is far below a float32's spacing
+                let stored = (value * power_of_ten(places)) as f32;
+                write!(out, "{}", shifted(stored, places))
+            }
+        }
+    }
+}
+
+/// `stored` with its decimal point moved `places` to the left: 1.7000004
+/// over 10 is `0.17000004`, 1500 over 100 is `15`, and 3 over 1000 is
+/// `0.003`. Display never writes a float with an exponent, so the digits
+/// are all there to move.
+fn shifted(stored: f32, places: u8) -> String {
+    let text = format!("{stored}");
+    if !stored.is_finite() {
+        return text;
+    }
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.as_str()),
+    };
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    let places = usize::from(places);
+    let mut out = String::from(sign);
+    if int.len() > places {
+        let (head, tail) = int.split_at(int.len() - places);
+        out.push_str(head);
+        out.push('.');
+        out.push_str(tail);
+    } else {
+        out.push_str("0.");
+        out.extend(std::iter::repeat_n('0', places - int.len()));
+        out.push_str(int);
+    }
+    out.push_str(frac);
+    let kept = out.trim_end_matches('0').trim_end_matches('.').len();
+    out.truncate(kept);
+    out
 }
 
 /// What one export writes.
@@ -89,14 +164,7 @@ impl Export {
                     .get(*n)
                     .filter(|&i| column.data.xs[i].total_cmp(&time).is_eq())
                 {
-                    // the fewest digits that read back exactly, as a
-                    // float32 when the field stored one
-                    let value = column.data.ys[i];
-                    if column.single {
-                        write!(out, "{}", value as f32)?;
-                    } else {
-                        write!(out, "{value}")?;
-                    }
+                    column.digits.write(out, column.data.ys[i])?;
                     *n += 1;
                 }
             }
@@ -182,14 +250,14 @@ fn quoted(name: &str) -> String {
 mod tests {
     use super::*;
 
-    fn column(title: &str, xs: &[f64], ys: &[f64], single: bool) -> Column {
+    fn column(title: &str, xs: &[f64], ys: &[f64], digits: Digits) -> Column {
         Column {
             title: title.into(),
             data: Series {
                 xs: xs.to_vec(),
                 ys: ys.to_vec(),
             },
-            single,
+            digits,
         }
     }
 
@@ -207,9 +275,14 @@ mod tests {
                     "ATT.Roll (deg)",
                     &[1.0, 2.0, 2.5],
                     &[0.0, 1.5, -3.25],
-                    false,
+                    Digits::Double,
                 ),
-                column("IMU[1].GyrX (rad/s)", &[2.0, 3.0], &[0.5, 0.25], true),
+                column(
+                    "IMU[1].GyrX (rad/s)",
+                    &[2.0, 3.0],
+                    &[0.5, 0.25],
+                    Digits::Single,
+                ),
             ],
             // 2023-11-14 22:13:20 UTC at 0.5 s of board time
             time_base: Some(TimeBase {
@@ -237,18 +310,38 @@ mod tests {
     #[test]
     fn values_print_as_the_log_stored_them() {
         // a float32 field's 123.4, scaled by 1e-3 in f64, carries the
-        // cast's noise
+        // cast's noise; two neighboring float32 values over 10 are closer
+        // than a float32 can tell apart, and the next test prints them as two
         let scaled = f64::from(123.4f32) / 1000.0;
         assert_eq!(format!("{scaled}"), "0.1234000015258789");
+        let low = 1.700_000_4_f32;
+        let high = f32::from_bits(low.to_bits() + 1);
+        assert_eq!(format!("{high}"), "1.7000005");
+        assert_eq!(
+            ((f64::from(low) / 10.0) as f32).to_bits(),
+            ((f64::from(high) / 10.0) as f32).to_bits(),
+            "rounded to a float32, the quotients merge"
+        );
         let export = Export {
             columns: vec![
                 column(
                     "BAT.CurrTot (Ah)",
-                    &[1.0, 2.0, 3.0],
-                    &[scaled, 0.1, 42.0],
-                    true,
+                    &[1.0, 2.0, 3.0, 4.0],
+                    &[scaled, 0.1, 42.0, f64::from(high) / 1000.0],
+                    Digits::SingleOver(3),
                 ),
-                column("GPS.NSats", &[1.0, 2.0, 3.0], &[scaled, 12.0, 1e21], false),
+                column(
+                    "GPS.NSats",
+                    &[1.0, 2.0, 3.0, 4.0],
+                    &[scaled, 12.0, 1e21, f64::from(high) / 10.0],
+                    Digits::Double,
+                ),
+                column(
+                    "BAT.Curr (A)",
+                    &[1.0, 2.0, 3.0, 4.0],
+                    &[f64::from(0.3f32), -0.5, 42.0, f64::from(high) / 10.0],
+                    Digits::Single,
+                ),
             ],
             time_base: None,
             range: None,
@@ -256,11 +349,43 @@ mod tests {
         let (file, _) = text(&export);
         assert_eq!(
             file,
-            "time_s,BAT.CurrTot (Ah),GPS.NSats\n\
-             1.000000,0.1234,0.1234000015258789\n\
-             2.000000,0.1,12\n\
-             3.000000,42,1000000000000000000000\n"
+            "time_s,BAT.CurrTot (Ah),GPS.NSats,BAT.Curr (A)\n\
+             1.000000,0.1234,0.1234000015258789,0.3\n\
+             2.000000,0.1,12,-0.5\n\
+             3.000000,42,1000000000000000000000,42\n\
+             4.000000,0.0017000005,0.1700000524520874,0.17000005\n"
         );
+    }
+
+    #[test]
+    fn a_float32_over_a_power_of_ten_keeps_its_digits() {
+        // 1.7000004 and 1.7000005 both round to 0.17000005 as float32
+        // quotients; their digits moved one place tell them apart
+        let low = 1.700_000_4_f32;
+        let high = f32::from_bits(low.to_bits() + 1);
+        let mut out = Vec::new();
+        for value in [low, high] {
+            Digits::SingleOver(1)
+                .write(&mut out, f64::from(value) / 10.0)
+                .unwrap();
+            out.push(b' ');
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), "0.17000004 0.17000005 ");
+
+        assert_eq!(shifted(1500.0, 2), "15");
+        assert_eq!(shifted(1500.0, 3), "1.5");
+        assert_eq!(shifted(3.0, 3), "0.003");
+        assert_eq!(shifted(-0.5, 1), "-0.05");
+        assert_eq!(shifted(0.0, 6), "0");
+        assert_eq!(shifted(1e10, 1), "1000000000");
+        assert_eq!(shifted(123.4, 3), "0.1234");
+
+        // a float32 multiplied by another factor prints as the f64 product,
+        // which two stored values never share
+        assert_eq!(Digits::of(true, Scale::Multiply(3.6)), Digits::Double);
+        assert_eq!(Digits::of(true, Scale::Unit), Digits::Single);
+        assert_eq!(Digits::of(true, Scale::Divide(2)), Digits::SingleOver(2));
+        assert_eq!(Digits::of(false, Scale::Divide(2)), Digits::Double);
     }
 
     #[test]
@@ -271,10 +396,10 @@ mod tests {
                     "A,B (m)",
                     &[1.0, 2.0, 3.0, 4.0],
                     &[1.0, 2.0, 3.0, 4.0],
-                    false,
+                    Digits::Double,
                 ),
-                column("X \"raw\"", &[2.5], &[7.0], false),
-                column("Plain", &[], &[], false),
+                column("X \"raw\"", &[2.5], &[7.0], Digits::Double),
+                column("Plain", &[], &[], Digits::Double),
             ],
             time_base: None,
             range: Some(2.0..=3.0),
@@ -308,8 +433,13 @@ mod tests {
         // a sorted and an unsorted column merge as one file
         let export = Export {
             columns: vec![
-                column("Sorted", &[1.0, 2.0, 3.0], &[10.0, 20.0, 30.0], false),
-                column("Unsorted", &[3.0, 1.0], &[0.5, 0.25], true),
+                column(
+                    "Sorted",
+                    &[1.0, 2.0, 3.0],
+                    &[10.0, 20.0, 30.0],
+                    Digits::Double,
+                ),
+                column("Unsorted", &[3.0, 1.0], &[0.5, 0.25], Digits::Single),
             ],
             time_base: None,
             range: Some(1.5..=3.0),
@@ -335,7 +465,7 @@ mod tests {
                 "NOTM.Value",
                 &[3.0, 1.0, 1.0],
                 &[30.0, 10.0, 11.0],
-                false,
+                Digits::Double,
             )],
             time_base: None,
             range: None,
