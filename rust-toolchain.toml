@@ -1,5 +1,5 @@
-# Every machine builds with this exact compiler so artifacts differ by
-# target, not toolchain. Bump deliberately, not as a side effect.
+# Every machine builds with this minor release; patch releases arrive
+# with `rustup update`. Move to a new minor release deliberately.
 [toolchain]
-channel = "1.98.0"
+channel = "1.98"
 components = ["rustfmt", "clippy"]

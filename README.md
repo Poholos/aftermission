@@ -46,18 +46,24 @@ The tool is early. What works today:
   ArduPilot's tables, and the mode changes, in one list in time order with
   a toggle per kind and a filter. A click on a row seeks the plot and the
   map to its time; the row the cursor has passed is highlighted.
+- **Parameters**: a tab beside the events with every `PARM` name, its
+  last value, its default where the log records one, and how often it
+  changed after boot. A changed parameter unfolds to its history, the boot
+  value first; a click on a change seeks the plot and the map to it.
+  Toggles narrow the table to parameters off their default or changed
+  after boot, and a filter to a name.
 - **Preferences** persist: theme, time axis, mode bands, which panels are
-  open, map tiles and the recent files.
+  open and which tab the bottom one shows, map tiles and the recent files.
 
 A plot set up on one log carries over when another opens: series the new
 log also has are re-read, the rest are dropped.
 
-Planned next: the parameter table, CSV and Parquet export, and a browser
-build.
+Planned next: CSV, `.param` and Parquet export, and a browser build.
 
 ## Building and running
 
-The toolchain is pinned in `rust-toolchain.toml`.
+The toolchain's minor release is set in `rust-toolchain.toml`; `rustup
+update` brings its patch releases.
 
 ```bash
 cargo run --release -- path/to/flight.bin

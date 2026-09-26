@@ -1,6 +1,7 @@
 //! Preferences that survive a restart: theme, time axis, mode bands, which
-//! panels are open, map tiles and recent files. Stored through eframe's key-value
-//! storage, a file next to the app's config on native.
+//! panels are open and what the bottom one shows, map tiles and recent
+//! files. Stored through eframe's key-value storage, a file next to the
+//! app's config on native.
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,14 @@ pub enum TimeAxis {
     Utc,
 }
 
+/// What the bottom panel lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BottomTab {
+    #[default]
+    Events,
+    Parameters,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 #[expect(
@@ -36,7 +45,11 @@ pub struct Settings {
     /// The side panel unfolded.
     pub side_panel: bool,
     pub show_map: bool,
-    pub show_events: bool,
+    /// The bottom panel, with the events list and the parameter table.
+    /// Settings saved before the panel had tabs call it `show_events`.
+    #[serde(alias = "show_events")]
+    pub show_bottom: bool,
+    pub bottom_tab: BottomTab,
     /// Map tiles downloaded from OpenStreetMap; off, the track draws on a
     /// plain background and nothing leaves the machine.
     pub online_tiles: bool,
@@ -52,7 +65,8 @@ impl Default for Settings {
             show_modes: true,
             side_panel: true,
             show_map: true,
-            show_events: true,
+            show_bottom: true,
+            bottom_tab: BottomTab::default(),
             online_tiles: true,
             recent: Vec::new(),
         }
@@ -105,8 +119,13 @@ mod tests {
         assert_eq!(partial.theme, ThemePreference::Dark);
         assert_eq!(partial.time_axis, TimeAxis::Boot);
         assert!(partial.show_modes);
-        assert!(partial.show_map && partial.show_events && partial.online_tiles);
+        assert!(partial.show_map && partial.show_bottom && partial.online_tiles);
+        assert_eq!(partial.bottom_tab, BottomTab::Events);
         assert!(partial.recent.is_empty());
+
+        // the bottom panel's toggle keeps its saved value under its old name
+        let renamed: Settings = ron::from_str("(show_events: false)").unwrap();
+        assert!(!renamed.show_bottom);
     }
 
     #[test]

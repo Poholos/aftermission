@@ -4,9 +4,11 @@
 mod app;
 mod codes;
 mod events;
+mod filter;
 mod map;
 mod model;
 mod modes;
+mod params;
 mod plot;
 mod settings;
 mod timefmt;

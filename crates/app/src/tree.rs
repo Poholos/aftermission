@@ -2,6 +2,7 @@
 //! unfolding to its fields, or to its instances and their fields, with a
 //! checkbox per numeric field that puts the series on the plot.
 
+use crate::filter::Filter;
 use crate::model::{LoadedLog, MessageType, SeriesKey};
 use crate::plot::PlotPanel;
 use crate::settings::{Settings, TimeAxis};
@@ -69,15 +70,13 @@ pub fn types(
     ui: &mut egui::Ui,
     log: &LoadedLog,
     plot: &mut PlotPanel,
-    filter: &str,
+    filter: &Filter,
     open: Option<bool>,
 ) {
-    let filter = filter.trim().to_ascii_lowercase();
     let mut shown = 0;
     for t in &log.types {
-        let type_matches = filter.is_empty() || t.name.to_ascii_lowercase().contains(&filter);
-        let field_matches =
-            |label: &str| type_matches || label.to_ascii_lowercase().contains(&filter);
+        let type_matches = filter.matches(&t.name);
+        let field_matches = |label: &str| type_matches || filter.matches(label);
         if !type_matches && !t.fields.iter().any(|f| field_matches(&f.label)) {
             continue;
         }

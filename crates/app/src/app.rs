@@ -1,15 +1,18 @@
 //! The application: menus, the side panel with the log's types, the plot,
-//! the map and the events list, and the ways a log gets opened.
+//! the map, the bottom panel with the events list and the parameter
+//! table, and the ways a log gets opened.
 
 use std::path::{Path, PathBuf};
 
 use egui::{Align2, Color32, Context};
 
 use crate::events::EventsPanel;
+use crate::filter::Filter;
 use crate::map::MapPanel;
 use crate::model::LoadedLog;
+use crate::params::ParamsPanel;
 use crate::plot::PlotPanel;
-use crate::settings::{Settings, TimeAxis};
+use crate::settings::{BottomTab, Settings, TimeAxis};
 use crate::tree;
 use crate::worker::OpenJob;
 
@@ -25,6 +28,7 @@ pub struct AftermissionApp {
     plot: PlotPanel,
     map: MapPanel,
     events: EventsPanel,
+    params: ParamsPanel,
     /// The side panel's type and field filter.
     filter: String,
     /// Whether the filter was in use last frame: the headers it unfolded
@@ -70,6 +74,16 @@ impl AftermissionApp {
         self.filter = filter.to_string();
     }
 
+    #[cfg(test)]
+    pub(crate) fn params_mut(&mut self) -> &mut ParamsPanel {
+        &mut self.params
+    }
+
+    #[cfg(test)]
+    pub(crate) fn events_mut(&mut self) -> &mut EventsPanel {
+        &mut self.events
+    }
+
     /// Take the result of a finished open.
     pub fn poll(&mut self, ctx: &Context) {
         let Some(job) = &mut self.job else {
@@ -86,6 +100,7 @@ impl AftermissionApp {
                 self.settings.remember(&path);
                 self.plot.reload(&log);
                 self.map.reload();
+                self.params.reload();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
                     "{} - Aftermission",
                     log.name
@@ -211,7 +226,7 @@ impl AftermissionApp {
             ui.checkbox(&mut self.settings.show_modes, "Mode bands");
             ui.checkbox(&mut self.settings.side_panel, "Side panel");
             ui.checkbox(&mut self.settings.show_map, "Map");
-            ui.checkbox(&mut self.settings.show_events, "Events");
+            ui.checkbox(&mut self.settings.show_bottom, "Events and parameters");
             ui.checkbox(
                 &mut self.settings.online_tiles,
                 "Map tiles from OpenStreetMap",
@@ -266,7 +281,8 @@ impl AftermissionApp {
         if let Some(error) = &self.plot.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        let filtering = !self.filter.trim().is_empty();
+        let filter = Filter::new(&self.filter);
+        let filtering = !filter.is_blank();
         let open = if filtering {
             Some(true)
         } else if self.filter_was_active {
@@ -275,7 +291,7 @@ impl AftermissionApp {
             None
         };
         self.filter_was_active = filtering;
-        tree::types(ui, log, &mut self.plot, &self.filter, open);
+        tree::types(ui, log, &mut self.plot, &filter, open);
     }
 
     fn central_ui(&mut self, ui: &mut egui::Ui) {
@@ -290,8 +306,8 @@ impl AftermissionApp {
             });
             return;
         };
-        // The map to the right and the events below share the width and
-        // height with the plot, which takes what is left.
+        // The map to the right and the events or parameters below share
+        // the width and height with the plot, which takes what is left.
         if self.settings.show_map {
             egui::Panel::right("map_panel")
                 .default_size(420.0)
@@ -304,12 +320,23 @@ impl AftermissionApp {
                     }
                 });
         }
-        if self.settings.show_events {
-            egui::Panel::bottom("events_panel")
+        if self.settings.show_bottom {
+            egui::Panel::bottom("bottom_panel")
                 .default_size(180.0)
+                .resizable(true)
                 .show(ui, |ui| {
-                    let cursor = self.plot.cursor;
-                    if let Some(time) = self.events.show(ui, log, &self.settings, cursor) {
+                    let tab = &mut self.settings.bottom_tab;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(tab, BottomTab::Events, "Events");
+                        ui.selectable_value(tab, BottomTab::Parameters, "Parameters");
+                    });
+                    let seek = match *tab {
+                        BottomTab::Events => {
+                            self.events.show(ui, log, &self.settings, self.plot.cursor)
+                        }
+                        BottomTab::Parameters => self.params.show(ui, log, &self.settings),
+                    };
+                    if let Some(time) = seek {
                         self.plot.seek(time);
                     }
                 });
@@ -373,17 +400,25 @@ mod tests {
         let mut app = AftermissionApp::default();
         // tests draw the map without downloading anything
         app.settings.online_tiles = false;
+        reopen(&mut app, &path);
+        assert_eq!(app.settings.recent, [path]);
+        app
+    }
+
+    /// Open `path` in `app` and wait until the job is done.
+    fn reopen(app: &mut AftermissionApp, path: &Path) {
         let ctx = Context::default();
-        app.open_path(&path, &ctx);
+        app.open_path(path, &ctx);
         assert!(app.job.is_some(), "the open runs in the background");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while app.log().is_none() {
+        while app.job.is_some() {
             assert!(std::time::Instant::now() < deadline, "{:?}", app.error);
             app.poll(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(app.settings.recent, [path]);
-        app
+        // a failed open keeps the log before, so the error is what tells
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(app.log().is_some());
     }
 
     /// Run a frame of the app in a window with room for every panel, and
@@ -460,7 +495,7 @@ mod tests {
 
         // the panels can be turned off
         app.settings.show_map = false;
-        app.settings.show_events = false;
+        app.settings.show_bottom = false;
         with_ui(&mut app, |harness| {
             assert!(
                 harness
@@ -469,6 +504,179 @@ mod tests {
             );
             assert!(harness.query_by_label_contains("MODE Loiter").is_none());
         });
+    }
+
+    #[test]
+    fn the_parameters_tab_lists_filters_and_a_clicked_change_seeks_the_plot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Parameters").click();
+            harness.run();
+            harness.get_by_label_contains("WPNAV_SPEED");
+            harness.get_by_label_contains("ATC_RAT_RLL_P");
+            // the changed parameter unfolds to its history
+            harness.get_by_label_contains("MIS_TOTAL").click();
+            harness.run();
+            harness.get_by_label_contains("at boot");
+            harness.get_by_label_contains("0:02.320").click();
+            harness.run();
+        });
+        assert_eq!(app.settings.bottom_tab, BottomTab::Parameters);
+        assert_eq!(app.plot().cursor, Some(2.32));
+
+        // the toggles narrow the table
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Not default").click();
+            harness.run();
+            harness.get_by_label_contains("WPNAV_SPEED");
+            harness.get_by_label_contains("MIS_TOTAL");
+            assert!(harness.query_by_label_contains("ATC_RAT_RLL_P").is_none());
+            assert!(harness.query_by_label_contains("SIM_RATE_HZ").is_none());
+            harness.get_by_label("Changed after boot").click();
+            harness.run();
+            harness.get_by_label_contains("MIS_TOTAL");
+            assert!(harness.query_by_label_contains("WPNAV_SPEED").is_none());
+        });
+
+        // the filter narrows by name, and to nothing
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Not default").click();
+            harness.run();
+            harness.get_by_label("Changed after boot").click();
+            harness.run();
+        });
+        app.params_mut().set_filter("wpnav");
+        with_ui(&mut app, |harness| {
+            harness.get_by_label_contains("WPNAV_SPEED");
+            assert!(harness.query_by_label_contains("MIS_TOTAL").is_none());
+            assert!(harness.query_by_label_contains("ATC_RAT_RLL_P").is_none());
+        });
+        app.params_mut().set_filter("rtl");
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Nothing matches.");
+        });
+
+        // a log opened afresh starts with every history folded
+        app.params_mut().set_filter("");
+        let path = app.settings.recent[0].clone();
+        reopen(&mut app, &path);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label_contains("MIS_TOTAL");
+            assert!(harness.query_by_label_contains("at boot").is_none());
+        });
+    }
+
+    #[test]
+    fn the_bottom_panel_keeps_its_height_on_either_tab_and_after_a_drag() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        // enough parameters and events that both lists have to scroll
+        let mut w = LogWriter::new();
+        w.define(1, "PARM", "QNff", &["TimeUS", "Name", "Value", "Default"])
+            .unwrap();
+        w.define(2, "EV", "QB", &["TimeUS", "Id"]).unwrap();
+        for i in 0..40u64 {
+            w.record("EV", &[Value::U64(2_000_000 + i * 1000), Value::U64(10)])
+                .unwrap();
+        }
+        for i in 0..120u64 {
+            w.record(
+                "PARM",
+                &[
+                    Value::U64(1_000_000),
+                    Value::Str(format!("TEST_P{i:03}")),
+                    Value::F64(i as f64),
+                    Value::F64(0.0),
+                ],
+            )
+            .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.bin");
+        std::fs::write(&path, w.into_bytes()).unwrap();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        app.settings.bottom_tab = BottomTab::Parameters;
+        reopen(&mut app, &path);
+
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui_state(|ui, app: &mut AftermissionApp| app.show(ui), app);
+        let height = |harness: &Harness<'_, AftermissionApp>| {
+            egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("bottom_panel"))
+                .expect("the bottom panel has drawn")
+                .size()
+                .y
+        };
+        // a table that scrolls does not grow the panel past its default
+        harness.run();
+        harness.get_by_label_contains("TEST_P000");
+        let before = height(&harness);
+        assert!(before < 200.0, "the panel grew to {before}");
+
+        // nor does it shrink to one row or the empty message, and stay
+        // there
+        for filter in ["no-such-name", "TEST_P000", ""] {
+            harness.state_mut().params_mut().set_filter(filter);
+            harness.run();
+            let now = height(&harness);
+            assert!(
+                (now - before).abs() < 1.0,
+                "filtered to {filter:?}, the panel went from {before} to {now}"
+            );
+        }
+        harness.get_by_label_contains("TEST_P000");
+
+        // the events list holds it too
+        harness.state_mut().settings.bottom_tab = BottomTab::Events;
+        for filter in ["no-such-event", ""] {
+            harness.state_mut().events_mut().set_filter(filter);
+            harness.run();
+            let now = height(&harness);
+            assert!(
+                (now - before).abs() < 1.0,
+                "events filtered to {filter:?}, the panel went from {before} to {now}"
+            );
+        }
+        // rows on screen, so the list itself held the height
+        assert!(harness.get_all_by_label_contains("Armed").count() > 1);
+
+        // dragged small on one tab, the panel stays small on the other
+        harness.state_mut().settings.bottom_tab = BottomTab::Parameters;
+        harness.run();
+        // the edge from the stored rect: the central panel's margin keeps
+        // the panel off the window's bottom
+        let rect =
+            egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("bottom_panel"))
+                .expect("the bottom panel has drawn")
+                .outer_rect;
+        let at = |y: f32| egui::pos2(rect.center().x, y);
+        let (edge, target) = (rect.min.y, rect.min.y + 100.0);
+        harness.hover_at(at(edge));
+        harness.run();
+        harness.drag_at(at(edge));
+        harness.run();
+        for step in 1..=5u8 {
+            harness.hover_at(at(edge + (target - edge) * f32::from(step) / 5.0));
+            harness.run();
+        }
+        harness.drop_at(at(target));
+        harness.run();
+        let small = height(&harness);
+        assert!(
+            (small - (before - 100.0)).abs() < 1.0,
+            "the drag left the panel at {small}"
+        );
+        harness.state_mut().settings.bottom_tab = BottomTab::Events;
+        harness.run();
+        let now = height(&harness);
+        assert!(
+            (now - small).abs() < 1.0,
+            "the events tab took the panel from {small} to {now}"
+        );
+        assert!(harness.get_all_by_label_contains("Armed").count() > 1);
     }
 
     #[test]

@@ -17,6 +17,7 @@ dflog.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui_plot.workspace = true
+egui_extras.workspace = true
 rfd.workspace = true
 walkers.workspace = true
 serde.workspace = true

@@ -1,8 +1,8 @@
 //! A scanned log as the review tool sees it: message types with their
 //! fields, units and instances, a time for every record, the flight mode
-//! changes, the wall-clock base, the vehicle's track and its events. Built
-//! once, off the UI thread, from a [`dflog::Log`]; series are extracted
-//! from it on demand.
+//! changes, the wall-clock base, the vehicle's track, its events and its
+//! parameters. Built once, off the UI thread, from a [`dflog::Log`];
+//! series are extracted from it on demand.
 
 use dflog::columns::{self, ColumnError};
 use dflog::time::TimeBase;
@@ -10,6 +10,7 @@ use dflog::{FmtDef, Log, ScanStats};
 
 use crate::codes;
 use crate::modes::Vehicle;
+use crate::params::{self, Param};
 use crate::settings::TimeAxis;
 
 /// One field of a message type, with the units metadata the log carries
@@ -242,6 +243,8 @@ pub struct LoadedLog {
     pub track: Track,
     /// In time order.
     pub events: Vec<Event>,
+    /// Sorted by name.
+    pub params: Vec<Param>,
 }
 
 impl LoadedLog {
@@ -310,10 +313,12 @@ impl LoadedLog {
             .find_map(|record| Vehicle::from_banner(record.value("Message")?.as_str()?))
             .unwrap_or_default();
         let modes = mode_changes(&log, &timeline, vehicle);
+        let params = params::read(&log, &timeline);
 
         let mut loaded = LoadedLog {
             name,
             types,
+            params,
             timeline,
             time_base: log.time_base(),
             modes,
@@ -641,7 +646,7 @@ fn events(log: &LoadedLog) -> Vec<Event> {
 }
 
 /// Seconds since boot of the record at `lineno` of the timeline.
-fn time_of(timeline: &[f64], lineno: u64) -> f64 {
+pub(crate) fn time_of(timeline: &[f64], lineno: u64) -> f64 {
     timeline.get(lineno as usize).copied().unwrap_or(f64::NAN)
 }
 
@@ -679,13 +684,31 @@ pub(crate) mod testlog {
     use dflog::write::LogWriter;
 
     /// A copter log: units and multipliers, one mode change, `ATT` with a
-    /// scaled field, `IMU` in two instances, a `PARM`-like type without a
-    /// time field, three `POS` positions, an error and an event.
+    /// scaled field, `IMU` in two instances, a type without a time field,
+    /// three `POS` positions, an error, an event, and four parameters, one
+    /// of them changed after boot.
     pub fn bytes() -> Vec<u8> {
         let mut w = LogWriter::new();
         define(&mut w);
         metadata(&mut w);
         let us = |t: u64| Value::U64(t);
+        let parm = |w: &mut LogWriter, t: u64, name: &str, value: f64, default: f64| {
+            w.record(
+                "PARM",
+                &[
+                    us(t),
+                    Value::Str(name.into()),
+                    Value::F64(value),
+                    Value::F64(default),
+                ],
+            )
+            .unwrap();
+        };
+        // the dump at boot; SIM_RATE_HZ has no default to log
+        parm(&mut w, 1_000_000, "WPNAV_SPEED", 1500.0, 1200.0);
+        parm(&mut w, 1_000_000, "MIS_TOTAL", 4.0, 4.0);
+        parm(&mut w, 1_000_000, "SIM_RATE_HZ", 380.0, f64::NAN);
+        parm(&mut w, 1_000_000, "ATC_RAT_RLL_P", 0.137, 0.137);
         w.record(
             "MODE",
             &[us(1_500_000), Value::U64(0), Value::U64(0), Value::U64(26)],
@@ -730,6 +753,11 @@ pub(crate) mod testlog {
             if i == 1 {
                 w.record("NOTM", &[Value::U64(7), Value::F64(42.0)])
                     .unwrap();
+            }
+            if i == 3 {
+                // a mission uploaded after boot, its count logged twice
+                parm(&mut w, 2_320_000, "MIS_TOTAL", 7.0, f64::NAN);
+                parm(&mut w, 2_330_000, "MIS_TOTAL", 7.0, f64::NAN);
             }
             if i < 3 {
                 // a short hop north-east, 50 ms after each attitude sample
@@ -786,6 +814,8 @@ pub(crate) mod testlog {
         w.define(10, "ERR", "QBB", &["TimeUS", "Subsys", "ECode"])
             .unwrap();
         w.define(11, "EV", "QB", &["TimeUS", "Id"]).unwrap();
+        w.define(12, "PARM", "QNff", &["TimeUS", "Name", "Value", "Default"])
+            .unwrap();
     }
 
     /// The banner and the units tables, all at one second.
@@ -833,8 +863,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "ATT", "ERR", "EV", "FMT", "FMTU", "IMU", "MODE", "MSG", "MULT", "NOTM", "POS",
-                "UNIT"
+                "ATT", "ERR", "EV", "FMT", "FMTU", "IMU", "MODE", "MSG", "MULT", "NOTM", "PARM",
+                "POS", "UNIT"
             ]
         );
         let att = log.type_named("ATT").unwrap();
@@ -982,6 +1012,33 @@ mod tests {
             ]
         );
         assert_eq!(log.wall_clock(TimeAxis::Utc), None, "no GPS");
+
+        // what the window tests rely on: each parameter against its
+        // default, and when it changed; params.rs tests the reading itself
+        let params: Vec<(&str, Option<bool>, Vec<f64>)> = log
+            .params
+            .iter()
+            .map(|p| {
+                let times = p.changes.iter().map(|&(time, _)| time).collect();
+                (p.name.as_str(), p.off_default(), times)
+            })
+            .collect();
+        assert_eq!(params.len(), 4);
+        assert_eq!(params[0].0, "ATC_RAT_RLL_P");
+        assert_eq!(params[0].1, Some(false), "at its default");
+        assert_eq!(params[1].0, "MIS_TOTAL");
+        assert_eq!(params[1].1, Some(true), "set away from it after boot");
+        assert!(close(&params[1].2, &[2.32]), "{:?}", params[1].2);
+        assert_eq!(params[2].0, "SIM_RATE_HZ");
+        assert_eq!(params[2].1, None, "no default logged");
+        assert_eq!(params[3].0, "WPNAV_SPEED");
+        assert_eq!(params[3].1, Some(true), "off it from boot");
+        assert!(
+            params
+                .iter()
+                .filter(|p| p.0 != "MIS_TOTAL")
+                .all(|p| p.2.is_empty())
+        );
     }
 
     /// Before `TimeUS`, types carried `TimeMS` as board time, except GPS,

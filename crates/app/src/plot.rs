@@ -166,7 +166,8 @@ impl PlotPanel {
     }
 
     /// Put the cursor at `time`, panning the view there when it is off
-    /// screen: what a click in the events list or on the map does.
+    /// screen: what a click in the events list, on a parameter change or
+    /// on the map does.
     pub fn seek(&mut self, time: f64) {
         self.cursor = Some(time);
         self.pending_seek = Some(time);

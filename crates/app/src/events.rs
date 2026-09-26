@@ -4,6 +4,7 @@
 
 use egui::RichText;
 
+use crate::filter::Filter;
 use crate::model::{Event, EventKind, LoadedLog};
 use crate::settings::Settings;
 use crate::timefmt;
@@ -34,6 +35,11 @@ impl Default for EventsPanel {
 }
 
 impl EventsPanel {
+    #[cfg(test)]
+    pub(crate) fn set_filter(&mut self, filter: &str) {
+        self.filter = filter.to_string();
+    }
+
     /// The list, with the kind toggles and the filter above it. The row
     /// last passed by `cursor` is highlighted; the time of a clicked row
     /// is returned, to seek to.
@@ -54,12 +60,11 @@ impl EventsPanel {
                     .desired_width(180.0),
             );
         });
-        let filter = self.filter.trim().to_ascii_lowercase();
+        let filter = Filter::new(&self.filter);
         let rows: Vec<&Event> = log
             .events
             .iter()
-            .filter(|e| self.is_shown(e.kind))
-            .filter(|e| filter.is_empty() || e.text.to_ascii_lowercase().contains(&filter))
+            .filter(|e| self.is_shown(e.kind) && filter.matches(&e.text))
             .collect();
         if rows.is_empty() {
             ui.weak(if log.events.is_empty() {
@@ -67,6 +72,8 @@ impl EventsPanel {
             } else {
                 "Nothing matches."
             });
+            // the panel keeps its height: it stores what its content used
+            ui.take_available_space();
             return None;
         }
         // the row the cursor has passed most recently
@@ -78,11 +85,12 @@ impl EventsPanel {
 
         let mut seek = None;
         let row_height = ui.spacing().interact_size.y;
-        egui::ScrollArea::vertical().auto_shrink(false).show_rows(
-            ui,
-            row_height,
-            rows.len(),
-            |ui, range| {
+        // the list takes the height the panel gives it, as the parameter
+        // table does, so switching tabs does not resize the panel
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .min_scrolled_height(0.0)
+            .show_rows(ui, row_height, rows.len(), |ui, range| {
                 for index in range {
                     let e = rows[index];
                     let text = format!(
@@ -99,8 +107,7 @@ impl EventsPanel {
                         seek = Some(e.time);
                     }
                 }
-            },
-        );
+            });
         seek
     }
 
@@ -117,7 +124,8 @@ fn kind_name(kind: EventKind) -> &'static str {
     match kind {
         EventKind::Message => "Messages",
         EventKind::Error => "Errors",
-        EventKind::Event => "Events",
+        // not "Events": the bottom panel's tab has that name
+        EventKind::Event => "Vehicle events",
         EventKind::Mode => "Modes",
     }
 }
