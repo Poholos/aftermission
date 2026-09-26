@@ -1,5 +1,6 @@
-//! Opening a log on a worker thread, so the UI keeps painting while the
-//! file is mapped, scanned and modeled.
+//! Work off the UI thread, so the window keeps painting: opening a log,
+//! which maps, scans and models the file, and writing an export. One job
+//! runs at a time.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -8,44 +9,90 @@ use dflog::Log;
 
 use crate::model::LoadedLog;
 
-/// A log being opened.
-pub struct OpenJob {
-    pub path: PathBuf,
-    /// The file's size when the job started, for the progress line.
-    pub bytes: Option<u64>,
-    rx: Receiver<Result<LoadedLog, String>>,
+/// What a job is doing, for where its outcome goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Open,
+    Export,
 }
 
-impl std::fmt::Debug for OpenJob {
+/// What a finished job hands back.
+#[derive(Debug)]
+pub enum Done {
+    /// The log at `path`, modeled; boxed, so the enum stays the size of
+    /// its other variant.
+    Opened { path: PathBuf, log: Box<LoadedLog> },
+    /// A file written at `path`; `summary` is what the status line says.
+    Exported { path: PathBuf, summary: String },
+}
+
+/// Work running on a worker thread.
+pub struct Job {
+    pub kind: Kind,
+    /// The file the job reads or writes, which names it in an error.
+    pub path: PathBuf,
+    /// What the status line says while it runs: `Indexing flight.bin
+    /// (12.3 MB)`, `Writing flight.csv`.
+    pub label: String,
+    rx: Receiver<Result<Done, String>>,
+}
+
+impl std::fmt::Debug for Job {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenJob")
+        f.debug_struct("Job")
+            .field("kind", &self.kind)
             .field("path", &self.path)
-            .field("bytes", &self.bytes)
+            .field("label", &self.label)
             .finish_non_exhaustive()
     }
 }
 
-impl OpenJob {
-    /// Open and model `path` in the background. `ctx` is asked to repaint
-    /// when the result is in.
+impl Job {
+    /// Open and model the log at `path` in the background.
     #[must_use]
-    pub fn start(path: PathBuf, ctx: egui::Context) -> Self {
-        let (tx, rx) = mpsc::channel();
-        let bytes = std::fs::metadata(&path).ok().map(|m| m.len());
-        let job_path = path.clone();
-        spawn("aftermission-open", move || {
-            let result = Log::open(&job_path)
-                .map_err(|e| format!("{}: {e}", job_path.display()))
-                .map(|log| LoadedLog::build(log, file_name(&job_path)));
-            // a closed receiver only means the app moved on
-            let _ = tx.send(result);
-            ctx.request_repaint();
-        });
-        Self { path, bytes, rx }
+    pub fn open(path: PathBuf, ctx: egui::Context) -> Self {
+        let size = std::fs::metadata(&path)
+            .ok()
+            .map(|m| format!(" ({:.1} MB)", m.len() as f64 / 1e6))
+            .unwrap_or_default();
+        let label = format!("Indexing {}{size}", file_name(&path));
+        Self::run(Kind::Open, path.clone(), label, ctx, move || {
+            let log = Log::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let log = Box::new(LoadedLog::build(log, file_name(&path)));
+            Ok(Done::Opened { path, log })
+        })
     }
 
-    /// The outcome, once the log is modeled.
-    pub fn poll(&mut self) -> Option<Result<LoadedLog, String>> {
+    /// Run `work`, which reads or writes `path`, on a worker thread.
+    /// `ctx` is asked to repaint when the result is in.
+    #[must_use]
+    pub fn run(
+        kind: Kind,
+        path: PathBuf,
+        label: String,
+        ctx: egui::Context,
+        work: impl FnOnce() -> Result<Done, String> + Send + 'static,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let name = match kind {
+            Kind::Open => "aftermission-open",
+            Kind::Export => "aftermission-export",
+        };
+        spawn(name, move || {
+            // a closed receiver only means the app moved on
+            let _ = tx.send(work());
+            ctx.request_repaint();
+        });
+        Self {
+            kind,
+            path,
+            label,
+            rx,
+        }
+    }
+
+    /// The outcome, once the work is done.
+    pub fn poll(&mut self) -> Option<Result<Done, String>> {
         match self.rx.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
@@ -54,12 +101,6 @@ impl OpenJob {
                 self.path.display()
             ))),
         }
-    }
-
-    /// The file's name, for the progress line.
-    #[must_use]
-    pub fn name(&self) -> String {
-        file_name(&self.path)
     }
 }
 
@@ -87,14 +128,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     /// Poll until the job reports, for tests.
-    pub(crate) fn wait(job: &mut OpenJob) -> Result<LoadedLog, String> {
+    pub(crate) fn wait(job: &mut Job) -> Result<Done, String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(result) = job.poll() {
                 return result;
             }
             if Instant::now() >= deadline {
-                return Err("the open job did not finish in time".into());
+                return Err("the job did not finish in time".into());
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -105,10 +146,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("flight.bin");
         std::fs::write(&path, crate::model::testlog::bytes()).unwrap();
-        let mut job = OpenJob::start(path.clone(), egui::Context::default());
-        assert_eq!(job.name(), "flight.bin");
-        assert_eq!(job.bytes, Some(std::fs::metadata(&path).unwrap().len()));
-        let log = wait(&mut job).unwrap();
+        let mut job = Job::open(path.clone(), egui::Context::default());
+        assert_eq!(job.kind, Kind::Open);
+        let kb = std::fs::metadata(&path).unwrap().len() as f64 / 1e6;
+        assert_eq!(job.label, format!("Indexing flight.bin ({kb:.1} MB)"));
+        let Done::Opened { path: opened, log } = wait(&mut job).unwrap() else {
+            panic!("an open job opens");
+        };
+        assert_eq!(opened, path);
         assert_eq!(log.name, "flight.bin");
         assert_eq!(log.type_named("ATT").unwrap().count, 4);
     }
@@ -116,10 +161,57 @@ mod tests {
     #[test]
     fn a_missing_file_is_an_error_with_its_path() {
         let path = PathBuf::from("no-such-folder/no-such-log.bin");
-        let mut job = OpenJob::start(path.clone(), egui::Context::default());
-        assert_eq!(job.bytes, None);
+        let mut job = Job::open(path.clone(), egui::Context::default());
+        assert_eq!(job.label, "Indexing no-such-log.bin", "no size to show");
         let err = wait(&mut job).unwrap_err();
         assert!(err.starts_with(&path.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn any_work_runs_as_a_job() {
+        let mut job = Job::run(
+            Kind::Export,
+            "out.csv".into(),
+            "Writing out.csv".into(),
+            egui::Context::default(),
+            || {
+                Ok(Done::Exported {
+                    path: "out.csv".into(),
+                    summary: "Wrote out.csv: 3 rows".into(),
+                })
+            },
+        );
+        assert_eq!(job.kind, Kind::Export);
+        let Done::Exported { path, summary } = wait(&mut job).unwrap() else {
+            panic!("an export job exports");
+        };
+        assert_eq!(path, PathBuf::from("out.csv"));
+        assert_eq!(summary, "Wrote out.csv: 3 rows");
+
+        let mut failed = Job::run(
+            Kind::Export,
+            "out.csv".into(),
+            "Writing out.csv".into(),
+            egui::Context::default(),
+            || Err("disk full".into()),
+        );
+        assert_eq!(wait(&mut failed).unwrap_err(), "disk full");
+    }
+
+    #[test]
+    fn a_worker_that_dies_is_reported_by_its_path() {
+        let path = PathBuf::from("logs/a/flight.bin");
+        let mut job = Job::run(
+            Kind::Open,
+            path.clone(),
+            "Indexing flight.bin (1.0 MB)".into(),
+            egui::Context::default(),
+            || panic!("a worker that dies before it sends"),
+        );
+        assert_eq!(
+            wait(&mut job).unwrap_err(),
+            format!("{}: the worker ended without a result", path.display())
+        );
     }
 
     #[test]

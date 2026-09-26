@@ -89,6 +89,41 @@ pub fn stamp(base: Option<TimeBase>, seconds: f64) -> String {
     }
 }
 
+/// `seconds` since boot through `base` in ISO 8601 UTC to the
+/// microsecond, `2026-03-04T05:06:07.123456Z`: the CSV's `utc` column,
+/// which must never merge two rows that its `time_s` tells apart. It is
+/// computed in whole microseconds from the base's two millisecond fields:
+/// `wall_clock_unix_ms` works in `f64` milliseconds, which near 1.7e12 are
+/// spaced about 0.24 µs apart and could flip the last digit.
+#[must_use]
+pub fn iso_stamp(base: TimeBase, seconds: f64) -> String {
+    const DAY_US: i64 = 86_400_000_000;
+    if !seconds.is_finite() {
+        return String::new();
+    }
+    // a corrupt board time can be finite yet far beyond any date: the
+    // cast saturates, and the sum then has no room, so the cell is empty
+    let board_us = (seconds * 1e6).round() as i64;
+    let Some(unix_us) = base
+        .gps_start_unix_ms
+        .checked_sub(base.ms_offset)
+        .and_then(|ms| ms.checked_mul(1000))
+        .and_then(|us| us.checked_add(board_us))
+    else {
+        return String::new();
+    };
+    let (year, month, day) = civil_from_days(unix_us.div_euclid(DAY_US));
+    let in_day = unix_us.rem_euclid(DAY_US);
+    let seconds = in_day / 1_000_000;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:06}Z",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60,
+        in_day % 1_000_000
+    )
+}
+
 /// Unix milliseconds as a UTC calendar date, `YYYY-MM-DD`.
 #[must_use]
 pub fn utc_date(unix_ms: f64) -> String {
@@ -160,6 +195,28 @@ mod tests {
             ms_offset: 60_000,
         };
         assert_eq!(stamp(Some(base), 65.25), "2023-11-14 22:13:25.250");
+    }
+
+    #[test]
+    fn iso_stamps_are_exact_to_the_microsecond() {
+        let base = TimeBase {
+            gps_start_unix_ms: 1_700_000_000_000,
+            ms_offset: 60_000,
+        };
+        assert_eq!(iso_stamp(base, 65.250_001), "2023-11-14T22:13:25.250001Z");
+        // a bit over half a microsecond past rounds up
+        assert_eq!(iso_stamp(base, 65.250_000_6), "2023-11-14T22:13:25.250001Z");
+        // a board time before the base
+        assert_eq!(iso_stamp(base, 0.0), "2023-11-14T22:12:20.000000Z");
+        let epoch = TimeBase {
+            gps_start_unix_ms: 0,
+            ms_offset: 0,
+        };
+        assert_eq!(iso_stamp(epoch, 0.0), "1970-01-01T00:00:00.000000Z");
+        assert_eq!(iso_stamp(epoch, -0.000_001), "1969-12-31T23:59:59.999999Z");
+        assert_eq!(iso_stamp(epoch, f64::NAN), "");
+        // a corrupt TimeUS near u64::MAX, in seconds
+        assert_eq!(iso_stamp(base, 1.8e13), "");
     }
 
     #[test]

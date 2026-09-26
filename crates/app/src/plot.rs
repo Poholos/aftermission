@@ -191,6 +191,23 @@ impl PlotPanel {
         self.reset_view = true;
     }
 
+    /// The series showing: the selected ones not hidden through the
+    /// legend, as of the last frame. What the readout reads and the CSV
+    /// export writes.
+    pub fn showing(&self) -> impl Iterator<Item = &Selected> {
+        self.selected
+            .iter()
+            .filter(|s| !self.hidden.contains(&line_id(&s.key)))
+    }
+
+    /// The time range in view while the plot is zoomed or panned; None
+    /// while the view follows the data and shows all of it.
+    #[must_use]
+    pub fn zoomed_range(&self, ctx: &egui::Context) -> Option<RangeInclusive<f64>> {
+        let memory = PlotMemory::load(ctx, Id::new(PLOT_ID))?;
+        (!memory.auto_bounds.x && !self.reset_view).then(|| memory.bounds().range_x())
+    }
+
     /// Whether the next frame shows the whole of the data, for tests.
     #[cfg(test)]
     pub(crate) fn resets_view(&self) -> bool {
@@ -425,8 +442,7 @@ fn offset_note(sample_time: f64, cursor: f64) -> String {
 /// `IMU[1].GyrX (rad/s)`
 fn title(log: &LoadedLog, key: &SeriesKey) -> String {
     let unit = log
-        .type_named(&key.type_name)
-        .and_then(|t| t.field(&key.field))
+        .field_of(key)
         .and_then(|f| f.unit.clone())
         .filter(|u| !u.is_empty());
     match unit {
@@ -946,21 +962,37 @@ mod tests {
             plot,
         );
         harness.run();
+        assert_eq!(harness.state().showing().count(), 1);
+        assert!(
+            harness.state().zoomed_range(&harness.ctx).is_none(),
+            "the view follows the data"
+        );
+
+        // zoomed, the view is a range to export
+        let id = Id::new(PLOT_ID);
+        let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        memory.auto_bounds.x = false;
+        memory.store(&harness.ctx, id);
+        let range = harness.state().zoomed_range(&harness.ctx).unwrap();
+        assert!(range.contains(&2.0) && range.contains(&2.3), "{range:?}");
 
         // hide the series as a click on its legend entry would
-        let id = Id::new(PLOT_ID);
         let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
         memory.hidden_items.insert(line_id(&roll));
         memory.store(&harness.ctx, id);
         harness.step();
         assert_eq!(harness.state().hidden, [line_id(&roll)]);
+        assert_eq!(harness.state().showing().count(), 0);
 
+        // a reset shows everything and stops trusting the stored view
         harness.state_mut().reload(&log);
+        assert!(harness.state().zoomed_range(&harness.ctx).is_none());
         harness.step();
         assert!(harness.state().hidden.is_empty(), "shown from the reset on");
         assert!(!harness.state().resets_view());
         harness.step();
         assert!(harness.state().hidden.is_empty(), "and after it");
+        assert!(harness.state().zoomed_range(&harness.ctx).is_none());
     }
 
     #[test]

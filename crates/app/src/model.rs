@@ -23,8 +23,8 @@ pub struct Field {
     /// The unit name from the log's `UNIT` table, such as `deg` or `m/s`.
     pub unit: Option<String>,
     /// The factor that takes the decoded value to its unit, when the
-    /// format character does not already apply it; see
-    /// [`display_multiplier`].
+    /// format character does not already apply it, as the log carries it;
+    /// see [`display_multiplier`]. [`Scale::of`] applies it.
     pub multiplier: Option<f64>,
     /// Whether the field decodes to a number and so can be plotted.
     pub numeric: bool,
@@ -340,6 +340,12 @@ impl LoadedLog {
         self.types.iter().find(|t| t.name == name)
     }
 
+    /// The field `key` names, when the log has it.
+    #[must_use]
+    pub fn field_of(&self, key: &SeriesKey) -> Option<&Field> {
+        self.type_named(&key.type_name)?.field(&key.field)
+    }
+
     /// Indexed records.
     #[must_use]
     pub fn records(&self) -> usize {
@@ -397,11 +403,11 @@ impl LoadedLog {
         if !field.numeric {
             return Err(format!("{}.{} is text, not a number", t.name, key.field));
         }
-        let factor = field.multiplier.unwrap_or(1.0);
+        let scale = Scale::of(field.multiplier);
         let cols = self
             .timed_columns(t, &[&key.field], key.instance)
             .map_err(|e| format!("{}: {e}", key.label()))?;
-        let values = cols.column(0).iter().map(|v| v * factor);
+        let values = cols.column(0).iter().map(|&v| scale.apply(v));
         let (xs, ys) = cols
             .times
             .iter()
@@ -476,7 +482,52 @@ fn finite((x, y): &(f64, f64)) -> bool {
     x.is_finite() && y.is_finite()
 }
 
-/// The factor a plotted value is multiplied by. A format character that
+/// How a field's decoded values reach the unit the log names for them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Scale {
+    /// Already there: no factor applies.
+    Unit,
+    /// Divided by an exact power of ten. ArduPilot writes its `MULT` table
+    /// through a float cast, so the factor standing for 0.1 arrives as
+    /// 0.100000001490116, and multiplying by it puts a raw 41 at
+    /// 4.100000061094761; even by an exact 0.1 it is 4.1000000000000005.
+    /// Dividing by the power the factor stands for gives 4.1.
+    Divide(f64),
+    /// Multiplied by any other factor, such as 3.6 or 100; by 100 the
+    /// product is exact anyway.
+    Multiply(f64),
+}
+
+/// The powers a `MULT` factor can stand for: 1e-1 (`A`) down to 1e-9
+/// (`I`), matched by value, since the table has no `H`.
+const POWERS_OF_TEN: [f64; 9] = [1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9];
+
+impl Scale {
+    /// The scaling a field's display multiplier calls for.
+    #[must_use]
+    pub fn of(multiplier: Option<f64>) -> Scale {
+        let Some(factor) = multiplier else {
+            return Scale::Unit;
+        };
+        // within 1e-6 relative of a power: the cast's error is under 6e-8,
+        // and neighboring powers differ tenfold, so nothing else matches
+        POWERS_OF_TEN
+            .iter()
+            .find(|&&power| (factor * power - 1.0).abs() < 1e-6)
+            .map_or(Scale::Multiply(factor), |&power| Scale::Divide(power))
+    }
+
+    #[must_use]
+    pub fn apply(self, value: f64) -> f64 {
+        match self {
+            Scale::Unit => value,
+            Scale::Divide(power) => value / power,
+            Scale::Multiply(factor) => value * factor,
+        }
+    }
+}
+
+/// The factor a plotted value is scaled by. A format character that
 /// scales its field (`c`, `C`, `e`, `E`, `L`) already yields the unit the
 /// log names, and the `MULT` entry for such a field describes that same
 /// scaling, so applying it too would scale twice. Other fields take their
@@ -568,7 +619,7 @@ fn positions(
     fix_field: Option<&str>,
     source: &'static str,
 ) -> Option<Track> {
-    let scale = |label: &str| t.field(label).and_then(|f| f.multiplier).unwrap_or(1.0);
+    let scale = |label: &str| Scale::of(t.field(label).and_then(|f| f.multiplier));
     let scales = [scale("Lat"), scale("Lng"), scale("Alt")];
     let mut fields = vec!["Lat", "Lng", "Alt"];
     fields.extend(fix_field);
@@ -579,7 +630,7 @@ fn positions(
     };
     for row in 0..cols.rows {
         let time = cols.times[row];
-        let [lat, lon, alt] = [0, 1, 2].map(|i| cols.column(i)[row] * scales[i]);
+        let [lat, lon, alt] = [0, 1, 2].map(|i| scales[i].apply(cols.column(i)[row]));
         let fixed = fix_field.is_none() || cols.column(3)[row] >= 3.0;
         let placed = time.is_finite() && lat.is_finite() && lon.is_finite();
         if !fixed || !placed || (lat == 0.0 && lon == 0.0) {
@@ -849,8 +900,15 @@ pub(crate) mod testlog {
         for (c, name) in [('s', "s"), ('d', "deg"), ('E', "rad/s"), ('#', "instance")] {
             w.record("UNIT", &[t.clone(), id(c), text(name)]).unwrap();
         }
-        for (c, factor) in [('-', 0.0), ('?', 1.0), ('F', 1e-6), ('B', 0.01), ('0', 1.0)] {
-            w.record("MULT", &[t.clone(), id(c), Value::F64(factor)])
+        // the factors pass through a float32 on the way into a real log
+        for (c, factor) in [
+            ('-', 0.0f32),
+            ('?', 1.0),
+            ('F', 1e-6),
+            ('B', 0.01),
+            ('0', 1.0),
+        ] {
+            w.record("MULT", &[t.clone(), id(c), Value::F64(f64::from(factor))])
                 .unwrap();
         }
         // ATT: TimeUS in seconds through F; Roll, Pitch and Yaw in degrees
@@ -896,7 +954,11 @@ mod tests {
         assert_eq!(roll.multiplier, None, "the c format already scales");
         let time = att.field("TimeUS").unwrap();
         assert_eq!(time.title(), "TimeUS (s)");
-        assert_eq!(time.multiplier, Some(1e-6));
+        assert_eq!(
+            time.multiplier,
+            Some(f64::from(1e-6f32)),
+            "as the log carries it"
+        );
 
         let imu = log.type_named("IMU").unwrap();
         assert_eq!(imu.instance_field.as_deref(), Some("I"));
@@ -957,9 +1019,12 @@ mod tests {
         let gyrz = log.series(&key("IMU", "GyrZ", Some(0))).unwrap();
         assert_eq!(gyrz.ys, [0.5, 0.5, 0.5]);
         assert_eq!(gyrz.xs.len(), 3);
-        // TimeUS itself plots in seconds through its multiplier
+        // TimeUS itself plots in seconds through its multiplier, exactly:
+        // divided by 1e6, not multiplied by the cast factor
         let t = log.series(&key("ATT", "TimeUS", None)).unwrap();
-        assert!((t.ys[0] - 2.0).abs() < 1e-9);
+        assert_eq!(t.ys, [2.0, 2.1, 2.2, 2.3]);
+        assert_eq!(log.field_of(&key("ATT", "TimeUS", None)).unwrap().code, 'Q');
+        assert!(log.field_of(&key("ATT", "Nope", None)).is_none());
 
         assert!(log.has_series(&key("IMU", "GyrX", Some(1))));
         assert!(
@@ -1240,6 +1305,34 @@ mod tests {
             &[b.south, b.north, b.west, b.east],
             &[47.5, 47.5001, 8.5, 8.5]
         ));
+    }
+
+    #[test]
+    fn factors_snap_to_the_power_of_ten_they_stand_for_and_divide() {
+        // the copter corpus's A and F, cast through float32
+        assert_eq!(Scale::of(Some(f64::from(0.1f32))), Scale::Divide(1e1));
+        assert_eq!(Scale::of(Some(f64::from(1e-6f32))), Scale::Divide(1e6));
+        assert_eq!(Scale::of(Some(f64::from(1e-9f32))), Scale::Divide(1e9));
+        assert_eq!(Scale::of(Some(0.01)), Scale::Divide(1e2));
+        assert_eq!(Scale::of(Some(3.6)), Scale::Multiply(3.6));
+        assert_eq!(Scale::of(Some(100.0)), Scale::Multiply(100.0));
+        assert_eq!(Scale::of(None), Scale::Unit);
+
+        // a raw 41 at A is 4.1, not 4.100000061094761; and 1e-5 and 1e-9
+        // divide exactly where 1.0 / factor would not
+        let values = [
+            Scale::of(Some(f64::from(0.1f32))).apply(41.0),
+            Scale::of(Some(f64::from(1e-5f32))).apply(3.0),
+            Scale::of(Some(f64::from(1e-9f32))).apply(7.0),
+            Scale::of(Some(3.6)).apply(2.0),
+            Scale::Unit.apply(-1.5),
+        ];
+        let expected = [4.1, 3e-5, 7e-9, 7.2, -1.5];
+        assert_eq!(
+            values.map(f64::to_bits),
+            expected.map(f64::to_bits),
+            "{values:?}"
+        );
     }
 
     #[test]

@@ -1,11 +1,15 @@
 //! The application: menus, the side panel with the log's types, the plot,
 //! the map, the bottom panel with the events list and the parameter
-//! table, and the ways a log gets opened.
+//! table, the ways a log gets opened, and the exports.
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use egui::{Align2, Color32, Context};
 
+use crate::csv::{self, Column, Export};
 use crate::events::EventsPanel;
 use crate::filter::Filter;
 use crate::map::MapPanel;
@@ -14,17 +18,37 @@ use crate::params::ParamsPanel;
 use crate::plot::PlotPanel;
 use crate::settings::{BottomTab, Settings, TimeAxis};
 use crate::tree;
-use crate::worker::OpenJob;
+use crate::worker::{self, Done, Job, Kind};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A line in the menu bar: the last job's outcome, or why one could not
+/// start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Notice {
+    text: String,
+    error: bool,
+}
+
+/// The choices made before a CSV export.
+#[derive(Debug, Default)]
+struct CsvDialog {
+    /// Only the time range the plot shows.
+    visible_only: bool,
+}
 
 #[derive(Debug, Default)]
 pub struct AftermissionApp {
     settings: Settings,
     log: Option<LoadedLog>,
-    job: Option<OpenJob>,
+    /// The one job running: an open or an export.
+    job: Option<Job>,
     /// Why the last open failed, until the next one starts.
     error: Option<String>,
+    /// Until the next job starts.
+    notice: Option<Notice>,
+    /// The CSV export's confirmation window, while it is open.
+    csv_dialog: Option<CsvDialog>,
     plot: PlotPanel,
     map: MapPanel,
     events: EventsPanel,
@@ -52,10 +76,28 @@ impl AftermissionApp {
     }
 
     /// Start opening `path`. The log on screen stays until the new one is
-    /// ready; an open already running is dropped.
+    /// ready. Refused while a job runs.
     pub fn open_path(&mut self, path: &Path, ctx: &Context) {
+        if self.busy() {
+            return;
+        }
         self.error = None;
-        self.job = Some(OpenJob::start(path.to_path_buf(), ctx.clone()));
+        self.job = Some(Job::open(path.to_path_buf(), ctx.clone()));
+    }
+
+    /// One job at a time: while one runs, the next is refused with a
+    /// notice beside the spinner, not queued; the notice goes when the job
+    /// does. A job that may start clears the last notice.
+    fn busy(&mut self) -> bool {
+        if let Some(job) = &self.job {
+            self.notice = Some(Notice {
+                text: format!("Still busy: {}\u{2026}", job.label),
+                error: false,
+            });
+            return true;
+        }
+        self.notice = None;
+        false
     }
 
     /// The loaded log, for tests.
@@ -67,6 +109,14 @@ impl AftermissionApp {
     #[cfg(test)]
     pub(crate) fn plot(&self) -> &PlotPanel {
         &self.plot
+    }
+
+    /// Put `key` on the plot, as a click in the tree does; for tests.
+    #[cfg(test)]
+    pub(crate) fn toggle_series(&mut self, key: crate::model::SeriesKey) {
+        if let Some(log) = &self.log {
+            self.plot.toggle(key, log);
+        }
     }
 
     #[cfg(test)]
@@ -84,7 +134,7 @@ impl AftermissionApp {
         &mut self.events
     }
 
-    /// Take the result of a finished open.
+    /// Take the result of a finished job.
     pub fn poll(&mut self, ctx: &Context) {
         let Some(job) = &mut self.job else {
             return;
@@ -92,25 +142,47 @@ impl AftermissionApp {
         let Some(result) = job.poll() else {
             return;
         };
-        let path = job.path.clone();
+        let kind = job.kind;
         self.job = None;
+        // a refusal made while the job ran is over with it
+        self.notice = None;
         match result {
-            Ok(log) => {
+            Ok(Done::Opened { path, log }) => {
                 // only a log that opened is worth offering again
                 self.settings.remember(&path);
                 self.plot.reload(&log);
                 self.map.reload();
                 self.params.reload();
+                // an export set up on the log before would write the wrong one
+                self.csv_dialog = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
                     "{} - Aftermission",
                     log.name
                 )));
                 tracing::info!(name = %log.name, records = log.records(), "log opened");
-                self.log = Some(log);
+                self.log = Some(*log);
             }
-            Err(message) => {
+            Ok(Done::Exported { path, summary }) => {
+                tracing::info!(%summary, "export done");
+                // a folder that took a file is where the next dialog opens
+                if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                    self.settings.export_dir = Some(dir.to_path_buf());
+                }
+                self.notice = Some(Notice {
+                    text: summary,
+                    error: false,
+                });
+            }
+            Err(message) if kind == Kind::Open => {
                 tracing::warn!(%message, "cannot open the log");
                 self.error = Some(message);
+            }
+            Err(message) => {
+                tracing::warn!(%message, "the export failed");
+                self.notice = Some(Notice {
+                    text: message,
+                    error: true,
+                });
             }
         }
     }
@@ -169,6 +241,7 @@ impl AftermissionApp {
         }
         egui::CentralPanel::default().show(ui, |ui| self.central_ui(ui));
         self.about_ui(&ctx);
+        self.csv_dialog_ui(&ctx);
         Self::drop_overlay(&ctx);
     }
 
@@ -193,6 +266,28 @@ impl AftermissionApp {
                         self.settings.recent.clear();
                     }
                 });
+            });
+            ui.separator();
+            // not while a job runs: the export would be refused after the
+            // save dialog, with the chosen path lost
+            let plotted = self.log.is_some() && self.plot.showing().next().is_some();
+            let idle = self.job.is_none();
+            ui.menu_button("Export", |ui| {
+                if ui
+                    .add_enabled(
+                        plotted && idle,
+                        egui::Button::new("Plotted series as CSV\u{2026}"),
+                    )
+                    .on_disabled_hover_text(if idle {
+                        "Plot a series first"
+                    } else {
+                        "Wait for the running job"
+                    })
+                    .clicked()
+                {
+                    ui.close();
+                    self.csv_dialog = Some(CsvDialog::default());
+                }
             });
             ui.separator();
             if ui.button("Quit").clicked() {
@@ -249,15 +344,19 @@ impl AftermissionApp {
         });
     }
 
-    /// A spinner while a log is being opened.
+    /// A spinner while a job runs, and the notice: a refusal beside the
+    /// spinner, or the last job's outcome.
     fn status(&self, ui: &mut egui::Ui) {
         if let Some(job) = &self.job {
             ui.spinner();
-            let size = job
-                .bytes
-                .map(|b| format!(" ({:.1} MB)", b as f64 / 1e6))
-                .unwrap_or_default();
-            ui.label(format!("Indexing {}{size}\u{2026}", job.name()));
+            ui.label(format!("{}\u{2026}", job.label));
+        }
+        if let Some(notice) = &self.notice {
+            if notice.error {
+                ui.colored_label(ui.visuals().error_fg_color, &notice.text);
+            } else {
+                ui.label(&notice.text);
+            }
         }
     }
 
@@ -357,6 +456,95 @@ impl AftermissionApp {
             });
     }
 
+    /// The choices before a CSV export, then the save dialog.
+    fn csv_dialog_ui(&mut self, ctx: &Context) {
+        // a job started underneath, by a dropped file, would refuse the export
+        if self.job.is_some() {
+            self.csv_dialog = None;
+        }
+        let (Some(dialog), Some(log)) = (&mut self.csv_dialog, &self.log) else {
+            return;
+        };
+        let zoomed = self.plot.zoomed_range(ctx);
+        if zoomed.is_none() {
+            // the view shows everything again: the choice no longer applies
+            dialog.visible_only = false;
+        }
+        let range = zoomed.clone().filter(|_| dialog.visible_only);
+        // the plot may have lost its series since the window opened
+        let showing = self.plot.showing().next().is_some();
+        let header = csv::header(
+            log.time_base.is_some(),
+            self.plot.showing().map(|s| s.title.as_str()),
+        );
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Export CSV")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Columns:");
+                for name in &header {
+                    ui.monospace(name);
+                }
+                ui.add_enabled(
+                    zoomed.is_some(),
+                    egui::Checkbox::new(&mut dialog.visible_only, "Only the time range in view"),
+                )
+                .on_disabled_hover_text("Zoom the plot to narrow the range");
+                ui.horizontal(|ui| {
+                    save = ui
+                        .add_enabled(showing, egui::Button::new("Save as\u{2026}"))
+                        .on_disabled_hover_text("Nothing is showing on the plot")
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if !open || cancel {
+            self.csv_dialog = None;
+        }
+        if save {
+            let export = csv_export(log, &self.plot, range.clone());
+            let name = csv::file_name(&log.name, range.as_ref());
+            let mut picker = rfd::FileDialog::new()
+                .add_filter("CSV", &["csv"])
+                .set_file_name(name);
+            if let Some(dir) = &self.settings.export_dir {
+                picker = picker.set_directory(dir);
+            }
+            self.csv_dialog = None;
+            if let Some(path) = picker.save_file() {
+                self.export_csv_to(export, path, ctx);
+            }
+        }
+    }
+
+    /// Write `export` to `path` on a worker.
+    pub(crate) fn export_csv_to(&mut self, export: Export, path: PathBuf, ctx: &Context) {
+        if self.busy() {
+            return;
+        }
+        let name = worker::file_name(&path);
+        let label = format!("Writing {name}");
+        let subject = path.clone();
+        self.job = Some(Job::run(
+            Kind::Export,
+            subject,
+            label,
+            ctx.clone(),
+            move || {
+                let describe = |e: std::io::Error| format!("{}: {e}", path.display());
+                let mut out = BufWriter::new(File::create(&path).map_err(describe)?);
+                let rows = export.write(&mut out).map_err(describe)?;
+                out.flush().map_err(describe)?;
+                let summary = format!("Wrote {name}: {rows} rows, {} series", export.columns.len());
+                Ok(Done::Exported { path, summary })
+            },
+        ));
+    }
+
     /// A shade over the window while a file is being dragged over it.
     fn drop_overlay(ctx: &Context) {
         if ctx.input(|i| i.raw.hovered_files.is_empty()) {
@@ -378,6 +566,23 @@ impl AftermissionApp {
     }
 }
 
+/// The series showing on `plot`, as the CSV writes them: a value from an
+/// `f` field prints as the float32 the log stored.
+fn csv_export(log: &LoadedLog, plot: &PlotPanel, range: Option<RangeInclusive<f64>>) -> Export {
+    Export {
+        columns: plot
+            .showing()
+            .map(|s| Column {
+                title: s.title.clone(),
+                data: s.data.clone(),
+                single: log.field_of(&s.key).is_some_and(|f| f.code == 'f'),
+            })
+            .collect(),
+        time_base: log.time_base,
+        range,
+    }
+}
+
 impl eframe::App for AftermissionApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
@@ -391,7 +596,10 @@ impl eframe::App for AftermissionApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::{Harness, kittest::Queryable};
+    use egui_kittest::{
+        Harness,
+        kittest::{NodeT, Queryable},
+    };
 
     /// Write the synthetic log, open it and wait for the model.
     fn opened(dir: &Path) -> AftermissionApp {
@@ -722,6 +930,276 @@ mod tests {
             "the events tab took the panel from {small} to {now}"
         );
         assert!(harness.get_all_by_label_contains("Armed").count() > 1);
+    }
+
+    /// Poll until the running job is done.
+    fn wait(app: &mut AftermissionApp, ctx: &Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.job.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job did not finish"
+            );
+            app.poll(ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_csv_window_lists_the_columns_and_follows_the_plot() {
+        use crate::model::SeriesKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let key = |type_name: &str, field: &str, instance| SeriesKey {
+            type_name: type_name.into(),
+            field: field.into(),
+            instance,
+        };
+        // nothing plotted: nothing to export, and the menu says so
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("File").click();
+            harness.run();
+            harness.get_by_label("Export \u{23F5}").hover();
+            harness.run();
+            assert!(
+                harness
+                    .get_by_label("Plotted series as CSV\u{2026}")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        });
+
+        // Roll is a scaled integer field, GyrX a float32 one
+        app.toggle_series(key("ATT", "Roll", None));
+        app.toggle_series(key("IMU", "GyrX", Some(1)));
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("File").click();
+            harness.run();
+            harness.get_by_label("Export \u{23F5}").hover();
+            harness.run();
+            harness
+                .get_by_label("Plotted series as CSV\u{2026}")
+                .click();
+            harness.run();
+            // the window lists the columns about to be written
+            let window = harness.get_by_role_and_label(egui::accesskit::Role::Window, "Export CSV");
+            window.get_by_label("time_s");
+            window.get_by_label("ATT.Roll (deg)");
+            window.get_by_label("IMU[1].GyrX (rad/s)");
+            assert!(window.query_by_label("utc").is_none(), "no GPS clock");
+            // the view shows the whole log, so there is no range to cut to
+            assert!(
+                window
+                    .get_by_label("Only the time range in view")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            assert!(
+                !window
+                    .get_by_label("Save as\u{2026}")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        });
+        // with nothing left showing, the window offers no save
+        let roll = key("ATT", "Roll", None);
+        let gyr = key("IMU", "GyrX", Some(1));
+        app.toggle_series(roll.clone());
+        app.toggle_series(gyr.clone());
+        with_ui(&mut app, |harness| {
+            assert!(
+                harness
+                    .get_by_label("Save as\u{2026}")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            harness.get_by_label("Cancel").click();
+            harness.run();
+            assert!(harness.query_by_label("Export CSV").is_none());
+        });
+        assert!(app.csv_dialog.is_none());
+
+        // a job underneath the window closes it
+        app.csv_dialog = Some(CsvDialog::default());
+        let path = app.settings.recent[0].clone();
+        app.open_path(&path, &ctx);
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label("Export CSV").is_none());
+        });
+        assert!(app.csv_dialog.is_none());
+        wait(&mut app, &ctx);
+    }
+
+    #[test]
+    fn the_showing_series_export_to_csv_as_the_plot_has_them() {
+        use crate::model::SeriesKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let key = |type_name: &str, field: &str, instance| SeriesKey {
+            type_name: type_name.into(),
+            field: field.into(),
+            instance,
+        };
+        // Roll is a scaled integer field, GyrX a float32 one
+        app.toggle_series(key("ATT", "Roll", None));
+        app.toggle_series(key("IMU", "GyrX", Some(1)));
+        with_ui(&mut app, |_| {});
+
+        let export = csv_export(app.log().unwrap(), app.plot(), None);
+        assert_eq!(
+            export.header(),
+            ["time_s", "ATT.Roll (deg)", "IMU[1].GyrX (rad/s)"]
+        );
+        assert_eq!(
+            export.columns.iter().map(|c| c.single).collect::<Vec<_>>(),
+            [false, true]
+        );
+        let out = dir.path().join("out").join("flight.csv");
+        std::fs::create_dir(out.parent().unwrap()).unwrap();
+        app.export_csv_to(export.clone(), out.clone(), &ctx);
+        assert_eq!(app.job.as_ref().unwrap().label, "Writing flight.csv");
+        wait(&mut app, &ctx);
+        assert_eq!(
+            app.notice,
+            Some(Notice {
+                text: "Wrote flight.csv: 8 rows, 2 series".into(),
+                error: false,
+            })
+        );
+        assert_eq!(app.settings.export_dir.as_deref(), out.parent());
+        // the gyro samples 10 us after each attitude sample
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "time_s,ATT.Roll (deg),IMU[1].GyrX (rad/s)\n\
+             2.000000,0,\n\
+             2.000010,,0.5\n\
+             2.100000,1.5,\n\
+             2.100010,,0.5\n\
+             2.200000,3,\n\
+             2.200010,,0.5\n\
+             2.300000,4.5,\n\
+             2.300010,,0.5\n"
+        );
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Wrote flight.csv: 8 rows, 2 series");
+        });
+
+        // a file that cannot be written reports why, in the menu bar, and
+        // its folder is not where the next dialog opens
+        let bad = dir.path().join("no-such-folder").join("flight.csv");
+        app.export_csv_to(export, bad.clone(), &ctx);
+        wait(&mut app, &ctx);
+        let notice = app.notice.clone().unwrap();
+        assert!(notice.error);
+        assert!(
+            notice.text.starts_with(&bad.display().to_string()),
+            "{}",
+            notice.text
+        );
+        assert_eq!(app.settings.export_dir.as_deref(), out.parent());
+        with_ui(&mut app, |harness| {
+            harness.get_by_label(notice.text.as_str());
+        });
+    }
+
+    #[test]
+    fn one_job_runs_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flight.bin");
+        std::fs::write(&path, crate::model::testlog::bytes()).unwrap();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        let ctx = Context::default();
+        app.open_path(&path, &ctx);
+        let label = app.job.as_ref().unwrap().label.clone();
+
+        // a second open while the first runs is refused, not queued
+        let other = dir.path().join("other.bin");
+        app.open_path(&other, &ctx);
+        assert_eq!(
+            app.job.as_ref().unwrap().label,
+            label,
+            "the first job runs on"
+        );
+        assert_eq!(
+            app.notice,
+            Some(Notice {
+                text: format!("Still busy: {label}\u{2026}"),
+                error: false,
+            })
+        );
+        wait(&mut app, &ctx);
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        assert!(app.error.is_none());
+        assert!(app.notice.is_none(), "the refusal goes with the job");
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label_contains("Still busy").is_none());
+        });
+    }
+
+    #[test]
+    fn a_running_job_shows_a_refusal_and_holds_back_the_export() {
+        use crate::model::SeriesKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        app.toggle_series(SeriesKey {
+            type_name: "ATT".into(),
+            field: "Roll".into(),
+            instance: None,
+        });
+        // a job that runs until the test lets it go
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let out = dir.path().join("held.csv");
+        let job_out = out.clone();
+        app.job = Some(Job::run(
+            Kind::Export,
+            out,
+            "Writing held.csv".into(),
+            ctx.clone(),
+            move || {
+                let _ = held.recv();
+                Ok(Done::Exported {
+                    path: job_out,
+                    summary: "Released".into(),
+                })
+            },
+        ));
+        app.open_path(&dir.path().join("other.bin"), &ctx);
+
+        // the spinner asks for frames without end, so each run stops at the
+        // step limit rather than when the window is still
+        let export_enabled = |harness: &mut Harness<'_>| {
+            harness.get_by_label("File").click();
+            harness.run_ok();
+            harness.get_by_label("Export \u{23F5}").hover();
+            harness.run_ok();
+            !harness
+                .get_by_label("Plotted series as CSV\u{2026}")
+                .accesskit_node()
+                .is_disabled()
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui(|ui| app.show(ui));
+        harness.run_ok();
+        // the refusal shows beside the job it waits for
+        harness.get_by_label("Writing held.csv\u{2026}");
+        harness.get_by_label("Still busy: Writing held.csv\u{2026}");
+        assert!(!export_enabled(&mut harness), "not while a job runs");
+        drop(harness);
+
+        release.send(()).unwrap();
+        wait(&mut app, &ctx);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Released");
+            assert!(export_enabled(harness), "once the job is done");
+        });
     }
 
     #[test]

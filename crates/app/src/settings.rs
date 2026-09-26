@@ -1,7 +1,7 @@
 //! Preferences that survive a restart: theme, time axis, mode bands, which
-//! panels are open and what the bottom one shows, map tiles and recent
-//! files. Stored through eframe's key-value storage, a file next to the
-//! app's config on native.
+//! panels are open and what the bottom one shows, map tiles, recent files
+//! and the export folder. Stored through eframe's key-value storage, a
+//! file next to the app's config on native.
 
 use std::path::{Path, PathBuf};
 
@@ -55,6 +55,8 @@ pub struct Settings {
     pub online_tiles: bool,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
+    /// Where the last export went, for the next save dialog to open in.
+    pub export_dir: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -69,6 +71,7 @@ impl Default for Settings {
             bottom_tab: BottomTab::default(),
             online_tiles: true,
             recent: Vec::new(),
+            export_dir: None,
         }
     }
 }
@@ -122,6 +125,7 @@ mod tests {
         assert!(partial.show_map && partial.show_bottom && partial.online_tiles);
         assert_eq!(partial.bottom_tab, BottomTab::Events);
         assert!(partial.recent.is_empty());
+        assert_eq!(partial.export_dir, None);
 
         // the bottom panel's toggle keeps its saved value under its old name
         let renamed: Settings = ron::from_str("(show_events: false)").unwrap();

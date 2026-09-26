@@ -54,13 +54,22 @@ The tool is early. What works today:
   value first; a click on a change seeks the plot and the map to it.
   Toggles narrow the table to parameters off their default or changed
   after boot, and a filter to a name.
+- **CSV export** (File > Export) of the series on the plot: one row per
+  sample time, one column per series, a cell empty where a series has no
+  sample at that time, and nothing interpolated. A `time_s` column in
+  seconds since boot and, when the log has a GPS clock, a `utc` column in
+  ISO 8601 to the microsecond come first. Values scaled by a power of ten
+  and values from float32 fields print exactly as the log stored them. The
+  whole log, or only the time range in view when the plot is zoomed.
+  Series hidden through the legend stay out.
 - **Preferences** persist: theme, time axis, mode bands, which panels are
-  open and which tab the bottom one shows, map tiles and the recent files.
+  open and which tab the bottom one shows, map tiles, the recent files and
+  the export folder.
 
 A plot set up on one log carries over when another opens: series the new
 log also has are re-read, the rest are dropped.
 
-Planned next: CSV, `.param` and Parquet export, and a browser build.
+Planned next: `.param` and Parquet export, and a browser build.
 
 ## Building and running
 
