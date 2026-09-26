@@ -196,6 +196,8 @@ pub enum EventKind {
     Event,
     /// A flight mode change.
     Mode,
+    /// A parameter set to a new value after boot.
+    Param,
 }
 
 /// One line of the events list.
@@ -599,7 +601,8 @@ fn positions(
     Some(track)
 }
 
-/// The `MSG`, `ERR` and `EV` records and the mode changes, in time order.
+/// The `MSG`, `ERR` and `EV` records, the mode changes and the parameter
+/// changes after boot, in time order.
 fn events(log: &LoadedLog) -> Vec<Event> {
     let mut events: Vec<Event> = log
         .modes
@@ -630,7 +633,7 @@ fn events(log: &LoadedLog) -> Vec<Event> {
                     _ => None,
                 },
                 EventKind::Event => byte("Id").map(codes::event_label),
-                EventKind::Mode => None,
+                EventKind::Mode | EventKind::Param => None,
             };
             let Some(text) = text else {
                 continue;
@@ -639,6 +642,24 @@ fn events(log: &LoadedLog) -> Vec<Event> {
             if time.is_finite() {
                 events.push(Event { time, kind, text });
             }
+        }
+    }
+    for param in &log.params {
+        let mut before = param.initial;
+        for &(time, value) in &param.changes {
+            if time.is_finite() {
+                events.push(Event {
+                    time,
+                    kind: EventKind::Param,
+                    text: format!(
+                        "{} {} -> {}",
+                        param.name,
+                        params::value_text(before),
+                        params::value_text(value)
+                    ),
+                });
+            }
+            before = value;
         }
     }
     events.sort_by(|a, b| a.time.total_cmp(&b.time));
@@ -1009,6 +1030,7 @@ mod tests {
                 "2.020 Error Compass: resolved",
                 "2.030 Event Armed",
                 "2.250 Mode Loiter",
+                "2.320 Param MIS_TOTAL 4 -> 7",
             ]
         );
         assert_eq!(log.wall_clock(TimeAxis::Utc), None, "no GPS");
@@ -1038,6 +1060,45 @@ mod tests {
                 .iter()
                 .filter(|p| p.0 != "MIS_TOTAL")
                 .all(|p| p.2.is_empty())
+        );
+    }
+
+    #[test]
+    fn each_parameter_change_event_reads_from_the_value_before_it() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let mut w = LogWriter::new();
+        w.define(1, "PARM", "QNf", &["TimeUS", "Name", "Value"])
+            .unwrap();
+        for (time, value) in [
+            (1_000_000, 1250.0),
+            (3_000_000, 875.5),
+            (4_000_000, 875.5),
+            (5_000_000, 1250.0),
+        ] {
+            w.record(
+                "PARM",
+                &[
+                    Value::U64(time),
+                    Value::Str("LOIT_SPEED".into()),
+                    Value::F64(value),
+                ],
+            )
+            .unwrap();
+        }
+        let log = LoadedLog::build(Log::from_bytes(&w.into_bytes()), "parm.bin".into());
+        let lines: Vec<String> = log
+            .events
+            .iter()
+            .map(|e| format!("{:.3} {:?} {}", e.time, e.kind, e.text))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "3.000 Param LOIT_SPEED 1250 -> 875.5",
+                "5.000 Param LOIT_SPEED 875.5 -> 1250",
+            ]
         );
     }
 

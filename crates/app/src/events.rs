@@ -1,6 +1,6 @@
-//! The events panel: the log's messages, errors, events and mode changes
-//! in one list, in time order, a click on a row seeking the plot and the
-//! map to its time.
+//! The events panel: the log's messages, errors, events, mode changes and
+//! parameter changes in one list, in time order, a click on a row seeking
+//! the plot and the map to its time.
 
 use egui::RichText;
 
@@ -10,25 +10,28 @@ use crate::settings::Settings;
 use crate::timefmt;
 
 /// The kinds of event, in the order the panel offers them.
-const KINDS: [EventKind; 4] = [
+const KINDS: [EventKind; 5] = [
     EventKind::Message,
     EventKind::Error,
     EventKind::Event,
     EventKind::Mode,
+    EventKind::Param,
 ];
 
 /// The panel's state: which kinds are listed and a text filter.
 #[derive(Debug)]
 pub struct EventsPanel {
     /// Per kind of [`KINDS`].
-    shown: [bool; 4],
+    shown: [bool; 5],
     filter: String,
 }
 
 impl Default for EventsPanel {
     fn default() -> Self {
         Self {
-            shown: [true; 4],
+            // parameter changes start hidden: a mission upload can log
+            // dozens
+            shown: KINDS.map(|kind| kind != EventKind::Param),
             filter: String::new(),
         }
     }
@@ -69,6 +72,9 @@ impl EventsPanel {
         if rows.is_empty() {
             ui.weak(if log.events.is_empty() {
                 "No messages, errors or events in this log."
+            } else if !log.events.iter().any(|e| self.is_shown(e.kind)) {
+                // parameter changes start hidden, and may be all a log has
+                "Every kind this log has is toggled off."
             } else {
                 "Nothing matches."
             });
@@ -127,6 +133,7 @@ fn kind_name(kind: EventKind) -> &'static str {
         // not "Events": the bottom panel's tab has that name
         EventKind::Event => "Vehicle events",
         EventKind::Mode => "Modes",
+        EventKind::Param => "Parameter changes",
     }
 }
 
@@ -137,5 +144,6 @@ fn kind_tag(kind: EventKind) -> &'static str {
         EventKind::Error => "ERR",
         EventKind::Event => "EV",
         EventKind::Mode => "MODE",
+        EventKind::Param => "PARM",
     }
 }

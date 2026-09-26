@@ -493,6 +493,18 @@ mod tests {
         assert_eq!(app.plot().cursor, Some(2.25));
         assert!(app.plot().readout.is_empty(), "nothing plotted yet");
 
+        // parameter changes are listed only once their toggle is on
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label_contains("4 -> 7").is_none());
+            harness.get_by_label("Parameter changes").click();
+            harness.run();
+            harness
+                .get_by_label_contains("PARM MIS_TOTAL 4 -> 7")
+                .click();
+            harness.run();
+        });
+        assert_eq!(app.plot().cursor, Some(2.32));
+
         // the panels can be turned off
         app.settings.show_map = false;
         app.settings.show_bottom = false;
@@ -564,6 +576,39 @@ mod tests {
         with_ui(&mut app, |harness| {
             harness.get_by_label_contains("MIS_TOTAL");
             assert!(harness.query_by_label_contains("at boot").is_none());
+        });
+    }
+
+    #[test]
+    fn a_log_of_only_parameter_changes_says_they_are_toggled_off() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let mut w = LogWriter::new();
+        w.define(1, "PARM", "QNf", &["TimeUS", "Name", "Value"])
+            .unwrap();
+        for (time, value) in [(1_000_000, 35.0), (4_000_000, 42.5)] {
+            w.record(
+                "PARM",
+                &[
+                    Value::U64(time),
+                    Value::Str("FENCE_RADIUS".into()),
+                    Value::F64(value),
+                ],
+            )
+            .unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("parm.bin");
+        std::fs::write(&path, w.into_bytes()).unwrap();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        reopen(&mut app, &path);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Every kind this log has is toggled off.");
+            harness.get_by_label("Parameter changes").click();
+            harness.run();
+            harness.get_by_label_contains("PARM FENCE_RADIUS 35 -> 42.5");
         });
     }
 

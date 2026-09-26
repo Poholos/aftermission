@@ -43,9 +43,11 @@ The tool is early. What works today:
   disk next to the settings; View > Map tiles turns them off, and the
   track then draws on a plain background with nothing downloaded.
 - **Events**: the `MSG` texts, the `ERR` faults and `EV` events named per
-  ArduPilot's tables, and the mode changes, in one list in time order with
-  a toggle per kind and a filter. A click on a row seeks the plot and the
-  map to its time; the row the cursor has passed is highlighted.
+  ArduPilot's tables, the mode changes and the parameter changes after
+  boot, in one list in time order with a toggle per kind and a filter;
+  parameter changes start hidden, since a mission upload can log dozens.
+  A click on a row seeks the plot and the map to its time; the row the
+  cursor has passed is highlighted.
 - **Parameters**: a tab beside the events with every `PARM` name, its
   last value, its default where the log records one, and how often it
   changed after boot. A changed parameter unfolds to its history, the boot
