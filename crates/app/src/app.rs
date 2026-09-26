@@ -14,6 +14,7 @@ use crate::events::EventsPanel;
 use crate::filter::Filter;
 use crate::map::MapPanel;
 use crate::model::LoadedLog;
+use crate::paramfile::{self, ParamFile};
 use crate::params::ParamsPanel;
 use crate::plot::PlotPanel;
 use crate::settings::{BottomTab, Settings, TimeAxis};
@@ -37,6 +38,13 @@ struct CsvDialog {
     visible_only: bool,
 }
 
+/// The choices made before a `.param` export.
+#[derive(Debug, Default)]
+struct ParamDialog {
+    /// The values at boot rather than the last ones in the log.
+    boot: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct AftermissionApp {
     settings: Settings,
@@ -49,6 +57,8 @@ pub struct AftermissionApp {
     notice: Option<Notice>,
     /// The CSV export's confirmation window, while it is open.
     csv_dialog: Option<CsvDialog>,
+    /// The `.param` export's confirmation window, while it is open.
+    param_dialog: Option<ParamDialog>,
     plot: PlotPanel,
     map: MapPanel,
     events: EventsPanel,
@@ -155,6 +165,7 @@ impl AftermissionApp {
                 self.params.reload();
                 // an export set up on the log before would write the wrong one
                 self.csv_dialog = None;
+                self.param_dialog = None;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
                     "{} - Aftermission",
                     log.name
@@ -242,6 +253,7 @@ impl AftermissionApp {
         egui::CentralPanel::default().show(ui, |ui| self.central_ui(ui));
         self.about_ui(&ctx);
         self.csv_dialog_ui(&ctx);
+        self.param_dialog_ui(&ctx);
         Self::drop_overlay(&ctx);
     }
 
@@ -271,22 +283,37 @@ impl AftermissionApp {
             // not while a job runs: the export would be refused after the
             // save dialog, with the chosen path lost
             let plotted = self.log.is_some() && self.plot.showing().next().is_some();
+            let has_params = self.log.as_ref().is_some_and(|l| !l.params.is_empty());
             let idle = self.job.is_none();
+            let why = |reason| {
+                if idle {
+                    reason
+                } else {
+                    "Wait for the running job"
+                }
+            };
             ui.menu_button("Export", |ui| {
                 if ui
                     .add_enabled(
                         plotted && idle,
                         egui::Button::new("Plotted series as CSV\u{2026}"),
                     )
-                    .on_disabled_hover_text(if idle {
-                        "Plot a series first"
-                    } else {
-                        "Wait for the running job"
-                    })
+                    .on_disabled_hover_text(why("Plot a series first"))
                     .clicked()
                 {
                     ui.close();
                     self.csv_dialog = Some(CsvDialog::default());
+                }
+                if ui
+                    .add_enabled(
+                        has_params && idle,
+                        egui::Button::new("Parameters as .param\u{2026}"),
+                    )
+                    .on_disabled_hover_text(why("The log has no parameters"))
+                    .clicked()
+                {
+                    ui.close();
+                    self.param_dialog = Some(ParamDialog::default());
                 }
             });
             ui.separator();
@@ -508,21 +535,116 @@ impl AftermissionApp {
         if save {
             let export = csv_export(log, &self.plot, range.clone());
             let name = csv::file_name(&log.name, range.as_ref());
-            let mut picker = rfd::FileDialog::new()
-                .add_filter("CSV", &["csv"])
-                .set_file_name(name);
-            if let Some(dir) = &self.settings.export_dir {
-                picker = picker.set_directory(dir);
-            }
             self.csv_dialog = None;
-            if let Some(path) = picker.save_file() {
+            if let Some(path) = self.save_dialog("CSV", "csv", name) {
                 self.export_csv_to(export, path, ctx);
             }
         }
     }
 
+    /// The choices before a `.param` export, then the save dialog.
+    fn param_dialog_ui(&mut self, ctx: &Context) {
+        // a job started underneath, by a dropped file, would refuse the export
+        if self.job.is_some() {
+            self.param_dialog = None;
+        }
+        let (Some(dialog), Some(log)) = (&mut self.param_dialog, &self.log) else {
+            return;
+        };
+        // counted as the file will have them
+        let (mut written, mut changed) = (0, 0);
+        for p in paramfile::exportable(&log.params) {
+            written += 1;
+            changed += usize::from(!p.changes.is_empty());
+        }
+        let left_out = log.params.len() - written;
+        if changed == 0 {
+            dialog.boot = false;
+        }
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Export parameters")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{written} parameters, {changed} changed after boot"
+                ));
+                if left_out > 0 {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("Left out, with a name no loader can read: {left_out}"),
+                    );
+                }
+                ui.add_enabled(
+                    changed > 0,
+                    egui::Checkbox::new(&mut dialog.boot, "Boot values instead of last values"),
+                )
+                .on_disabled_hover_text("No parameter changed after boot");
+                ui.horizontal(|ui| {
+                    save = ui
+                        .add_enabled(written > 0, egui::Button::new("Save as\u{2026}"))
+                        .on_disabled_hover_text("No parameter has a name a loader can read")
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        let boot = dialog.boot;
+        if !open || cancel {
+            self.param_dialog = None;
+        }
+        if save {
+            let file = ParamFile::new(&log.name, &log.params, boot);
+            let name = paramfile::file_name(&log.name, boot);
+            self.param_dialog = None;
+            if let Some(path) = self.save_dialog("Parameter file", "param", name) {
+                self.export_params_to(file, path, ctx);
+            }
+        }
+    }
+
+    /// Ask where to save a file named `name`, starting in the last export
+    /// folder.
+    fn save_dialog(&self, kind: &str, extension: &str, name: String) -> Option<PathBuf> {
+        let mut picker = rfd::FileDialog::new()
+            .add_filter(kind, &[extension])
+            .set_file_name(name);
+        if let Some(dir) = &self.settings.export_dir {
+            picker = picker.set_directory(dir);
+        }
+        picker.save_file()
+    }
+
     /// Write `export` to `path` on a worker.
     pub(crate) fn export_csv_to(&mut self, export: Export, path: PathBuf, ctx: &Context) {
+        self.write_file(path, ctx, move |out, name| {
+            let rows = export.write(out)?;
+            Ok(format!(
+                "Wrote {name}: {rows} rows, {} series",
+                export.columns.len()
+            ))
+        });
+    }
+
+    /// Write `file` to `path` on a worker.
+    pub(crate) fn export_params_to(&mut self, file: ParamFile, path: PathBuf, ctx: &Context) {
+        self.write_file(path, ctx, move |out, name| {
+            file.write(out)?;
+            Ok(format!("Wrote {name}: {} parameters", file.values.len()))
+        });
+    }
+
+    /// Create `path` and fill it through `write` on a worker; `write` is
+    /// given the file's name and returns the summary the menu bar shows.
+    /// Refused while a job runs.
+    fn write_file(
+        &mut self,
+        path: PathBuf,
+        ctx: &Context,
+        write: impl FnOnce(&mut BufWriter<File>, &str) -> std::io::Result<String> + Send + 'static,
+    ) {
         if self.busy() {
             return;
         }
@@ -537,9 +659,8 @@ impl AftermissionApp {
             move || {
                 let describe = |e: std::io::Error| format!("{}: {e}", path.display());
                 let mut out = BufWriter::new(File::create(&path).map_err(describe)?);
-                let rows = export.write(&mut out).map_err(describe)?;
+                let summary = write(&mut out, &name).map_err(describe)?;
                 out.flush().map_err(describe)?;
-                let summary = format!("Wrote {name}: {rows} rows, {} series", export.columns.len());
                 Ok(Done::Exported { path, summary })
             },
         ));
@@ -1103,6 +1224,176 @@ mod tests {
         assert_eq!(app.settings.export_dir.as_deref(), out.parent());
         with_ui(&mut app, |harness| {
             harness.get_by_label(notice.text.as_str());
+        });
+    }
+
+    #[test]
+    fn the_parameters_export_as_a_param_file_with_last_or_boot_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+
+        // the window counts what it is about to write
+        app.param_dialog = Some(ParamDialog::default());
+        with_ui(&mut app, |harness| {
+            let window =
+                harness.get_by_role_and_label(egui::accesskit::Role::Window, "Export parameters");
+            window.get_by_label("4 parameters, 1 changed after boot");
+            window
+                .get_by_label("Boot values instead of last values")
+                .click();
+            harness.run();
+        });
+        assert!(app.param_dialog.as_ref().unwrap().boot);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Cancel").click();
+            harness.run();
+        });
+        assert!(app.param_dialog.is_none());
+
+        let log = app.log().unwrap();
+        let (last, boot) = (
+            ParamFile::new(&log.name, &log.params, false),
+            ParamFile::new(&log.name, &log.params, true),
+        );
+        let out = dir.path().join("flight.param");
+        app.export_params_to(last, out.clone(), &ctx);
+        assert_eq!(app.job.as_ref().unwrap().label, "Writing flight.param");
+        wait(&mut app, &ctx);
+        assert_eq!(
+            app.notice,
+            Some(Notice {
+                text: "Wrote flight.param: 4 parameters".into(),
+                error: false,
+            })
+        );
+        assert_eq!(app.settings.export_dir.as_deref(), Some(dir.path()));
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "# flight.bin: each parameter's last value in the log\n\
+             ATC_RAT_RLL_P,0.137\n\
+             MIS_TOTAL,7\n\
+             SIM_RATE_HZ,380\n\
+             WPNAV_SPEED,1500\n"
+        );
+        // the boot values differ in the one changed after boot
+        let out = dir.path().join("flight_boot.param");
+        app.export_params_to(boot, out.clone(), &ctx);
+        wait(&mut app, &ctx);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "# flight.bin: each parameter's value at boot in the log\n\
+             ATC_RAT_RLL_P,0.137\n\
+             MIS_TOTAL,4\n\
+             SIM_RATE_HZ,380\n\
+             WPNAV_SPEED,1500\n"
+        );
+
+        // a job underneath the window closes it
+        app.param_dialog = Some(ParamDialog::default());
+        let path = app.settings.recent[0].clone();
+        app.open_path(&path, &ctx);
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label("Export parameters").is_none());
+        });
+        assert!(app.param_dialog.is_none());
+        wait(&mut app, &ctx);
+    }
+
+    #[test]
+    fn the_param_export_holds_back_what_the_log_cannot_give() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        // a log with only `records` as `PARM` rows, each at boot, and an
+        // event so that it has something without them
+        let log = |records: &[(&str, f64)]| {
+            let mut w = LogWriter::new();
+            w.define(1, "PARM", "QNf", &["TimeUS", "Name", "Value"])
+                .unwrap();
+            w.define(2, "EV", "QB", &["TimeUS", "Id"]).unwrap();
+            w.record("EV", &[Value::U64(1_000_000), Value::U64(10)])
+                .unwrap();
+            for &(name, value) in records {
+                w.record(
+                    "PARM",
+                    &[
+                        Value::U64(1_000_000),
+                        Value::Str(name.into()),
+                        Value::F64(value),
+                    ],
+                )
+                .unwrap();
+            }
+            w.into_bytes()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+
+        // no parameters: nothing to export
+        let path = dir.path().join("none.bin");
+        std::fs::write(&path, log(&[])).unwrap();
+        reopen(&mut app, &path);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("File").click();
+            harness.run();
+            harness.get_by_label("Export \u{23F5}").hover();
+            harness.run();
+            assert!(
+                harness
+                    .get_by_label("Parameters as .param\u{2026}")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        });
+
+        // none changed after boot: the boot values are the last ones, and
+        // a damaged name is counted out
+        let path = dir.path().join("still.bin");
+        std::fs::write(
+            &path,
+            log(&[("FLTMODE1", 5.0), ("BAD NAME", 1.0), ("RTL_ALT", 1500.0)]),
+        )
+        .unwrap();
+        reopen(&mut app, &path);
+        app.param_dialog = Some(ParamDialog { boot: true });
+        with_ui(&mut app, |harness| {
+            let window =
+                harness.get_by_role_and_label(egui::accesskit::Role::Window, "Export parameters");
+            window.get_by_label("2 parameters, 0 changed after boot");
+            window.get_by_label("Left out, with a name no loader can read: 1");
+            assert!(
+                window
+                    .get_by_label("Boot values instead of last values")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            assert!(
+                !window
+                    .get_by_label("Save as\u{2026}")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+        });
+        assert!(!app.param_dialog.as_ref().unwrap().boot);
+
+        // every name damaged: the window says why and offers no save
+        let path = dir.path().join("damaged.bin");
+        std::fs::write(&path, log(&[("BAD NAME", 1.0)])).unwrap();
+        reopen(&mut app, &path);
+        app.param_dialog = Some(ParamDialog::default());
+        with_ui(&mut app, |harness| {
+            let window =
+                harness.get_by_role_and_label(egui::accesskit::Role::Window, "Export parameters");
+            window.get_by_label("0 parameters, 0 changed after boot");
+            window.get_by_label("Left out, with a name no loader can read: 1");
+            assert!(
+                window
+                    .get_by_label("Save as\u{2026}")
+                    .accesskit_node()
+                    .is_disabled()
+            );
         });
     }
 

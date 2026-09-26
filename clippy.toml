@@ -7,4 +7,4 @@ allow-expect-in-tests = true
 allow-panic-in-tests = true
 
 # Names that are not code and need no backticks in docs.
-doc-valid-idents = ["ArduPilot", ".."]
+doc-valid-idents = ["ArduPilot", "MAVProxy", ".."]

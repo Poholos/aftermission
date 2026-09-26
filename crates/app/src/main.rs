@@ -9,6 +9,7 @@ mod filter;
 mod map;
 mod model;
 mod modes;
+mod paramfile;
 mod params;
 mod plot;
 mod settings;

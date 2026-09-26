@@ -62,6 +62,9 @@ The tool is early. What works today:
   and values from float32 fields print exactly as the log stored them. The
   whole log, or only the time range in view when the plot is zoomed.
   Series hidden through the legend stay out.
+- **Parameter file export** (File > Export) as a `.param` file of
+  `NAME,VALUE` lines, which Mission Planner and MAVProxy load: each
+  parameter's last value in the log, or its value at boot.
 - **Preferences** persist: theme, time axis, mode bands, which panels are
   open and which tab the bottom one shows, map tiles, the recent files and
   the export folder.
@@ -69,7 +72,7 @@ The tool is early. What works today:
 A plot set up on one log carries over when another opens: series the new
 log also has are re-read, the rest are dropped.
 
-Planned next: `.param` and Parquet export, and a browser build.
+Planned next: Parquet export and a browser build.
 
 ## Building and running
 

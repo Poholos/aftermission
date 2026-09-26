@@ -4,12 +4,12 @@
 
 use std::io::{self, Write};
 use std::ops::{Range, RangeInclusive};
-use std::path::Path;
 
 use dflog::time::TimeBase;
 
 use crate::model::Series;
 use crate::timefmt;
+use crate::worker;
 
 /// One column: a series under its plot title.
 #[derive(Debug, Clone, PartialEq)]
@@ -122,10 +122,7 @@ pub fn header<'a>(utc: bool, titles: impl Iterator<Item = &'a str>) -> Vec<Strin
 /// whole seconds when one applies. `flight.csv`, or `flight_12-30s.csv`.
 #[must_use]
 pub fn file_name(log_name: &str, range: Option<&RangeInclusive<f64>>) -> String {
-    let stem = Path::new(log_name).file_stem().map_or_else(
-        || log_name.to_string(),
-        |s| s.to_string_lossy().into_owned(),
-    );
+    let stem = worker::file_stem(log_name);
     match range {
         Some(range) => format!("{stem}_{:.0}-{:.0}s.csv", range.start(), range.end()),
         None => format!("{stem}.csv"),

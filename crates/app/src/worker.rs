@@ -104,6 +104,15 @@ impl Job {
     }
 }
 
+/// A file name without its extension, which an export's file name starts
+/// with: `flight` for `flight.bin`.
+#[must_use]
+pub fn file_stem(name: &str) -> String {
+    Path::new(name)
+        .file_stem()
+        .map_or_else(|| name.to_string(), |s| s.to_string_lossy().into_owned())
+}
+
 /// The last component of a path, or the whole path when it has none.
 #[must_use]
 pub fn file_name(path: &Path) -> String {
@@ -218,5 +227,8 @@ mod tests {
     fn file_names_fall_back_to_the_path() {
         assert_eq!(file_name(Path::new("a/b/c.bin")), "c.bin");
         assert_eq!(file_name(Path::new("..")), "..");
+        assert_eq!(file_stem("flight.bin"), "flight");
+        assert_eq!(file_stem("flight.bin.gz"), "flight.bin");
+        assert_eq!(file_stem(".."), "..");
     }
 }
