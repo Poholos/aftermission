@@ -1,0 +1,12 @@
+# `trunk serve` / `trunk build --release` from the workspace root. The
+# Parquet export is native only, so every trunk build leaves the default
+# feature out.
+[build]
+target = "crates/app/index.html"
+dist = "dist"
+no_default_features = true
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8081
+open = false

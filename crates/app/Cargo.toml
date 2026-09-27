@@ -18,17 +18,26 @@ eframe.workspace = true
 egui.workspace = true
 egui_plot.workspace = true
 egui_extras.workspace = true
-rfd.workspace = true
 walkers.workspace = true
 serde.workspace = true
-tempfile.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# The file dialogs, the memory map, and the export's temporary file have
+# no browser counterpart; the web build reads and writes through the page.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dflog = { workspace = true, features = ["mmap"] }
+rfd.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures.workspace = true
 
 [features]
 default = ["parquet"]
 # File > Export > Whole log as Parquet, through dflog's exporter. It pulls
-# in the arrow dependency tree; the web build (M5) leaves it out.
+# in the arrow dependency tree and a folder picker, so it is native only:
+# the web build, through Trunk.toml, leaves it out.
 parquet = ["dflog/parquet"]
 
 [dev-dependencies]

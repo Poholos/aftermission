@@ -5,9 +5,7 @@
 use dflog::time::TimeBase;
 use egui::{Color32, Pos2, Rect, Stroke};
 use walkers::sources::OpenStreetMap;
-use walkers::{
-    HeaderValue, HttpOptions, HttpTiles, Map, MapMemory, Position, Projector, Tiles, lat_lon,
-};
+use walkers::{HttpOptions, HttpTiles, Map, MapMemory, Position, Projector, Tiles, lat_lon};
 
 use crate::model::{Bounds, LoadedLog, Track};
 use crate::timefmt;
@@ -167,16 +165,25 @@ impl MapPanel {
 /// OpenStreetMap's tile usage policy asks for an identifying user agent
 /// and a cache that honors the tiles' expiry; the cache sits beside the
 /// app's settings.
+#[cfg(not(target_arch = "wasm32"))]
 fn http_options() -> HttpOptions {
     HttpOptions {
         cache: eframe::storage_dir(crate::APP_ID).map(|dir| dir.join("tiles")),
-        user_agent: Some(HeaderValue::from_static(concat!(
+        user_agent: Some(walkers::HeaderValue::from_static(concat!(
             "aftermission/",
             env!("CARGO_PKG_VERSION"),
             " (+https://github.com/Poholos/aftermission)"
         ))),
         ..HttpOptions::default()
     }
+}
+
+/// In the browser, the browser does both: it caches the tiles by their
+/// expiry, and it sends its own user agent, which walkers asks us not to
+/// replace there.
+#[cfg(target_arch = "wasm32")]
+fn http_options() -> HttpOptions {
+    HttpOptions::default()
 }
 
 /// The middle of `bounds`.

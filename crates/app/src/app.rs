@@ -26,6 +26,11 @@ use crate::worker::{self, Done, Job, Kind};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// What the browser build says to an open, by the menu, the shortcut or a
+/// drop, until it can read a file the page is given.
+#[cfg(target_arch = "wasm32")]
+const NO_OPEN_IN_BROWSER: &str = "Opening a log is not in the browser build yet.";
+
 /// A line in the menu bar: the last job's outcome, or why one could not
 /// start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +248,7 @@ impl AftermissionApp {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn handle_drop(&mut self, ctx: &Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -257,12 +263,23 @@ impl AftermissionApp {
         }
     }
 
+    /// A drop in the browser names a file the page cannot open by path,
+    /// and a job there cannot start a thread: say what the open stub
+    /// says, rather than report a worker that never ran.
+    #[cfg(target_arch = "wasm32")]
+    fn handle_drop(&mut self, ctx: &Context) {
+        if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
+            self.error = Some(NO_OPEN_IN_BROWSER.to_string());
+        }
+    }
+
     fn shortcuts(&mut self, ctx: &Context) {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
             self.open_dialog(ctx);
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_dialog(&mut self, ctx: &Context) {
         let picked = rfd::FileDialog::new()
             .add_filter("Dataflash log", &["bin", "BIN"])
@@ -270,6 +287,13 @@ impl AftermissionApp {
         if let Some(path) = picked {
             self.open_path(&path, ctx);
         }
+    }
+
+    /// The browser's file picker is not built yet: say so where an open
+    /// error shows, rather than doing nothing.
+    #[cfg(target_arch = "wasm32")]
+    fn open_dialog(&mut self, _ctx: &Context) {
+        self.error = Some(NO_OPEN_IN_BROWSER.to_string());
     }
 
     /// The whole window.
@@ -751,6 +775,7 @@ impl AftermissionApp {
 
     /// Ask where to save a file named `name`, starting in the last export
     /// folder.
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_dialog(&self, kind: &str, extension: &str, name: String) -> Option<PathBuf> {
         let mut picker = rfd::FileDialog::new()
             .add_filter(kind, &[extension])
@@ -759,6 +784,17 @@ impl AftermissionApp {
             picker = picker.set_directory(dir);
         }
         picker.save_file()
+    }
+
+    /// Exports do not download yet: no path, so nothing is written, and a
+    /// notice says why.
+    #[cfg(target_arch = "wasm32")]
+    fn save_dialog(&mut self, kind: &str, _extension: &str, _name: String) -> Option<PathBuf> {
+        self.notice = Some(Notice {
+            text: format!("{kind} export is not in the browser build yet"),
+            error: true,
+        });
+        None
     }
 
     /// Write `export` to `path` on a worker.
@@ -797,6 +833,7 @@ impl AftermissionApp {
     /// fails where writing it in place would not. The sync is a hard
     /// failure on a mount without one, and the move has no retry against
     /// a program holding the just-closed file for a moment.
+    #[cfg(not(target_arch = "wasm32"))]
     fn write_file(
         &mut self,
         path: PathBuf,
@@ -844,6 +881,23 @@ impl AftermissionApp {
                 Ok(Done::Exported { path, summary })
             },
         ));
+    }
+
+    /// In the browser, [`Self::save_dialog`] gives no path yet, so nothing
+    /// reaches this; exports become downloads in a later change.
+    #[cfg(target_arch = "wasm32")]
+    fn write_file(
+        &mut self,
+        path: PathBuf,
+        _ctx: &Context,
+        write: impl FnOnce(&mut BufWriter<File>, &str) -> std::io::Result<String> + Send + 'static,
+    ) {
+        let text = format!(
+            "{}: exports are not in the browser build yet",
+            worker::file_name(&path)
+        );
+        drop((path, write));
+        self.notice = Some(Notice { text, error: true });
     }
 
     /// A shade over the window while a file is being dragged over it.

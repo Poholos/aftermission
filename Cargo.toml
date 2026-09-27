@@ -12,7 +12,9 @@ repository = "https://github.com/Poholos/aftermission"
 publish = false
 
 [workspace.dependencies]
-dflog = "0.2.0"
+# The memory map (`mmap`) is turned on per target in the app: native only,
+# since the browser hands a log over as bytes.
+dflog = { version = "0.2.0", default-features = false }
 
 eframe = { version = "0.36", features = ["persistence"] }
 egui = "0.36"
@@ -27,6 +29,9 @@ ron = "0.12.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3.27.0"
+
+# Browser build only.
+wasm-bindgen-futures = "0.4.79"
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"
