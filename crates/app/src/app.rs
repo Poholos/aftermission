@@ -2,8 +2,9 @@
 //! the map, the bottom panel with the events list and the parameter
 //! table, the ways a log gets opened, and the exports.
 
-use std::fs::File;
+#[cfg(not(target_arch = "wasm32"))]
 use std::io::BufWriter;
+use std::io::Write;
 use std::ops::RangeInclusive;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
@@ -29,6 +30,22 @@ use crate::tree;
 use crate::worker::{self, Done, Job, Kind};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The export dialogs' button: a save dialog natively, a download in the
+/// browser.
+#[cfg(not(target_arch = "wasm32"))]
+const SAVE_LABEL: &str = "Save as\u{2026}";
+#[cfg(target_arch = "wasm32")]
+const SAVE_LABEL: &str = "Download";
+
+/// How an export's summary starts. Natively the file is in place when the
+/// job ends; in the browser the page has handed it over, and whether the
+/// browser saved it, or the user canceled a prompt for where, the page
+/// cannot tell.
+#[cfg(not(target_arch = "wasm32"))]
+const DONE_VERB: &str = "Wrote";
+#[cfg(target_arch = "wasm32")]
+const DONE_VERB: &str = "Downloaded";
 
 /// A log the browser read, waiting for its label to be painted before
 /// the scan holds the page: the frame that takes the bytes shows the
@@ -502,7 +519,7 @@ impl AftermissionApp {
             let has_params = self.log.as_ref().is_some_and(|l| !l.params.is_empty());
             #[cfg(feature = "parquet")]
             let has_records = self.log.as_ref().is_some_and(|l| l.parquet_counts().1 > 0);
-            let idle = self.job.is_none();
+            let idle = self.running().is_none();
             let has_log = self.log.is_some();
             let why = |reason| disabled_reason(idle, has_log, reason);
             ui.menu_button("Export", |ui| {
@@ -720,7 +737,7 @@ impl AftermissionApp {
     /// The choices before a CSV export, then the save dialog.
     fn csv_dialog_ui(&mut self, ctx: &Context) {
         // a job started underneath, by a dropped file, would refuse the export
-        if self.job.is_some() {
+        if self.running().is_some() {
             self.csv_dialog = None;
         }
         let (Some(dialog), Some(log)) = (&mut self.csv_dialog, &self.log) else {
@@ -757,7 +774,7 @@ impl AftermissionApp {
                 .on_disabled_hover_text("Zoom the plot to narrow the range");
                 ui.horizontal(|ui| {
                     save = ui
-                        .add_enabled(showing, egui::Button::new("Save as\u{2026}"))
+                        .add_enabled(showing, egui::Button::new(SAVE_LABEL))
                         .on_disabled_hover_text("Nothing is showing on the plot")
                         .clicked();
                     cancel = ui.button("Cancel").clicked();
@@ -779,7 +796,7 @@ impl AftermissionApp {
     /// The choices before a `.param` export, then the save dialog.
     fn param_dialog_ui(&mut self, ctx: &Context) {
         // a job started underneath, by a dropped file, would refuse the export
-        if self.job.is_some() {
+        if self.running().is_some() {
             self.param_dialog = None;
         }
         let (Some(dialog), Some(log)) = (&mut self.param_dialog, &self.log) else {
@@ -819,7 +836,7 @@ impl AftermissionApp {
                 .on_disabled_hover_text("No parameter changed after boot");
                 ui.horizontal(|ui| {
                     save = ui
-                        .add_enabled(written > 0, egui::Button::new("Save as\u{2026}"))
+                        .add_enabled(written > 0, egui::Button::new(SAVE_LABEL))
                         .on_disabled_hover_text("No parameter has a name a loader can read")
                         .clicked();
                     cancel = ui.button("Cancel").clicked();
@@ -843,7 +860,7 @@ impl AftermissionApp {
     #[cfg(feature = "parquet")]
     fn parquet_dialog_ui(&mut self, ctx: &Context) {
         // a job started underneath, by a dropped file, would refuse the export
-        if self.job.is_some() {
+        if self.running().is_some() {
             self.parquet_dialog = None;
         }
         let (Some(dialog), Some(log)) = (&mut self.parquet_dialog, &self.log) else {
@@ -937,23 +954,25 @@ impl AftermissionApp {
         picker.save_file()
     }
 
-    /// Exports do not download yet: no path, so nothing is written, and a
-    /// notice says why.
+    /// In the browser the file is a download: the name is the whole of
+    /// the answer, and the browser asks where it goes if its settings say
+    /// to.
     #[cfg(target_arch = "wasm32")]
-    fn save_dialog(&mut self, kind: &str, _extension: &str, _name: String) -> Option<PathBuf> {
-        self.notice = Some(Notice {
-            text: format!("{kind} export is not in the browser build yet"),
-            error: true,
-        });
-        None
+    #[expect(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "the same call as the native dialog, which starts in the last export folder and can be canceled"
+    )]
+    fn save_dialog(&self, _kind: &str, _extension: &str, name: String) -> Option<PathBuf> {
+        Some(PathBuf::from(name))
     }
 
     /// Write `export` to `path` on a worker.
     pub(crate) fn export_csv_to(&mut self, export: Export, path: PathBuf, ctx: &Context) {
-        self.write_file(path, ctx, move |out, name| {
-            let rows = export.write(out)?;
+        self.write_file(path, ctx, move |mut out, name| {
+            let rows = export.write(&mut out)?;
             Ok(format!(
-                "Wrote {name}: {rows} rows, {} series",
+                "{DONE_VERB} {name}: {rows} rows, {} series",
                 export.columns.len()
             ))
         });
@@ -961,9 +980,12 @@ impl AftermissionApp {
 
     /// Write `file` to `path` on a worker.
     pub(crate) fn export_params_to(&mut self, file: ParamFile, path: PathBuf, ctx: &Context) {
-        self.write_file(path, ctx, move |out, name| {
-            file.write(out)?;
-            Ok(format!("Wrote {name}: {} parameters", file.values.len()))
+        self.write_file(path, ctx, move |mut out, name| {
+            file.write(&mut out)?;
+            Ok(format!(
+                "{DONE_VERB} {name}: {} parameters",
+                file.values.len()
+            ))
         });
     }
 
@@ -989,7 +1011,7 @@ impl AftermissionApp {
         &mut self,
         path: PathBuf,
         ctx: &Context,
-        write: impl FnOnce(&mut BufWriter<File>, &str) -> std::io::Result<String> + Send + 'static,
+        write: impl FnOnce(&mut dyn Write, &str) -> std::io::Result<String> + Send + 'static,
     ) {
         if self.busy() {
             return;
@@ -1034,21 +1056,36 @@ impl AftermissionApp {
         ));
     }
 
-    /// In the browser, [`Self::save_dialog`] gives no path yet, so nothing
-    /// reaches this; exports become downloads in a later change.
+    /// In the browser, write through `write` into memory and hand the
+    /// bytes to the browser as a download named after `path`, as a job
+    /// that runs to its end at once, so the outcome reaches the menu bar
+    /// the way a native export's does. Refused while a job runs or a scan
+    /// is armed. Nothing is replaced: the browser names a second download
+    /// of the same name itself, `flight (1).csv`.
     #[cfg(target_arch = "wasm32")]
     fn write_file(
         &mut self,
         path: PathBuf,
-        _ctx: &Context,
-        write: impl FnOnce(&mut BufWriter<File>, &str) -> std::io::Result<String> + Send + 'static,
+        ctx: &Context,
+        write: impl FnOnce(&mut dyn Write, &str) -> std::io::Result<String> + Send + 'static,
     ) {
-        let text = format!(
-            "{}: exports are not in the browser build yet",
-            worker::file_name(&path)
-        );
-        drop((path, write));
-        self.notice = Some(Notice { text, error: true });
+        if self.busy() {
+            return;
+        }
+        let name = worker::file_name(&path);
+        let label = format!("Downloading {name}");
+        self.job = Some(Job::run(
+            Kind::Export,
+            path.clone(),
+            label,
+            ctx.clone(),
+            move || {
+                let mut bytes = Vec::new();
+                let summary = write(&mut bytes, &name).map_err(|e| format!("{name}: {e}"))?;
+                crate::download::download(&name, &bytes).map_err(|e| format!("{name}: {e}"))?;
+                Ok(Done::Exported { path, summary })
+            },
+        ));
     }
 
     /// A shade over the window while a file is being dragged over it.
@@ -1135,7 +1172,6 @@ impl eframe::App for AftermissionApp {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use std::sync::mpsc;
 
     use super::*;

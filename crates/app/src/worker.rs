@@ -23,11 +23,8 @@ pub enum Done {
     /// The log at `path`, modeled; boxed, so the enum stays the size of
     /// its other variant.
     Opened { path: PathBuf, log: Box<LoadedLog> },
-    /// A file written at `path`; `summary` is what the status line says.
-    #[cfg_attr(
-        target_arch = "wasm32",
-        expect(dead_code, reason = "the browser build writes no export yet")
-    )]
+    /// A file written at `path`, or in the browser downloaded under that
+    /// name; `summary` is what the status line says.
     Exported { path: PathBuf, summary: String },
 }
 

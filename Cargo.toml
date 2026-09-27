@@ -31,19 +31,23 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3.27.0"
 
 # Browser build only. The file input, the files it yields and their
-# bytes, and the tab's title.
+# bytes, and the tab's title; for downloads, the blob, its URL and the
+# link that saves it.
 wasm-bindgen-futures = "0.4.79"
 js-sys = "0.3.106"
 web-sys = { version = "0.3.106", features = [
     "Blob",
+    "BlobPropertyBag",
     "Document",
     "Element",
     "EventTarget",
     "File",
     "FileList",
+    "HtmlAnchorElement",
     "HtmlElement",
     "HtmlInputElement",
     "Navigator",
+    "Url",
     "UserActivation",
     "Window",
 ] }

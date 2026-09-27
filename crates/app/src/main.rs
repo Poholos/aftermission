@@ -4,6 +4,8 @@
 mod app;
 mod codes;
 mod csv;
+#[cfg(any(target_arch = "wasm32", test))]
+mod download;
 mod events;
 mod filter;
 mod map;
