@@ -1,7 +1,8 @@
 # Aftermission
 
-Post-mission review of ArduPilot dataflash (`.bin`) logs: a desktop tool
-written in Rust on [egui](https://github.com/emilk/egui), reading logs
+Post-mission review of ArduPilot dataflash (`.bin`) logs: a tool for the
+desktop and the browser, written in Rust on
+[egui](https://github.com/emilk/egui), reading logs
 through [dflog](https://github.com/Poholos/dflog) and drawing the map
 with [walkers](https://github.com/podusowski/walkers). It is for looking
 at what a vehicle did after the flight, drive or dive: plotting any field
@@ -76,9 +77,9 @@ The tool is early. What works today:
   an earlier export; an export that fails leaves nothing behind. Built by
   default through the `parquet` feature; `--no-default-features` leaves
   it and the Arrow dependency tree out.
-- **A failed export leaves the file that was there**: a CSV or `.param`
+- **A failed export leaves the file that was there** (desktop): a CSV or `.param`
   file is written beside its target and moved over it only when complete.
-- **Closing during an export asks twice**: the first close while one
+- **Closing during an export asks twice** (desktop): the first close while one
   writes is held with a notice, and a second close quits anyway.
 - **Preferences** persist: theme, time axis, mode bands, which panels are
   open and which tab the bottom one shows, map tiles, the recent files and
@@ -87,7 +88,31 @@ The tool is early. What works today:
 A plot set up on one log carries over when another opens: series the new
 log also has are re-read, the rest are dropped.
 
-Planned next: a browser build.
+## In the browser
+
+The same app builds for the web and runs as a page. What differs there:
+
+- **The log stays in the browser.** A file chosen through File > Open, or
+  dropped on the page, is read into memory and indexed there; nothing is
+  uploaded anywhere. The page holds while a log is indexed, longer for a
+  large one, with the status line saying so first. There is no
+  list of recent files, since the browser gives no path to open again.
+- **Exports download.** CSV and `.param` files go to the browser's
+  downloads folder, or wherever it asks, and replace nothing: the browser
+  names a second one of the same name itself. The export runs to its end
+  before the page draws again, so a tab cannot be closed partway, and
+  there is no second close to ask for. The Parquet export is desktop
+  only: its dependency tree and its folder picker have no place in a page.
+- **Map tiles** come from OpenStreetMap through the browser, with the
+  browser's own cache and user agent.
+- **Memory.** While a log is read, the browser holds it twice, once as
+  the file it read and once in the app's memory, and the app's model on
+  top; a wasm program's memory tops out at 4 GB. Logs of a few hundred
+  megabytes are the practical ceiling in a page. The desktop app maps
+  the file instead of reading it and builds the same model, so it is
+  bounded by the machine's memory rather than by wasm's 4 GB.
+- **`?webgl`** on the page's address makes the app draw through WebGL 2
+  instead of WebGPU, for a browser whose WebGPU draws wrong.
 
 ## Building and running
 
@@ -112,6 +137,32 @@ cargo deny check
 
 The tests build their logs with dflog's writer, so no flight data is in the
 repository.
+
+### The web build
+
+[trunk](https://trunkrs.dev) builds the page; `Trunk.toml` at the root
+leaves the `parquet` feature out and serves on `127.0.0.1:8081`.
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo binstall trunk   # or: cargo install trunk --locked
+trunk serve
+trunk build --release
+```
+
+The release bundle lands in `dist/`. The checks for the web build, which
+CI runs beside the native ones:
+
+```bash
+cargo clippy -p aftermission --target wasm32-unknown-unknown --no-default-features -- -D warnings
+trunk build --release
+cargo about generate --manifest-path crates/app/Cargo.toml --no-default-features --fail about.hbs -o dist/third-party.html
+```
+
+The last writes the copyright notices and license texts of everything the
+bundle links, which its MIT and BSD components require to travel with it;
+the feature is left out there as in the bundle. A wasm clippy run never
+links, so the `trunk build` is the step that proves the build.
 
 ## License
 

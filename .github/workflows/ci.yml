@@ -1,6 +1,8 @@
 # Every push and pull request: format, lints and tests on Linux, the test
-# suite on Windows too, and the dependency policy. The toolchain comes from
-# rust-toolchain.toml. The web build joins once the app has one.
+# suite on Windows too, the dependency policy, and a real web build, since
+# a wasm clippy run never links. The toolchain comes from
+# rust-toolchain.toml. The bundle is kept as an artifact; publishing it is
+# a later milestone's.
 name: CI
 
 on:
@@ -34,7 +36,7 @@ jobs:
       - name: Clippy
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # the build without the Parquet export, which the web build will be
+      # the build without the Parquet export, which the web build is
       - name: Clippy without default features
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
@@ -50,3 +52,32 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  web:
+    name: Web build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Add the wasm target
+        run: rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: cargo-bins/cargo-binstall@v1.22.0
+      - name: Install trunk and cargo-about
+        run: cargo binstall --no-confirm trunk cargo-about
+      - name: Clippy for wasm
+        run: cargo clippy -p aftermission --target wasm32-unknown-unknown --no-default-features -- -D warnings
+      # Trunk.toml leaves the parquet feature out. No public URL until the
+      # bundle has an address.
+      - name: Build the release bundle
+        run: trunk build --release
+      # The copyright notices and license texts of everything the bundle
+      # links, which its MIT and BSD components require to travel with it.
+      # The feature is left out here as well: with it, the wasm32 graph
+      # holds tiny-keccak, allowed by deny.toml for the native build alone.
+      - name: Third-party notices
+        run: cargo about generate --manifest-path crates/app/Cargo.toml --no-default-features --fail about.hbs -o dist/third-party.html
+      - uses: actions/upload-artifact@v7
+        with:
+          name: web-bundle
+          path: dist
+          retention-days: 3
