@@ -123,6 +123,11 @@ update` brings its patch releases.
 cargo run --release -- path/to/flight.bin
 ```
 
+A release build on Windows opens no console window, so its log shows
+nowhere unless redirected: `aftermission flight.bin > aftermission.log`
+writes it to a file, with `RUST_LOG` as usual. A debug build (`cargo
+run`) keeps the console.
+
 On Linux, eframe and the file dialog need the GTK and X11/Wayland
 development libraries; the CI workflow lists the Debian packages.
 

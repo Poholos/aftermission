@@ -1,6 +1,11 @@
 //! Aftermission: post-mission review of ArduPilot dataflash logs, built on
 //! dflog and egui.
 
+// A release build on Windows opens no console window behind the app; a
+// debug build keeps it for `RUST_LOG`. Not for the test harness, which
+// is built from this file too and would print nothing.
+#![cfg_attr(all(not(debug_assertions), not(test)), windows_subsystem = "windows")]
+
 mod app;
 mod codes;
 mod csv;
@@ -39,9 +44,13 @@ const DEFAULT_LOG: &str = "aftermission=info,wgpu_core=warn,wgpu_hal=error,naga=
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
+    use std::io::IsTerminal as _;
     use std::path::PathBuf;
 
+    // Colors for a terminal only: a log redirected to a file, the one way
+    // to keep the Windows release build's, stays plain text.
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG)),
@@ -54,6 +63,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Aftermission")
+            .with_icon(icon())
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([640.0, 400.0])
             .with_drag_and_drop(true),
@@ -101,6 +111,14 @@ fn main() {
             tracing::error!(?err, "cannot start the web app");
         }
     });
+}
+
+/// The window's icon, painted by `examples/icon.rs`. The executable's own
+/// icon is a Windows resource that `build.rs` embeds from the same drawing.
+#[cfg(not(target_arch = "wasm32"))]
+fn icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon/aftermission.png"))
+        .expect("the icon is a PNG the build ships")
 }
 
 /// Whether the page's query, `?webgl` or `?x=1&webgl`, asks for WebGL.
@@ -160,7 +178,14 @@ mod web_log {
 
 #[cfg(test)]
 mod tests {
-    use super::asks_for_webgl;
+    use super::{asks_for_webgl, icon};
+
+    #[test]
+    fn the_window_icon_is_the_painted_png() {
+        let icon = icon();
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 
     #[test]
     fn the_address_asks_for_webgl_by_a_bare_or_valued_key() {

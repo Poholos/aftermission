@@ -30,6 +30,11 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3.27.0"
 
+# The icon: `image` paints it in `examples/icon.rs`, `winresource` embeds
+# it into the Windows executable.
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+winresource = "0.1.31"
+
 # Browser build only. The file input, the files it yields and their
 # bytes, and the tab's title; for downloads, the blob, its URL and the
 # link that saves it.

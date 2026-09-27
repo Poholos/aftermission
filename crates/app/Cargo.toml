@@ -42,8 +42,13 @@ default = ["parquet"]
 # the web build, through Trunk.toml, leaves it out.
 parquet = ["dflog/parquet"]
 
+# The executable's icon: only a Windows host can embed the resource.
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
+
 [dev-dependencies]
 egui_kittest.workspace = true
+image.workspace = true
 ron.workspace = true
 
 [lints]
