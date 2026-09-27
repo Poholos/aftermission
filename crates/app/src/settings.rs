@@ -3,12 +3,15 @@
 //! and the export folder. Stored through eframe's key-value storage, a
 //! file next to the app's config on native.
 
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 
 use egui::ThemePreference;
 use serde::{Deserialize, Serialize};
 
 /// Recent paths kept in the File menu.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_RECENT: usize = 8;
 
 /// What the time axis reads in.
@@ -91,7 +94,9 @@ impl Settings {
         eframe::set_value(storage, Self::KEY, self);
     }
 
-    /// Put `path` at the front of the recent list.
+    /// Put `path` at the front of the recent list. The browser has no
+    /// path to offer again, so it never calls this.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn remember(&mut self, path: &Path) {
         self.recent.retain(|p| p != path);
         self.recent.insert(0, path.to_path_buf());

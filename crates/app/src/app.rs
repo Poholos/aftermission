@@ -5,7 +5,9 @@
 use std::fs::File;
 use std::io::BufWriter;
 use std::ops::RangeInclusive;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use egui::{Align2, Color32, Context};
@@ -19,6 +21,8 @@ use crate::paramfile::{self, ParamFile};
 use crate::params::ParamsPanel;
 #[cfg(feature = "parquet")]
 use crate::parquetdir;
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::picks::{Outcome, Picks};
 use crate::plot::PlotPanel;
 use crate::settings::{BottomTab, Settings, TimeAxis};
 use crate::tree;
@@ -26,10 +30,33 @@ use crate::worker::{self, Done, Job, Kind};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// What the browser build says to an open, by the menu, the shortcut or a
-/// drop, until it can read a file the page is given.
-#[cfg(target_arch = "wasm32")]
-const NO_OPEN_IN_BROWSER: &str = "Opening a log is not in the browser build yet.";
+/// A log the browser read, waiting for its label to be painted before
+/// the scan holds the page: the frame that takes the bytes shows the
+/// label and asks for a repaint, the next counts down, the one after
+/// starts the job, so the label has been presented when the page holds.
+/// Frames are counted by egui's frame number, since a frame can run the
+/// window several passes over, none of them presented.
+#[cfg(any(target_arch = "wasm32", test))]
+struct Armed {
+    /// Frames still to paint before the scan starts.
+    frames_left: u8,
+    /// The frame the count last moved in.
+    counted_frame: u64,
+    name: String,
+    bytes: Vec<u8>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl std::fmt::Debug for Armed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Armed")
+            .field("frames_left", &self.frames_left)
+            .field("counted_frame", &self.counted_frame)
+            .field("name", &self.name)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
 
 /// A line in the menu bar: the last job's outcome, or why one could not
 /// start.
@@ -91,24 +118,45 @@ pub struct AftermissionApp {
     about_open: bool,
     /// A close was held while an export ran; the next one closes.
     close_held: bool,
+    /// The files the browser hands the page, picked or dropped.
+    #[cfg(any(target_arch = "wasm32", test))]
+    picks: Picks,
+    /// A log read by the browser, about to be indexed.
+    #[cfg(any(target_arch = "wasm32", test))]
+    armed: Option<Armed>,
 }
 
 impl AftermissionApp {
+    /// The app with its saved settings, opening `initial` when the
+    /// command line named a log.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        let mut app = Self {
-            settings: Settings::load(cc.storage),
-            ..Self::default()
-        };
-        // Our setting outranks the preference eframe restored with egui's memory.
-        cc.egui_ctx.set_theme(app.settings.theme);
+        let mut app = Self::with_settings(cc);
         if let Some(path) = initial {
             app.open_path(&path, &cc.egui_ctx);
         }
         app
     }
 
+    /// The app with its saved settings; the page has no command line.
+    #[cfg(target_arch = "wasm32")]
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_settings(cc)
+    }
+
+    fn with_settings(cc: &eframe::CreationContext<'_>) -> Self {
+        let app = Self {
+            settings: Settings::load(cc.storage),
+            ..Self::default()
+        };
+        // Our setting outranks the preference eframe restored with egui's memory.
+        cc.egui_ctx.set_theme(app.settings.theme);
+        app
+    }
+
     /// Start opening `path`. The log on screen stays until the new one is
     /// ready. Refused while a job runs.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_path(&mut self, path: &Path, ctx: &Context) {
         if self.busy() {
             return;
@@ -121,11 +169,11 @@ impl AftermissionApp {
     /// notice beside the spinner, not queued; the notice goes when the job
     /// does. A job that may start clears the last notice.
     fn busy(&mut self) -> bool {
-        if let Some(job) = &self.job {
+        if let Some(label) = self.running() {
             // a held close keeps its warning, which the refusal would hide
             if !self.close_held {
                 self.notice = Some(Notice {
-                    text: format!("Still busy: {}\u{2026}", job.label),
+                    text: format!("Still busy: {label}\u{2026}"),
                     error: false,
                 });
             }
@@ -133,6 +181,91 @@ impl AftermissionApp {
         }
         self.notice = None;
         false
+    }
+
+    /// The label of the work under way, a job's or an armed scan's, which
+    /// the status line shows and the next job waits on.
+    fn running(&self) -> Option<String> {
+        if let Some(job) = &self.job {
+            return Some(job.label.clone());
+        }
+        #[cfg(any(target_arch = "wasm32", test))]
+        if let Some(armed) = &self.armed {
+            return Some(worker::indexing_label(
+                &armed.name,
+                Some(armed.bytes.len() as u64),
+            ));
+        }
+        None
+    }
+
+    /// Act on what a pick or a drop came to: arm the scan of a file
+    /// read, or say why there is none. Refused while a job runs or a scan
+    /// is armed, as an open by path is.
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn poll_picks(&mut self, ctx: &Context) {
+        let Some(outcome) = self.picks.poll() else {
+            return;
+        };
+        // one outcome a frame: another message may wait behind this one,
+        // and the repaint its sender asked for was spent on this frame. A
+        // message shown usually asks egui for a frame anyway; this does not
+        // rely on the screen changing.
+        ctx.request_repaint();
+        match outcome {
+            Outcome::File { name, bytes } => {
+                if self.busy() {
+                    return;
+                }
+                self.error = None;
+                self.armed = Some(Armed {
+                    frames_left: 2,
+                    counted_frame: ctx.cumulative_frame_nr(),
+                    name,
+                    bytes,
+                });
+                ctx.request_repaint();
+            }
+            Outcome::Unreadable { name, dropped } => {
+                // a dropped folder arrives as an entry with no file behind
+                // it; the chooser takes files only
+                let hint = if dropped {
+                    " A folder cannot be opened; drop the log file itself."
+                } else {
+                    ""
+                };
+                self.error = Some(format!("{name}: the browser could not read it.{hint}"));
+            }
+            Outcome::Refused => {
+                self.error =
+                    Some("The browser did not open the file chooser. Try again.".to_string());
+            }
+        }
+    }
+
+    /// Count the armed scan down and start it once its label has been
+    /// painted; see [`Armed`].
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn tick_armed(&mut self, ctx: &Context) {
+        let Some(armed) = &mut self.armed else {
+            return;
+        };
+        let frame = ctx.cumulative_frame_nr();
+        if frame == armed.counted_frame {
+            // another pass of the frame already counted
+            ctx.request_repaint();
+            return;
+        }
+        armed.counted_frame = frame;
+        if armed.frames_left > 1 {
+            armed.frames_left -= 1;
+            ctx.request_repaint();
+            return;
+        }
+        let Some(Armed { name, bytes, .. }) = self.armed.take() else {
+            return;
+        };
+        self.job = Some(Job::open_bytes(name, bytes, ctx.clone()));
     }
 
     /// Whether to hold a request to close the window. Ending the process
@@ -207,7 +340,10 @@ impl AftermissionApp {
         match result {
             Ok(Done::Opened { path, log }) => {
                 // only a log that opened is worth offering again
+                #[cfg(not(target_arch = "wasm32"))]
                 self.settings.remember(&path);
+                #[cfg(target_arch = "wasm32")]
+                drop(path);
                 self.plot.reload(&log);
                 self.map.reload();
                 self.params.reload();
@@ -216,10 +352,7 @@ impl AftermissionApp {
                 self.param_dialog = None;
                 #[cfg(feature = "parquet")]
                 self.parquet_dialog.take();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                    "{} - Aftermission",
-                    log.name
-                )));
+                set_title(ctx, &format!("{} - Aftermission", log.name));
                 tracing::info!(name = %log.name, records = log.records(), "log opened");
                 self.log = Some(Arc::from(log));
             }
@@ -263,13 +396,14 @@ impl AftermissionApp {
         }
     }
 
-    /// A drop in the browser names a file the page cannot open by path,
-    /// and a job there cannot start a thread: say what the open stub
-    /// says, rather than report a worker that never ran.
+    /// A drop in the browser is a file to read, not a path: the first
+    /// dropped file becomes a numbered pick, read in the background.
     #[cfg(target_arch = "wasm32")]
     fn handle_drop(&mut self, ctx: &Context) {
-        if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
-            self.error = Some(NO_OPEN_IN_BROWSER.to_string());
+        let first = ctx.input(|i| i.raw.dropped_files.first().cloned());
+        if let Some(handle) = first {
+            let (pick, tx) = self.picks.start();
+            crate::picks::read_dropped(pick, handle, tx, ctx.clone());
         }
     }
 
@@ -289,17 +423,22 @@ impl AftermissionApp {
         }
     }
 
-    /// The browser's file picker is not built yet: say so where an open
-    /// error shows, rather than doing nothing.
+    /// The browser's file chooser, as a numbered pick; what it yields
+    /// arrives through [`Self::poll_picks`].
     #[cfg(target_arch = "wasm32")]
-    fn open_dialog(&mut self, _ctx: &Context) {
-        self.error = Some(NO_OPEN_IN_BROWSER.to_string());
+    fn open_dialog(&mut self, ctx: &Context) {
+        let (pick, tx) = self.picks.start();
+        crate::picks::pick_file(pick, &tx, ctx);
     }
 
     /// The whole window.
     pub fn show(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        #[cfg(any(target_arch = "wasm32", test))]
+        self.tick_armed(&ctx);
+        #[cfg(any(target_arch = "wasm32", test))]
+        self.poll_picks(&ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.hold_close() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -337,7 +476,10 @@ impl AftermissionApp {
                 ui.close();
                 self.open_dialog(ui.ctx());
             }
+            // the browser has no path to offer again
+            #[cfg(not(target_arch = "wasm32"))]
             let recent = self.settings.recent.clone();
+            #[cfg(not(target_arch = "wasm32"))]
             ui.add_enabled_ui(!recent.is_empty(), |ui| {
                 ui.menu_button("Open recent", |ui| {
                     for path in &recent {
@@ -399,9 +541,13 @@ impl AftermissionApp {
                     self.parquet_dialog = Some(ParquetDialog::default());
                 }
             });
-            ui.separator();
-            if ui.button("Quit").clicked() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            // a page has no window to close
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                ui.separator();
+                if ui.button("Quit").clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         });
     }
@@ -457,9 +603,14 @@ impl AftermissionApp {
     /// A spinner while a job runs, and the notice: a refusal beside the
     /// spinner, or the last job's outcome.
     fn status(&self, ui: &mut egui::Ui) {
-        if let Some(job) = &self.job {
+        if let Some(label) = self.running() {
             ui.spinner();
-            ui.label(format!("{}\u{2026}", job.label));
+            ui.label(format!("{label}\u{2026}"));
+        }
+        #[cfg(any(target_arch = "wasm32", test))]
+        if let Some(name) = self.picks.reading() {
+            ui.spinner();
+            ui.label(format!("Reading {name}\u{2026}"));
         }
         if let Some(notice) = &self.notice {
             if notice.error {
@@ -941,6 +1092,22 @@ fn csv_export(log: &LoadedLog, plot: &PlotPanel, range: Option<RangeInclusive<f6
             .collect(),
         time_base: log.time_base,
         range,
+    }
+}
+
+/// Name the window after the log.
+#[cfg(not(target_arch = "wasm32"))]
+fn set_title(ctx: &Context, title: &str) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
+}
+
+/// Name the tab after the log. eframe's web runner acts on no viewport
+/// command but the screenshot, and warns about each other one, so the
+/// title goes to the document itself.
+#[cfg(target_arch = "wasm32")]
+fn set_title(_ctx: &Context, title: &str) {
+    if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+        document.set_title(title);
     }
 }
 
@@ -2103,6 +2270,243 @@ mod tests {
             disabled_reason(true, true, "Plot a series first"),
             "Plot a series first"
         );
+    }
+
+    #[test]
+    fn a_log_opens_from_bytes() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        app.job = Some(Job::open_bytes(
+            "flight.bin".into(),
+            crate::model::testlog::bytes(),
+            ctx.clone(),
+        ));
+        assert_eq!(
+            app.running().unwrap(),
+            worker::indexing_label(
+                "flight.bin",
+                Some(crate::model::testlog::bytes().len() as u64)
+            )
+        );
+        wait(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let log = app.log().unwrap();
+        assert_eq!(log.name, "flight.bin");
+        assert!(log.records() > 0);
+    }
+
+    /// Run one frame of the app on `ctx`, as the browser would between
+    /// presented frames. A kittest harness runs frames until the window is
+    /// still when it is built, so a count of frames goes through this
+    /// instead. Nothing paints, so the texture updates are dropped.
+    fn frame(app: &mut AftermissionApp, ctx: &Context) {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.show(ui));
+        output.textures_delta.clear();
+    }
+
+    /// Run frames, one at least, until nothing is armed or running,
+    /// polling the picks as the window does, unlike [`wait`].
+    fn frames_until_idle(app: &mut AftermissionApp, ctx: &Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            frame(app, ctx);
+            if app.job.is_none() && app.armed.is_none() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Send `message` as a browser callback would and run one frame.
+    fn pick_frame(app: &mut AftermissionApp, message: crate::picks::Picked) {
+        let (_, tx) = app.picks.start();
+        tx.send(message).unwrap();
+        frame(app, &Context::default());
+    }
+
+    #[test]
+    fn a_picked_log_shows_its_label_then_opens() {
+        use crate::picks::Picked;
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        let (pick, tx) = app.picks.start();
+        tx.send(Picked::Chosen {
+            pick,
+            name: "flight.bin".into(),
+        })
+        .unwrap();
+        with_busy_ui(&mut app, |harness| {
+            harness.get_by_label("Reading flight.bin\u{2026}");
+        });
+        let bytes = crate::model::testlog::bytes();
+        tx.send(Picked::File {
+            pick,
+            name: "flight.bin".into(),
+            bytes: bytes.clone(),
+        })
+        .unwrap();
+        // the frame that takes the bytes shows the label and no log yet,
+        // and so does the next; the one after starts the scan
+        let label = worker::indexing_label("flight.bin", Some(bytes.len() as u64));
+        let ctx = Context::default();
+        frame(&mut app, &ctx);
+        assert_eq!(app.running().as_deref(), Some(label.as_str()));
+        assert!(app.armed.is_some() && app.job.is_none() && app.log.is_none());
+        // a second choice while the scan is armed is refused, as an open by
+        // path is while a job runs; nothing runs on a thread yet, so the
+        // refusal cannot race the scan
+        let (late, tx) = app.picks.start();
+        tx.send(Picked::Chosen {
+            pick: late,
+            name: "other.bin".into(),
+        })
+        .unwrap();
+        tx.send(Picked::File {
+            pick: late,
+            name: "other.bin".into(),
+            bytes: Vec::new(),
+        })
+        .unwrap();
+        frame(&mut app, &ctx);
+        assert_eq!(app.running().as_deref(), Some(label.as_str()));
+        assert!(app.armed.is_some() && app.job.is_none() && app.log.is_none());
+        assert_eq!(
+            app.notice.as_ref().map(|n| n.text.clone()),
+            Some(format!("Still busy: {label}\u{2026}"))
+        );
+        assert!(app.picks.reading().is_none());
+        frame(&mut app, &ctx);
+        assert!(app.armed.is_none() && app.job.is_some(), "the scan started");
+        assert_eq!(app.running().as_deref(), Some(label.as_str()));
+        frames_until_idle(&mut app, &ctx);
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        assert!(app.error.is_none(), "{:?}", app.error);
+    }
+
+    #[test]
+    fn a_pick_that_fails_says_so() {
+        use crate::picks::Picked;
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        let (pick, tx) = app.picks.start();
+        tx.send(Picked::Chosen {
+            pick,
+            name: "photos".into(),
+        })
+        .unwrap();
+        pick_frame(
+            &mut app,
+            Picked::Unreadable {
+                pick,
+                name: "photos".into(),
+                dropped: true,
+            },
+        );
+        let error = app.error.clone().unwrap();
+        assert_eq!(
+            error,
+            "photos: the browser could not read it. A folder cannot be opened; drop the log file itself."
+        );
+        with_ui(&mut app, |harness| {
+            harness.get_by_label(error.as_str());
+        });
+
+        // a chosen file that fails gets no advice about folders
+        let (pick, tx) = app.picks.start();
+        tx.send(Picked::Chosen {
+            pick,
+            name: "flight.bin".into(),
+        })
+        .unwrap();
+        pick_frame(
+            &mut app,
+            Picked::Unreadable {
+                pick,
+                name: "flight.bin".into(),
+                dropped: false,
+            },
+        );
+        assert_eq!(
+            app.error.as_deref(),
+            Some("flight.bin: the browser could not read it.")
+        );
+
+        // a refusal and a read that land together: the refusal shows, and
+        // the next frame arms the read
+        let ctx = Context::default();
+        let (reading, tx) = app.picks.start();
+        let (refused, _) = app.picks.start();
+        tx.send(Picked::Chosen {
+            pick: reading,
+            name: "flight.bin".into(),
+        })
+        .unwrap();
+        tx.send(Picked::Refused { pick: refused }).unwrap();
+        tx.send(Picked::File {
+            pick: reading,
+            name: "flight.bin".into(),
+            bytes: crate::model::testlog::bytes(),
+        })
+        .unwrap();
+        frame(&mut app, &ctx);
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap()
+                .starts_with("The browser did not open")
+        );
+        assert!(app.armed.is_none(), "one outcome a frame");
+        frame(&mut app, &ctx);
+        assert!(app.armed.is_some(), "the next frame arms the read");
+        app.armed = None;
+
+        app.error = None;
+        let (pick, _) = app.picks.start();
+        pick_frame(&mut app, Picked::Canceled { pick });
+        assert!(app.error.is_none() && app.armed.is_none() && app.job.is_none());
+    }
+
+    #[test]
+    fn a_newer_choice_wins_over_an_older_read() {
+        use crate::picks::Picked;
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        let (first, tx) = app.picks.start();
+        let (second, _) = app.picks.start();
+        let (third, _) = app.picks.start();
+        for (pick, name) in [(first, "a.bin"), (second, "b.bin")] {
+            tx.send(Picked::Chosen {
+                pick,
+                name: name.into(),
+            })
+            .unwrap();
+        }
+        tx.send(Picked::Canceled { pick: third }).unwrap();
+        // the older read lands first: dropped, and the newer is still waited on
+        tx.send(Picked::File {
+            pick: first,
+            name: "a.bin".into(),
+            bytes: crate::model::testlog::bytes(),
+        })
+        .unwrap();
+        with_busy_ui(&mut app, |harness| {
+            harness.get_by_label("Reading b.bin\u{2026}");
+        });
+        assert!(app.armed.is_none() && app.job.is_none() && app.log.is_none());
+        tx.send(Picked::File {
+            pick: second,
+            name: "b.bin".into(),
+            bytes: crate::model::testlog::bytes(),
+        })
+        .unwrap();
+        let ctx = Context::default();
+        frames_until_idle(&mut app, &ctx);
+        assert_eq!(app.log().unwrap().name, "b.bin");
     }
 
     #[test]

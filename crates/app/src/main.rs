@@ -13,6 +13,8 @@ mod paramfile;
 mod params;
 #[cfg(feature = "parquet")]
 mod parquetdir;
+#[cfg(any(target_arch = "wasm32", test))]
+mod picks;
 mod plot;
 mod settings;
 mod timefmt;
@@ -90,7 +92,7 @@ fn main() {
             .start(
                 canvas,
                 options,
-                Box::new(|cc| Ok(Box::new(app::AftermissionApp::new(cc, None)))),
+                Box::new(|cc| Ok(Box::new(app::AftermissionApp::new(cc)))),
             )
             .await
         {

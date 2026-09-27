@@ -1,6 +1,7 @@
 //! Work off the UI thread, so the window keeps painting: opening a log,
 //! which maps, scans and models the file, and writing an export. One job
-//! runs at a time.
+//! runs at a time. The browser has no thread to give, so there a job
+//! runs to its end inside `run` and its result waits at the first poll.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -53,16 +54,29 @@ impl std::fmt::Debug for Job {
 
 impl Job {
     /// Open and model the log at `path` in the background.
+    #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
     pub fn open(path: PathBuf, ctx: egui::Context) -> Self {
-        let size = std::fs::metadata(&path)
-            .ok()
-            .map(|m| format!(" ({:.1} MB)", m.len() as f64 / 1e6))
-            .unwrap_or_default();
-        let label = format!("Indexing {}{size}", file_name(&path));
+        let label = indexing_label(
+            &file_name(&path),
+            std::fs::metadata(&path).ok().map(|m| m.len()),
+        );
         Self::run(Kind::Open, path.clone(), label, ctx, move || {
             let log = Log::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let log = Box::new(LoadedLog::build(log, file_name(&path)));
+            Ok(Done::Opened { path, log })
+        })
+    }
+
+    /// Model a log the browser read into memory as `name`. Natively only
+    /// tests take this way in; the path the result carries is the name.
+    #[cfg(any(target_arch = "wasm32", test))]
+    #[must_use]
+    pub fn open_bytes(name: String, bytes: Vec<u8>, ctx: egui::Context) -> Self {
+        let label = indexing_label(&name, Some(bytes.len() as u64));
+        let path = PathBuf::from(&name);
+        Self::run(Kind::Open, path.clone(), label, ctx, move || {
+            let log = Box::new(LoadedLog::build(Log::from_source(bytes.into()), name));
             Ok(Done::Opened { path, log })
         })
     }
@@ -108,6 +122,16 @@ impl Job {
     }
 }
 
+/// What the status line says while a log is indexed: `Indexing flight.bin
+/// (12.3 MB)`, the size left out when it is not known.
+#[must_use]
+pub fn indexing_label(name: &str, bytes: Option<u64>) -> String {
+    let size = bytes
+        .map(|len| format!(" ({:.1} MB)", len as f64 / 1e6))
+        .unwrap_or_default();
+    format!("Indexing {name}{size}")
+}
+
 /// A file name without its extension, which an export's file name starts
 /// with: `flight` for `flight.bin`.
 #[must_use]
@@ -126,6 +150,7 @@ pub fn file_name(path: &Path) -> String {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn spawn(name: &str, body: impl FnOnce() + Send + 'static) {
     if let Err(err) = std::thread::Builder::new()
         .name(name.to_string())
@@ -133,6 +158,14 @@ fn spawn(name: &str, body: impl FnOnce() + Send + 'static) {
     {
         tracing::error!(error = %err, name, "cannot spawn worker thread");
     }
+}
+
+/// No threads in the browser: run the job now, holding the frame. The
+/// app paints the job's label before it starts one that can take long.
+#[cfg(target_arch = "wasm32")]
+fn spawn(name: &str, body: impl FnOnce() + Send + 'static) {
+    tracing::debug!(name, "running the job inline");
+    body();
 }
 
 #[cfg(test)]
