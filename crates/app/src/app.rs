@@ -33,6 +33,19 @@ use crate::worker::{self, Done, Job, Kind};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The commit CI built from, which the About dialog names beside the
+/// version, so a page deployed between releases says which `main` it is.
+const COMMIT: Option<&str> = option_env!("AFTERMISSION_COMMIT");
+
+/// The About dialog's first line: the version, and the commit when CI
+/// built it.
+fn version_line(commit: Option<&str>) -> String {
+    match commit {
+        Some(commit) => format!("Aftermission {VERSION} ({commit})"),
+        None => format!("Aftermission {VERSION}"),
+    }
+}
+
 /// The export dialogs' button: a save dialog natively, a download in the
 /// browser.
 #[cfg(not(target_arch = "wasm32"))]
@@ -806,7 +819,7 @@ impl AftermissionApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!("Aftermission {VERSION}"));
+                ui.label(version_line(COMMIT));
                 ui.label("Post-mission review of ArduPilot dataflash logs.");
                 ui.label("Copyright 2026 Poholos. Licensed under the AGPL-3.0-only; commercial licenses available.");
                 ui.hyperlink("https://github.com/Poholos/aftermission");
@@ -1331,6 +1344,15 @@ mod tests {
             },
         ));
         release
+    }
+
+    #[test]
+    fn the_about_dialog_names_the_commit_ci_built() {
+        assert_eq!(
+            version_line(Some("49d52b1")),
+            format!("Aftermission {VERSION} (49d52b1)")
+        );
+        assert_eq!(version_line(None), format!("Aftermission {VERSION}"));
     }
 
     #[test]

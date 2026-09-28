@@ -1,8 +1,8 @@
 # Every push and pull request: format, lints and tests on Linux, the test
 # suite on Windows too, the dependency policy, and a real web build, since
 # a wasm clippy run never links. The toolchain comes from
-# rust-toolchain.toml. The bundle is kept as an artifact; publishing it is
-# a later milestone's.
+# rust-toolchain.toml. The bundle is kept as an artifact, and a push to
+# main publishes it as the repository's Pages site.
 name: CI
 
 on:
@@ -12,6 +12,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
 
 jobs:
   native:
@@ -64,12 +67,21 @@ jobs:
       - uses: cargo-bins/cargo-binstall@v1.22.0
       - name: Install trunk and cargo-about
         run: cargo binstall --no-confirm trunk cargo-about
+      # The About dialog names the commit, so a page deployed between
+      # releases says which main it is. A pull request's own head, not the
+      # merge commit GitHub builds it as.
+      - name: Name the commit
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "AFTERMISSION_COMMIT=${SHA::7}" >> "$GITHUB_ENV"
       - name: Clippy for wasm
         run: cargo clippy -p aftermission --target wasm32-unknown-unknown --no-default-features -- -D warnings
-      # Trunk.toml leaves the parquet feature out. No public URL until the
-      # bundle has an address.
+      # Trunk.toml leaves the parquet feature out. The Pages site serves
+      # the bundle under the repository's name, case included; a local
+      # trunk serve keeps /. The web-bundle artifact carries the path too:
+      # it runs served from a folder named aftermission, not from its root.
       - name: Build the release bundle
-        run: trunk build --release
+        run: trunk build --release --public-url /aftermission/
       # The copyright notices and license texts of everything the bundle
       # links, which its MIT and BSD components require to travel with it.
       # The feature is left out here as well: with it, the wasm32 graph
@@ -81,3 +93,29 @@ jobs:
           name: web-bundle
           path: dist
           retention-days: 3
+      # the same bundle packed as the artifact the Pages deployment takes
+      - uses: actions/upload-pages-artifact@v5
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          path: dist
+
+  # Publishes the web build to https://poholos.github.io/aftermission/.
+  # The github-pages environment lets main alone deploy; the Pages
+  # permissions are this job's, the rest of the workflow reads only.
+  deploy:
+    name: Deploy the web build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [native, deny, web]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

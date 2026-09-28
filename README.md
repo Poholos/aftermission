@@ -22,7 +22,8 @@ legs of 400 m in a crosswind, has its speed raised from the ground
 station and its GPS fail for two seconds on the way, and returns to
 land, eight and a half minutes in all. Every value in it is invented,
 the date included. File > Open demo log opens it, as do the Demo button
-of the empty window and `?demo` on the web page's address. Map tiles
+of the empty window and `?demo` on the web page's address: [the demo
+in the browser](https://poholos.github.io/aftermission/?demo). Map tiles
 © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors.
 
 | | |
@@ -139,7 +140,11 @@ log also has are re-read, the rest are dropped.
 
 ## In the browser
 
-The same app builds for the web and runs as a page. What differs there:
+The same app builds for the web and runs as a page, which is online at
+[poholos.github.io/aftermission](https://poholos.github.io/aftermission/),
+built from the latest `main`; its [demo
+flight](https://poholos.github.io/aftermission/?demo) opens with the
+page. What differs there:
 
 - **The log stays in the browser.** A file chosen through File > Open, or
   dropped on the page, is read into memory and indexed there; nothing is

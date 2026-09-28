@@ -7,6 +7,10 @@ you run a modified version and let users interact with it over a network,
 for example as a hosted log viewer, you must offer those users the
 corresponding source code.
 
+The web build at <https://poholos.github.io/aftermission/> is Aftermission
+itself, under the same license. It is built from this repository, from the
+commit its About dialog names, so the source it runs is the source here.
+
 The log parser Aftermission is built on, [dflog](https://github.com/Poholos/dflog),
 is a separate project under `MIT OR Apache-2.0`, so it can be used by anyone
 in the ArduPilot world without these obligations.
