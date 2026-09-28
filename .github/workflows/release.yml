@@ -1,0 +1,140 @@
+# A tag v<version> builds the release archives for Windows, Linux and
+# macOS and puts them on a draft release, which is published by hand once
+# its notes are written. A manual run is a rehearsal: it builds the
+# archives and keeps them as artifacts, with no release.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the C runtime linked in: VCRUNTIME140.dll is not on every
+          # Windows, and the archive holds the program alone
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
+          # a named release rather than ubuntu-latest: the glibc it builds
+          # against is the oldest the program runs on, 2.39, as the README
+          # says
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux libraries for eframe and the file dialog
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev cmake
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: cargo-bins/cargo-binstall@v1.24.0
+      - name: Install cargo-about
+        run: cargo binstall --no-confirm cargo-about
+      # The version names the archives on every run; a tag must be v and
+      # that version, so a tag the version does not match fails before it
+      # builds.
+      # the Windows runner's jq.exe ends its lines in CRLF under bash
+      - name: Read the version
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "aftermission") | .version' \
+            | tr -d '\r')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      # a push is a tag's; a manual run from a tag is a rehearsal too
+      - name: Check the tag against the version
+        if: github.event_name == 'push'
+        run: |
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but the workspace is at $VERSION"
+            exit 1
+          fi
+      # the default features, so the Parquet export is in
+      - name: Build
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --locked -p aftermission --target ${{ matrix.target }}
+      # The notices of what this target's binary links, which its MIT and
+      # BSD components require to travel with it.
+      - name: Third-party notices
+        run: cargo about generate --manifest-path crates/app/Cargo.toml --target ${{ matrix.target }} --fail about.hbs -o third-party.html
+      # A zip on Windows through 7-Zip, which the runner image has: bash
+      # there finds Git's GNU tar, which writes no zip.
+      - name: Pack the archive
+        run: |
+          name="aftermission-$VERSION-${{ matrix.target }}"
+          mkdir "$name"
+          exe=""
+          if [ "$RUNNER_OS" = "Windows" ]; then exe=".exe"; fi
+          cp "target/${{ matrix.target }}/release/aftermission$exe" \
+            LICENSE LICENSING.md README.md third-party.html "$name/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$name.zip" "$name"
+            echo "ARCHIVE=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$name.tar.gz" "$name"
+            echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  # A draft release of the tag with the four archives and their checksums.
+  # Its notes are a stub to write over before publishing.
+  publish:
+    name: Draft the release
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: archives
+          merge-multiple: true
+      - name: Checksums
+        working-directory: archives
+        run: sha256sum -- * > SHA256SUMS
+      - name: Create the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          {
+            echo "Replace with the notes before publishing."
+            echo
+            echo "Windows (x86-64), Linux (x86-64) and macOS (Apple silicon and Intel);"
+            echo "the README's Downloads section says what each system asks first."
+            echo
+            echo '```'
+            cat archives/SHA256SUMS
+            echo '```'
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" archives/* --draft --verify-tag \
+            --title "Aftermission ${GITHUB_REF_NAME#v}" --notes-file notes.md

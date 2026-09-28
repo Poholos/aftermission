@@ -64,7 +64,7 @@ jobs:
       - name: Add the wasm target
         run: rustup target add wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - uses: cargo-bins/cargo-binstall@v1.22.0
+      - uses: cargo-bins/cargo-binstall@v1.24.0
       - name: Install trunk and cargo-about
         run: cargo binstall --no-confirm trunk cargo-about
       # The About dialog names the commit, so a page deployed between

@@ -34,11 +34,20 @@ in the browser](https://poholos.github.io/aftermission/?demo). Map tiles
 ## Downloads
 
 Builds for Windows, Linux and macOS come with each release on the
-[releases page](https://github.com/Poholos/aftermission/releases), from
-0.1.0 on; until then the app is built from source, as below. Each archive
-holds the program, the license, the licensing note, this README and the
-third-party notices. The programs are not signed, which each system
-meets in its own way:
+[releases page](https://github.com/Poholos/aftermission/releases/latest),
+one archive per system:
+
+| System | Archive |
+|---|---|
+| Windows, x86-64 | `aftermission-<version>-x86_64-pc-windows-msvc.zip` |
+| Linux, x86-64 | `aftermission-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS, Apple silicon | `aftermission-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `aftermission-<version>-x86_64-apple-darwin.tar.gz` |
+
+Each archive holds the program, the license, the licensing note, this
+README and the third-party notices; `SHA256SUMS` beside them lists their
+checksums. The programs are not signed, which each system meets in its
+own way:
 
 - **Windows** may stop the program with "Windows protected your PC", as
   it does any unsigned program from the internet; More info > Run anyway
