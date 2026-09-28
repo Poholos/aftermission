@@ -197,16 +197,6 @@ cargo deny check
 The tests build their logs with dflog's writer, so no flight data is in the
 repository.
 
-The pictures above are rendered by the app itself from the demo log,
-through egui_kittest's wgpu renderer, in a test the ordinary run skips
-since it needs a GPU and the network, for the map's tiles:
-
-```bash
-cargo test --release -p aftermission -- --ignored hero_shots
-```
-
-It writes them to `assets/hero/`, or to the folder `HERO_DIR` names.
-
 ### The web build
 
 [trunk](https://trunkrs.dev) builds the page; `Trunk.toml` at the root
@@ -219,19 +209,7 @@ trunk serve
 trunk build --release
 ```
 
-The release bundle lands in `dist/`. The checks for the web build, which
-CI runs beside the native ones:
-
-```bash
-cargo clippy -p aftermission --target wasm32-unknown-unknown --no-default-features -- -D warnings
-trunk build --release
-cargo about generate --manifest-path crates/app/Cargo.toml --no-default-features --fail about.hbs -o dist/third-party.html
-```
-
-The last writes the copyright notices and license texts of everything the
-bundle links, which its MIT and BSD components require to travel with it;
-the feature is left out there as in the bundle. A wasm clippy run never
-links, so the `trunk build` is the step that proves the build.
+The release bundle lands in `dist/`.
 
 ## License
 
