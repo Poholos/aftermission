@@ -51,9 +51,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # the tag pins the action's script; version pins the binstall it installs
       - uses: cargo-bins/cargo-binstall@v1.24.0
+        with:
+          version: 1.24.0
+      # cargo-about publishes no Intel Mac binary, and its source build
+      # needs the cli feature, which binstall's fallback to cargo install
+      # leaves out: it builds no binary and reports success. So a source
+      # build there, and elsewhere no fallback.
       - name: Install cargo-about
-        run: cargo binstall --no-confirm cargo-about
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            cargo install cargo-about --locked --features cli
+          else
+            cargo binstall --no-confirm --disable-strategies compile cargo-about
+          fi
+          cargo about --version
       # The version names the archives on every run; a tag must be v and
       # that version, so a tag the version does not match fails before it
       # builds.
