@@ -47,7 +47,8 @@ parquet = ["dflog/parquet"]
 winresource.workspace = true
 
 [dev-dependencies]
-egui_kittest.workspace = true
+# wgpu renders the README's pictures in the ignored `hero_shots` test
+egui_kittest = { workspace = true, features = ["wgpu"] }
 image.workspace = true
 ron.workspace = true
 

@@ -11,14 +11,59 @@ the cursor read out, the track on a map, the log's events in a list and
 its parameters in a table, and the data out again as CSV, a `.param` file
 or Parquet.
 
+![The whole window at the demo flight's GPS fault: roll against desired
+roll and altitude over the flight mode bands, the survey track on the
+map, and the fault's rows in the events
+list](assets/hero/overview.png)
+
+The pictures are of the demo log, which the app generates on the spot:
+a quadcopter arms on a field in Iowa, climbs to 50 m, flies six survey
+legs of 400 m in a crosswind, has its speed raised from the ground
+station and its GPS fail for two seconds on the way, and returns to
+land, eight and a half minutes in all. Every value in it is invented,
+the date included. File > Open demo log opens it, as do the Demo button
+of the empty window and `?demo` on the web page's address. Map tiles
+© [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors.
+
+| | |
+|---|---|
+| ![The ground speed over the flight above the parameter table, filtered to WPNAV, with WPNAV_SPEED unfolded to its change](assets/hero/parameters.png) | ![The plot alone, zoomed on one turn of the survey: roll against desired roll with the legend and the readout](assets/hero/survey-turn.png) |
+| The speed parameter unfolded to its history; a click on its change put the cursor there, where the ground speed rises from 8 to 10 m/s. | One turn of the survey zoomed in: the roll the controller asked for against the roll flown, read out at the cursor. |
+
+## Downloads
+
+Builds for Windows, Linux and macOS come with each release on the
+[releases page](https://github.com/Poholos/aftermission/releases), from
+0.1.0 on; until then the app is built from source, as below. Each archive
+holds the program, the license, the licensing note, this README and the
+third-party notices. The programs are not signed, which each system
+meets in its own way:
+
+- **Windows** may stop the program with "Windows protected your PC", as
+  it does any unsigned program from the internet; More info > Run anyway
+  starts it.
+- **macOS** keeps a downloaded archive's contents in quarantine and
+  refuses an unsigned program with "cannot be opened because the
+  developer cannot be verified". After extracting,
+  `xattr -d com.apple.quarantine aftermission` lets it run, from the
+  terminal or by a double-click. There is no `.app` bundle yet, so the
+  Dock shows a generic icon.
+- **Linux** needs, at run time, the X11 or Wayland client libraries and
+  xkbcommon, and for the file dialogs a running xdg-desktop-portal with a
+  backend (GTK, GNOME or KDE). A full desktop has all of them; under a
+  bare window manager without the portal, File > Open and the save
+  dialogs do nothing, and a log opens from the command line. The program
+  is built on Ubuntu 24.04, so it needs glibc 2.39 or later.
+
+## What it does
+
 The tool is early. What works today:
 
 - **Opening a log** by drag and drop, the file dialog (Ctrl+O) or a path on
   the command line. The file is mapped and indexed on a worker thread, so
   the window stays live; the last eight logs are kept under File > Open
-  recent. File > Open demo log opens an invented survey flight of eight
-  and a half minutes, generated on the spot, to try the tool without a
-  log at hand.
+  recent. File > Open demo log opens the demo flight above, to try the
+  tool without a log at hand.
 - **The side panel** lists every message type in the log with its record
   count, and unfolds each to its fields, labeled with the units the log's
   own `UNIT`, `MULT` and `FMTU` records give them (`Roll (deg)`,
@@ -136,8 +181,9 @@ nowhere unless redirected: `aftermission flight.bin > aftermission.log`
 writes it to a file, with `RUST_LOG` as usual. A debug build (`cargo
 run`) keeps the console.
 
-On Linux, eframe and the file dialog need the GTK and X11/Wayland
-development libraries; the CI workflow lists the Debian packages.
+On Linux, eframe needs the X11 or Wayland and xkbcommon development
+libraries; the file dialogs ask the desktop portal over D-Bus and need
+no GTK. The CI workflow lists the Debian packages it installs.
 
 ```bash
 cargo fmt --all --check
@@ -150,6 +196,16 @@ cargo deny check
 
 The tests build their logs with dflog's writer, so no flight data is in the
 repository.
+
+The pictures above are rendered by the app itself from the demo log,
+through egui_kittest's wgpu renderer, in a test the ordinary run skips
+since it needs a GPU and the network, for the map's tiles:
+
+```bash
+cargo test --release -p aftermission -- --ignored hero_shots
+```
+
+It writes them to `assets/hero/`, or to the folder `HERO_DIR` names.
 
 ### The web build
 

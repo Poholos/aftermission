@@ -56,6 +56,12 @@ impl std::fmt::Debug for MapPanel {
 
 /// The track's line.
 const TRACK_COLOR: Color32 = Color32::from_rgb(255, 140, 40);
+/// Drawn under a white ring, so it reads on light tiles as on the plain
+/// dark background.
+const HALO: Stroke = Stroke {
+    width: 4.5,
+    color: Color32::from_black_alpha(160),
+};
 /// How close to the track, in points, the pointer counts as on it.
 const HIT_DISTANCE: f32 = 12.0;
 
@@ -144,6 +150,12 @@ impl MapPanel {
             );
         }
         response.inner
+    }
+
+    /// How many tiles are downloading, or None with tiles off; for tests.
+    #[cfg(test)]
+    pub(crate) fn tiles_in_progress(&self) -> Option<usize> {
+        self.tiles.as_ref().map(|tiles| tiles.stats().in_progress)
     }
 
     /// Start or stop downloading tiles, as `online` asks.
@@ -268,8 +280,10 @@ fn draw_track(
         painter.circle_filled(last, 4.0, Color32::from_rgb(235, 70, 70));
     }
     if let Some(i) = cursor.and_then(|t| track.nearest(t)) {
+        let at = screen(projector, track, i);
+        painter.circle_stroke(at, 6.0, HALO);
         painter.circle(
-            screen(projector, track, i),
+            at,
             6.0,
             Color32::from_white_alpha(60),
             Stroke::new(2.0, Color32::WHITE),
@@ -282,6 +296,7 @@ fn draw_track(
         .map(|&(i, p)| (i, p, p.distance(hover)))
         .min_by(|a, b| a.2.total_cmp(&b.2))
         .filter(|hit| hit.2 <= HIT_DISTANCE)?;
+    painter.circle_stroke(at, 5.0, HALO);
     painter.circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
     let time = timefmt::stamp(clock, track.times[i]);
     let text = match track.alts[i] {

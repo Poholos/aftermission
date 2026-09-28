@@ -162,8 +162,11 @@ impl PlotPanel {
         };
     }
 
+    /// Take every series off; the next one picked takes the first color
+    /// again.
     pub fn clear(&mut self) {
         self.selected.clear();
+        self.next_color = 0;
         self.readout.clear();
         self.cursor = None;
         // no cursor, so no row for the events list to follow
@@ -225,6 +228,23 @@ impl PlotPanel {
     #[cfg(test)]
     pub(crate) fn resets_view(&self) -> bool {
         self.reset_view
+    }
+
+    /// Zoom the view to `range` of time, the values fitting what it shows,
+    /// as a box zoom drawn around the data does; for tests, once the plot
+    /// has drawn.
+    #[cfg(test)]
+    pub(crate) fn zoom_to(ctx: &egui::Context, range: RangeInclusive<f64>) {
+        let id = Id::new(PLOT_ID);
+        let mut memory = PlotMemory::load(ctx, id).expect("the plot has drawn");
+        let [_, bottom] = memory.bounds().min();
+        let [_, top] = memory.bounds().max();
+        memory.set_bounds(egui_plot::PlotBounds::from_min_max(
+            [*range.start(), bottom],
+            [*range.end(), top],
+        ));
+        memory.auto_bounds = egui::Vec2b::new(false, true);
+        memory.store(ctx, id);
     }
 
     /// The series chips, the plot and the cursor readout. The readout takes
@@ -822,7 +842,13 @@ mod tests {
         plot.toggle(roll.clone(), &log);
         assert!(plot.selected.is_empty());
         plot.remove(3);
+
+        // a cleared plot starts the palette again
+        plot.toggle(gyr.clone(), &log);
+        assert_ne!(plot.selected[0].color, PALETTE[0]);
         plot.clear();
+        plot.toggle(gyr, &log);
+        assert_eq!(plot.selected[0].color, PALETTE[0]);
     }
 
     /// A log with one ATT record and no units metadata.

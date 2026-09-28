@@ -1611,24 +1611,7 @@ mod tests {
         // dragged small on one tab, the panel stays small on the other
         harness.state_mut().settings.bottom_tab = BottomTab::Parameters;
         harness.run();
-        // the edge from the stored rect: the central panel's margin keeps
-        // the panel off the window's bottom
-        let rect =
-            egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("bottom_panel"))
-                .expect("the bottom panel has drawn")
-                .outer_rect;
-        let at = |y: f32| egui::pos2(rect.center().x, y);
-        let (edge, target) = (rect.min.y, rect.min.y + 100.0);
-        harness.hover_at(at(edge));
-        harness.run();
-        harness.drag_at(at(edge));
-        harness.run();
-        for step in 1..=5u8 {
-            harness.hover_at(at(edge + (target - edge) * f32::from(step) / 5.0));
-            harness.run();
-        }
-        harness.drop_at(at(target));
-        harness.run();
+        drag_bottom_panel(&mut harness, 100.0);
         let small = height(&harness);
         assert!(
             (small - (before - 100.0)).abs() < 1.0,
@@ -2804,5 +2787,248 @@ mod tests {
         with_ui(&mut app, |harness| {
             harness.get_by_label(error.as_str());
         });
+    }
+
+    /// The README's pictures, rendered from the demo log by the real UI.
+    /// Ignored in the ordinary run since it needs a GPU and writes files:
+    /// `cargo test --release -p aftermission -- --ignored hero_shots`
+    /// writes them to `assets/hero/`, or to `$HERO_DIR`. One harness serves
+    /// every shot: a texture belongs to the context that made it. Unlike
+    /// every other test, this one has the map's tiles on, so it needs the
+    /// network; the few dozen it takes go through the app's tile cache,
+    /// with its user agent, as the app's own would.
+    #[test]
+    #[ignore = "renders the README pictures; run on demand"]
+    fn hero_shots() {
+        let out = std::env::var_os("HERO_DIR").map_or_else(
+            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/hero"),
+            PathBuf::from,
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.time_axis = TimeAxis::Utc;
+        app.open_demo(&ctx);
+        wait(&mut app, &ctx);
+        let fault = event_time(&app, "GPS: unhealthy");
+        let speed_change = event_time(&app, "WPNAV_SPEED 800 -> 1000");
+        let turn = event_time(&app, "Mission: 4 WP");
+        // the events list's scroll animates over a few frames
+        let mut harness = Harness::builder()
+            .with_pixels_per_point(1.0)
+            .with_max_steps(60)
+            .wgpu()
+            .build_ui_state(|ui, app: &mut AftermissionApp| app.show(ui), app);
+        window(&mut harness, 1440.0, 900.0);
+        // the side panel dragged a third narrower, for the plot's sake
+        let wide = panel_rect(&harness, "side_panel").width();
+        drag_side_panel(&mut harness, -wide / 3.0);
+        let narrow = panel_rect(&harness, "side_panel").width();
+        assert!(
+            (narrow - wide * 2.0 / 3.0).abs() < 1.0,
+            "{wide} to {narrow}"
+        );
+
+        // The whole window at the GPS fault: roll against desired roll on
+        // the left axis, altitude on the right, picked in the tree as a
+        // user does.
+        harness.get_by_label_contains("ATT (").click();
+        harness.run();
+        harness.get_by_label("Roll (deg)").click();
+        harness.get_by_label("DesRoll (deg)").click();
+        harness.run();
+        harness.get_by_label_contains("CTUN (").click();
+        harness.run();
+        harness.get_by_label("Alt (m)").click();
+        harness.run();
+        harness.get_all_by_label("L").nth(2).unwrap().click();
+        harness.run();
+        // The seeks of two clicks on the map: past the fault, which scrolls
+        // the events list down to its resolution, then on the fault, which
+        // the list already shows.
+        harness.state_mut().plot.seek(fault + 2.5);
+        harness.run();
+        harness.state_mut().plot.seek(fault + 0.5);
+        harness.run();
+        harness.get_by_label_contains("GPS: resolved");
+        shoot(&mut harness, &out, "overview");
+
+        // The speed over the flight above the parameter table on WPNAV,
+        // the speed parameter unfolded to its history and its change
+        // clicked, the side panel folded away and the table dragged taller.
+        harness.get_by_label_contains("ATT (").click();
+        harness.get_by_label_contains("CTUN (").click();
+        harness.run();
+        harness.state_mut().plot.clear();
+        harness.get_by_label_contains("GPS (").click();
+        harness.run();
+        harness.get_by_label("Spd (m/s)").click();
+        harness.run();
+        harness.state_mut().settings.side_panel = false;
+        harness.run();
+        harness.get_by_label("Parameters").click();
+        harness.run();
+        harness.state_mut().params_mut().set_filter("WPNAV");
+        harness.run();
+        harness.get_by_label("\u{25b8} WPNAV_SPEED").click();
+        harness.run();
+        drag_bottom_panel(&mut harness, -120.0);
+        harness.get_by_label_contains("14:34:10").click();
+        harness.run();
+        let cursor = harness.state().plot().cursor.unwrap();
+        assert!((cursor - speed_change).abs() < 1e-6, "{cursor}");
+        shoot(&mut harness, &out, "parameters");
+
+        // The plot alone, zoomed on a turn of the survey: roll against
+        // desired roll with the legend and the readout.
+        harness.state_mut().plot.clear();
+        harness.state_mut().settings.side_panel = true;
+        harness.run();
+        // GPS folds again and ATT unfolds
+        harness.get_by_label_contains("GPS (").click();
+        harness.get_by_label_contains("ATT (").click();
+        harness.run();
+        harness.get_by_label("Roll (deg)").click();
+        harness.get_by_label("DesRoll (deg)").click();
+        harness.run();
+        let settings = &mut harness.state_mut().settings;
+        settings.side_panel = false;
+        settings.show_map = false;
+        settings.show_bottom = false;
+        window(&mut harness, 1440.0, 720.0);
+        PlotPanel::zoom_to(&harness.ctx, turn - 8.0..=turn + 16.0);
+        // the pointer, last on the panel's edge, would move the cursor
+        harness.event(egui::Event::PointerGone);
+        harness.state_mut().plot.seek(turn + 2.0);
+        harness.run();
+        shoot(&mut harness, &out, "survey-turn");
+    }
+
+    /// The time of the demo's event reading `text`.
+    fn event_time(app: &AftermissionApp, text: &str) -> f64 {
+        app.log()
+            .unwrap()
+            .events
+            .iter()
+            .find(|e| e.text == text)
+            .unwrap_or_else(|| panic!("the demo has {text:?}"))
+            .time
+    }
+
+    /// The frame kittest draws around the app, cropped off each shot: a
+    /// window has none.
+    const KITTEST_MARGIN: f32 = 8.0;
+
+    /// Size the app's window, inside kittest's frame, and run it.
+    fn window(harness: &mut Harness<'_, AftermissionApp>, width: f32, height: f32) {
+        let margin = 2.0 * KITTEST_MARGIN;
+        harness.set_size(egui::vec2(width + margin, height + margin));
+        harness.run();
+    }
+
+    /// Where the panel `id` was drawn, as it stores it: the edges come from
+    /// here, since the central panel's margin keeps a panel off the
+    /// window's edge.
+    fn panel_rect(harness: &Harness<'_, AftermissionApp>, id: &str) -> egui::Rect {
+        egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new(id))
+            .expect("the panel has drawn")
+            .outer_rect
+    }
+
+    /// Drag the bottom panel's top edge by `dy` points, up when negative.
+    fn drag_bottom_panel(harness: &mut Harness<'_, AftermissionApp>, dy: f32) {
+        let rect = panel_rect(harness, "bottom_panel");
+        drag(
+            harness,
+            egui::pos2(rect.center().x, rect.min.y),
+            egui::vec2(0.0, dy),
+        );
+    }
+
+    /// Drag the side panel's right edge by `dx` points, left when negative.
+    fn drag_side_panel(harness: &mut Harness<'_, AftermissionApp>, dx: f32) {
+        let rect = panel_rect(harness, "side_panel");
+        drag(
+            harness,
+            egui::pos2(rect.max.x, rect.center().y),
+            egui::vec2(dx, 0.0),
+        );
+    }
+
+    /// Press at `from`, move by `by` in five steps and let go, as a hand
+    /// drags.
+    fn drag(harness: &mut Harness<'_, AftermissionApp>, from: egui::Pos2, by: egui::Vec2) {
+        harness.hover_at(from);
+        harness.run();
+        harness.drag_at(from);
+        harness.run();
+        for step in 1..=5u8 {
+            harness.hover_at(from + by * f32::from(step) / 5.0);
+            harness.run();
+        }
+        harness.drop_at(from + by);
+        harness.run();
+    }
+
+    /// Run frames until no map tile has been downloading for a second, so
+    /// the tiles the view asks for are in the shot.
+    fn wait_for_tiles(harness: &mut Harness<'_, AftermissionApp>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut quiet = 0;
+        while quiet < 20 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tiles did not load"
+            );
+            harness.step();
+            let loading = harness.state().map.tiles_in_progress().unwrap_or(0);
+            quiet = if loading == 0 { quiet + 1 } else { 0 };
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Fail unless the map's tiles are in `image`: a download that failed
+    /// ends the wait as one that finished does, and would leave the map
+    /// pane its plain dark ground. The tiles' ground is light, so most of
+    /// the pane's middle is, where the track covers little of it. `map`
+    /// is the pane in the image's pixels, one per point.
+    fn assert_tiles_drawn(image: &image::RgbaImage, map: egui::Rect) {
+        let middle = map.shrink2(map.size() / 4.0);
+        let (mut light, mut all) = (0u32, 0u32);
+        for y in middle.min.y as u32..middle.max.y as u32 {
+            for x in middle.min.x as u32..middle.max.x as u32 {
+                let [r, g, b, _] = image.get_pixel(x, y).0;
+                all += 1;
+                if r.min(g).min(b) > 160 {
+                    light += 1;
+                }
+            }
+        }
+        assert!(
+            light * 2 > all,
+            "the map shows no tiles: {light} of {all} pixels light; is the network there?"
+        );
+    }
+
+    /// Render the window after a few more frames, so the scroll areas
+    /// settle, the fonts upload and the map's tiles arrive, and save it as
+    /// `<name>.png` without kittest's frame. The pointer leaves first: a
+    /// tooltip or a hover has no place in it.
+    fn shoot(harness: &mut Harness<'_, AftermissionApp>, out: &Path, name: &str) {
+        harness.event(egui::Event::PointerGone);
+        wait_for_tiles(harness);
+        harness.run_steps(8);
+        let image = harness.render().expect("a GPU adapter renders the frame");
+        let settings = &harness.state().settings;
+        if settings.show_map && settings.online_tiles {
+            assert_tiles_drawn(&image, panel_rect(harness, "map_panel"));
+        }
+        // one pixel per point
+        let margin = KITTEST_MARGIN as u32;
+        let (width, height) = (image.width() - 2 * margin, image.height() - 2 * margin);
+        image::imageops::crop_imm(&image, margin, margin, width, height)
+            .to_image()
+            .save(out.join(format!("{name}.png")))
+            .unwrap();
     }
 }
