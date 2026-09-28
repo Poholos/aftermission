@@ -94,6 +94,13 @@ jobs:
       # BSD components require to travel with it.
       - name: Third-party notices
         run: cargo about generate --manifest-path crates/app/Cargo.toml --target ${{ matrix.target }} --fail about.hbs -o third-party.html
+      # The Linux binary carries its symbol table, a quarter of its size,
+      # which the program does not need to run; a crash trace from it then
+      # names no functions. Windows keeps its symbols in the .pdb, which
+      # the archive leaves out.
+      - name: Strip the Linux binary
+        if: runner.os == 'Linux'
+        run: strip "target/${{ matrix.target }}/release/aftermission"
       # A zip on Windows through 7-Zip, which the runner image has: bash
       # there finds Git's GNU tar, which writes no zip.
       - name: Pack the archive
