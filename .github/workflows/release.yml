@@ -118,7 +118,8 @@ jobs:
           if-no-files-found: error
 
   # A draft release of the tag with the four archives and their checksums.
-  # Its notes are a stub to write over before publishing.
+  # Its notes read as final, so the draft can be published as it is or
+  # with notes added on top.
   publish:
     name: Draft the release
     if: github.event_name == 'push'
@@ -139,11 +140,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive() { echo "\`aftermission-$version-$1\`"; }
+          readme="https://github.com/$GH_REPO/blob/$GITHUB_REF_NAME/README.md#downloads"
+          # one line per paragraph: a release page breaks lines where the
+          # text does
           {
-            echo "Replace with the notes before publishing."
+            echo "Aftermission $version, post-mission review of ArduPilot dataflash logs, for Windows, Linux and macOS. It also runs in the browser, with a demo flight: https://poholos.github.io/aftermission/?demo"
             echo
-            echo "Windows (x86-64), Linux (x86-64) and macOS (Apple silicon and Intel);"
-            echo "the README's Downloads section says what each system asks first."
+            echo "| System | Archive |"
+            echo "|---|---|"
+            echo "| Windows, x86-64 | $(archive x86_64-pc-windows-msvc.zip) |"
+            echo "| Linux, x86-64 | $(archive x86_64-unknown-linux-gnu.tar.gz) |"
+            echo "| macOS, Apple silicon | $(archive aarch64-apple-darwin.tar.gz) |"
+            echo "| macOS, Intel | $(archive x86_64-apple-darwin.tar.gz) |"
+            echo
+            echo "The programs are not signed, so Windows and macOS each ask for a step before the first start, and Linux has a few requirements; the README's [Downloads]($readme) section says what they are."
+            echo
+            echo 'SHA-256 checksums, also in `SHA256SUMS`:'
             echo
             echo '```'
             cat archives/SHA256SUMS
