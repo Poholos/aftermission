@@ -14,6 +14,8 @@ use std::sync::Arc;
 use egui::{Align2, Color32, Context};
 
 use crate::csv::{self, Column, Digits, Export};
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::demo;
 use crate::events::EventsPanel;
 use crate::filter::Filter;
 use crate::map::MapPanel;
@@ -47,20 +49,42 @@ const DONE_VERB: &str = "Wrote";
 #[cfg(target_arch = "wasm32")]
 const DONE_VERB: &str = "Downloaded";
 
-/// A log the browser read, waiting for its label to be painted before
-/// the scan holds the page: the frame that takes the bytes shows the
-/// label and asks for a repaint, the next counts down, the one after
-/// starts the job, so the label has been presented when the page holds.
-/// Frames are counted by egui's frame number, since a frame can run the
-/// window several passes over, none of them presented.
+/// A log to open, waiting for its label to be painted before the scan
+/// holds the page: the frame that arms it asks for a repaint, the next
+/// counts down, the one after starts the job, so the label has been
+/// presented when the page holds. It is presented twice when the arming
+/// comes before the status line draws, as a menu item's or a pick's
+/// does, and once when it comes after, as the empty window's button's
+/// does. Frames are counted by egui's frame number, since a frame can
+/// run the window several passes over, none of them presented.
 #[cfg(any(target_arch = "wasm32", test))]
 struct Armed {
     /// Frames still to paint before the scan starts.
     frames_left: u8,
     /// The frame the count last moved in.
     counted_frame: u64,
-    name: String,
-    bytes: Vec<u8>,
+    pending: Pending,
+}
+
+/// What an armed scan opens.
+#[cfg(any(target_arch = "wasm32", test))]
+enum Pending {
+    /// A file the browser read.
+    Bytes { name: String, bytes: Vec<u8> },
+    /// The demo flight, generated once the scan starts, so that too runs
+    /// under the label rather than in the frame that asked for it.
+    Demo,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl Pending {
+    /// What the status line says while it waits and while it runs.
+    fn label(&self) -> String {
+        match self {
+            Self::Bytes { name, bytes } => worker::indexing_label(name, Some(bytes.len() as u64)),
+            Self::Demo => demo::LABEL.to_string(),
+        }
+    }
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -69,8 +93,7 @@ impl std::fmt::Debug for Armed {
         f.debug_struct("Armed")
             .field("frames_left", &self.frames_left)
             .field("counted_frame", &self.counted_frame)
-            .field("name", &self.name)
-            .field("bytes", &self.bytes.len())
+            .field("pending", &self.pending.label())
             .finish()
     }
 }
@@ -138,7 +161,7 @@ pub struct AftermissionApp {
     /// The files the browser hands the page, picked or dropped.
     #[cfg(any(target_arch = "wasm32", test))]
     picks: Picks,
-    /// A log read by the browser, about to be indexed.
+    /// A log about to be indexed: one the browser read, or the demo.
     #[cfg(any(target_arch = "wasm32", test))]
     armed: Option<Armed>,
 }
@@ -155,10 +178,15 @@ impl AftermissionApp {
         app
     }
 
-    /// The app with its saved settings; the page has no command line.
+    /// The app with its saved settings; the page has no command line,
+    /// but its address can ask for the demo with `?demo`.
     #[cfg(target_arch = "wasm32")]
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self::with_settings(cc)
+    pub fn new(cc: &eframe::CreationContext<'_>, open_demo: bool) -> Self {
+        let mut app = Self::with_settings(cc);
+        if open_demo {
+            app.arm_demo(&cc.egui_ctx);
+        }
+        app
     }
 
     fn with_settings(cc: &eframe::CreationContext<'_>) -> Self {
@@ -175,11 +203,54 @@ impl AftermissionApp {
     /// ready. Refused while a job runs.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_path(&mut self, path: &Path, ctx: &Context) {
+        if self.may_start() {
+            self.job = Some(Job::open(path.to_path_buf(), ctx.clone()));
+        }
+    }
+
+    /// Whether an open may start: not while a job runs or a scan is
+    /// armed, which [`Self::busy`] says with a notice. One that may
+    /// clears the last open's error.
+    fn may_start(&mut self) -> bool {
         if self.busy() {
-            return;
+            return false;
         }
         self.error = None;
-        self.job = Some(Job::open(path.to_path_buf(), ctx.clone()));
+        true
+    }
+
+    /// Start opening the demo flight: natively as a job, so the window
+    /// never waits for it; in the browser armed like a picked file, so
+    /// its label paints before the page holds. Refused while a job runs.
+    fn open_demo(&mut self, ctx: &Context) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.may_start() {
+            self.job = Some(Job::open_demo(ctx.clone()));
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.arm_demo(ctx);
+    }
+
+    /// Arm a scan: the job starts two frames on, its label shown from
+    /// this frame or the next; see [`Armed`]. Refused while a job runs or
+    /// a scan is armed, as an open by path is.
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn arm(&mut self, pending: Pending, ctx: &Context) {
+        if !self.may_start() {
+            return;
+        }
+        self.armed = Some(Armed {
+            frames_left: 2,
+            counted_frame: ctx.cumulative_frame_nr(),
+            pending,
+        });
+        ctx.request_repaint();
+    }
+
+    /// Arm the demo flight, as the browser's menu item and `?demo` do.
+    #[cfg(any(target_arch = "wasm32", test))]
+    fn arm_demo(&mut self, ctx: &Context) {
+        self.arm(Pending::Demo, ctx);
     }
 
     /// One job at a time: while one runs, the next is refused with a
@@ -208,17 +279,13 @@ impl AftermissionApp {
         }
         #[cfg(any(target_arch = "wasm32", test))]
         if let Some(armed) = &self.armed {
-            return Some(worker::indexing_label(
-                &armed.name,
-                Some(armed.bytes.len() as u64),
-            ));
+            return Some(armed.pending.label());
         }
         None
     }
 
     /// Act on what a pick or a drop came to: arm the scan of a file
-    /// read, or say why there is none. Refused while a job runs or a scan
-    /// is armed, as an open by path is.
+    /// read, or say why there is none.
     #[cfg(any(target_arch = "wasm32", test))]
     fn poll_picks(&mut self, ctx: &Context) {
         let Some(outcome) = self.picks.poll() else {
@@ -230,19 +297,7 @@ impl AftermissionApp {
         // rely on the screen changing.
         ctx.request_repaint();
         match outcome {
-            Outcome::File { name, bytes } => {
-                if self.busy() {
-                    return;
-                }
-                self.error = None;
-                self.armed = Some(Armed {
-                    frames_left: 2,
-                    counted_frame: ctx.cumulative_frame_nr(),
-                    name,
-                    bytes,
-                });
-                ctx.request_repaint();
-            }
+            Outcome::File { name, bytes } => self.arm(Pending::Bytes { name, bytes }, ctx),
             Outcome::Unreadable { name, dropped } => {
                 // a dropped folder arrives as an entry with no file behind
                 // it; the chooser takes files only
@@ -279,10 +334,13 @@ impl AftermissionApp {
             ctx.request_repaint();
             return;
         }
-        let Some(Armed { name, bytes, .. }) = self.armed.take() else {
+        let Some(Armed { pending, .. }) = self.armed.take() else {
             return;
         };
-        self.job = Some(Job::open_bytes(name, bytes, ctx.clone()));
+        self.job = Some(match pending {
+            Pending::Bytes { name, bytes } => Job::open_bytes(name, bytes, ctx.clone()),
+            Pending::Demo => Job::open_demo(ctx.clone()),
+        });
     }
 
     /// Whether to hold a request to close the window. Ending the process
@@ -356,11 +414,11 @@ impl AftermissionApp {
         self.notice = None;
         match result {
             Ok(Done::Opened { path, log }) => {
-                // only a log that opened is worth offering again
-                #[cfg(not(target_arch = "wasm32"))]
-                self.settings.remember(&path);
-                #[cfg(target_arch = "wasm32")]
-                drop(path);
+                // only a log that opened from a file is worth offering
+                // again: the browser's have no path, and the demo needs none
+                if let Some(path) = path {
+                    self.settings.remember(&path);
+                }
                 self.plot.reload(&log);
                 self.map.reload();
                 self.params.reload();
@@ -492,6 +550,10 @@ impl AftermissionApp {
             if ui.button("Open\u{2026}").clicked() {
                 ui.close();
                 self.open_dialog(ui.ctx());
+            }
+            if ui.button("Open demo log").clicked() {
+                ui.close();
+                self.open_demo(ui.ctx());
             }
             // the browser has no path to offer again
             #[cfg(not(target_arch = "wasm32"))]
@@ -676,9 +738,16 @@ impl AftermissionApp {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.3);
                 ui.heading("Open a log to review");
-                ui.label("Drop an ArduPilot .bin file here, or press Ctrl+O.");
+                ui.label("Drop an ArduPilot .bin file here, press Ctrl+O, or try the demo.");
                 if ui.button("Open\u{2026}").clicked() {
                     self.open_dialog(ui.ctx());
+                }
+                if ui
+                    .button("Demo")
+                    .on_hover_text("An invented survey flight, generated here")
+                    .clicked()
+                {
+                    self.open_demo(ui.ctx());
                 }
             });
             return;
@@ -709,7 +778,17 @@ impl AftermissionApp {
                     });
                     let seek = match *tab {
                         BottomTab::Events => {
-                            self.events.show(ui, log, &self.settings, self.plot.cursor)
+                            let cursor = self.plot.cursor;
+                            let follow = self.plot.follow_mut();
+                            let seek = self.events.show(ui, log, &self.settings, cursor, follow);
+                            if let Some(time) = seek {
+                                // the clicked row is in view: the list does
+                                // not follow its own click, which would scroll
+                                // to the last of rows sharing its time
+                                self.plot.seek(time);
+                                *self.plot.follow_mut() = false;
+                            }
+                            None
                         }
                         BottomTab::Parameters => self.params.show(ui, log, &self.settings),
                     };
@@ -1339,6 +1418,24 @@ mod tests {
             );
             assert!(harness.query_by_label_contains("MODE Loiter").is_none());
         });
+    }
+
+    #[test]
+    fn a_click_in_the_events_list_is_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = opened(dir.path());
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui_state(|ui, app: &mut AftermissionApp| app.show(ui), app);
+        harness.run();
+        harness.get_by_label_contains("MODE Loiter").click();
+        // the click's own frame: the seek is made, and the list is not
+        // asked to follow it, which would scroll to the last of any rows
+        // sharing its time
+        harness.step();
+        let app = harness.state_mut();
+        assert_eq!(app.plot().cursor, Some(2.25));
+        assert!(!*app.plot.follow_mut());
     }
 
     #[test]
@@ -2330,6 +2427,148 @@ mod tests {
         let log = app.log().unwrap();
         assert_eq!(log.name, "flight.bin");
         assert!(log.records() > 0);
+    }
+
+    #[test]
+    fn only_a_log_with_a_path_is_remembered() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        let file = PathBuf::from("logs/flight.bin");
+        for (path, expected) in [(None, vec![]), (Some(file.clone()), vec![file])] {
+            let log = Box::new(LoadedLog::build(
+                dflog::Log::from_source(crate::model::testlog::bytes().into()),
+                "flight.bin".into(),
+            ));
+            app.job = Some(Job::run(
+                Kind::Open,
+                "flight.bin".into(),
+                "Indexing flight.bin".into(),
+                ctx.clone(),
+                move || Ok(Done::Opened { path, log }),
+            ));
+            wait(&mut app, &ctx);
+            assert_eq!(app.settings.recent, expected);
+            assert_eq!(app.log().unwrap().name, "flight.bin");
+        }
+    }
+
+    #[test]
+    fn the_demo_opens_from_the_menu_and_the_empty_window() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        with_ui(&mut app, |harness| {
+            harness
+                .get_by_label("Drop an ArduPilot .bin file here, press Ctrl+O, or try the demo.");
+            harness.get_by_label("File").click();
+            harness.run();
+            harness.get_by_label("Open demo log").click();
+            // the spinner asks for frames while the job runs
+            harness.run_ok();
+        });
+        assert!(
+            app.job.is_some() || app.log().is_some(),
+            "the demo is on its way"
+        );
+        wait(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let log = app.log().unwrap();
+        assert_eq!(log.name, "demo.bin");
+        assert!(log.records() > 50_000, "{}", log.records());
+        assert!(app.settings.recent.is_empty(), "no path to offer again");
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("demo.bin");
+            harness.get_by_label_contains("Copter, ");
+        });
+
+        // the button on the empty window opens it too
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Demo").click();
+            harness.run_ok();
+        });
+        wait(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.log().unwrap().name, "demo.bin");
+        assert!(app.settings.recent.is_empty());
+    }
+
+    #[test]
+    fn a_seek_from_the_parameters_tab_scrolls_the_events_list_on_return() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        app.job = Some(Job::open_demo(ctx.clone()));
+        wait(&mut app, &ctx);
+        // the scroll animates over a few frames
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .with_max_steps(60)
+            .build_ui(|ui| app.show(ui));
+        harness.run();
+        harness.get_by_label_contains("ArduCopter V4.7.0");
+        harness.get_by_label("Parameters").click();
+        harness.run();
+        harness.get_by_label("Changed after boot").click();
+        harness.run();
+        harness.get_by_label_contains("WPNAV_SPEED").click();
+        harness.run();
+        harness.get_by_label_contains("4:10.000").click();
+        harness.run();
+        // the events list was not on screen for the seek; it follows it
+        // when it shows again
+        harness.get_by_label("Events").click();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("ArduCopter V4.7.0")
+                .is_none(),
+            "the list scrolled to the change"
+        );
+        // the rows around 250 s are the survey's mission lines
+        assert!(harness.get_all_by_label_contains("Mission: ").count() > 0);
+        drop(harness);
+        let cursor = app.plot().cursor.unwrap();
+        assert!((cursor - 250.0).abs() < 1e-6, "{cursor}");
+        assert!(!*app.plot.follow_mut(), "the list took the seek");
+    }
+
+    #[test]
+    fn the_armed_demo_shows_its_label_then_opens() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        app.arm_demo(&ctx);
+        assert!(app.armed.is_some() && app.job.is_none());
+        assert_eq!(app.running().as_deref(), Some(demo::LABEL));
+        // a second request while the scan is armed is refused, with the
+        // notice an open by path gets while a job runs
+        app.arm_demo(&ctx);
+        assert!(app.armed.is_some() && app.job.is_none());
+        assert_eq!(
+            app.notice.as_ref().map(|n| n.text.clone()),
+            Some(format!("Still busy: {}\u{2026}", demo::LABEL))
+        );
+        // armed between frames, the label is up for the next two, as a
+        // pick's is: egui counts a frame at its end, so the first frame
+        // has the number the arming saw; the third starts the job under it
+        for painted in 1..=2 {
+            frame(&mut app, &ctx);
+            assert!(
+                app.armed.is_some() && app.job.is_none(),
+                "frame {painted} paints the label"
+            );
+            assert_eq!(app.running().as_deref(), Some(demo::LABEL));
+        }
+        frame(&mut app, &ctx);
+        assert!(app.armed.is_none() && app.job.is_some(), "the third starts");
+        assert_eq!(app.running().as_deref(), Some(demo::LABEL));
+        frames_until_idle(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.log().unwrap().name, "demo.bin");
+        assert!(app.settings.recent.is_empty());
     }
 
     /// Run one frame of the app on `ctx`, as the browser would between

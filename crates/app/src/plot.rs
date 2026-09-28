@@ -92,6 +92,9 @@ pub struct PlotPanel {
     hidden: Vec<Id>,
     /// A time to bring into view on the next frame.
     pending_seek: Option<f64>,
+    /// A seek the events list has yet to bring into view: it may be on
+    /// the other tab, or filtered empty, when the seek is made.
+    follow: bool,
 }
 
 /// The plot's id, fixed so its memory can be read back.
@@ -163,6 +166,8 @@ impl PlotPanel {
         self.selected.clear();
         self.readout.clear();
         self.cursor = None;
+        // no cursor, so no row for the events list to follow
+        self.follow = false;
     }
 
     /// Put the cursor at `time`, panning the view there when it is off
@@ -171,7 +176,14 @@ impl PlotPanel {
     pub fn seek(&mut self, time: f64) {
         self.cursor = Some(time);
         self.pending_seek = Some(time);
+        self.follow = true;
         self.refresh_readout();
+    }
+
+    /// Whether a seek waits for the events list to follow it, for the
+    /// list to clear once it has.
+    pub fn follow_mut(&mut self) -> &mut bool {
+        &mut self.follow
     }
 
     /// Re-extract every series from a newly opened log, dropping those it
@@ -188,6 +200,7 @@ impl PlotPanel {
         });
         self.readout.clear();
         self.cursor = None;
+        self.follow = false;
         self.reset_view = true;
     }
 

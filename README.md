@@ -16,7 +16,9 @@ The tool is early. What works today:
 - **Opening a log** by drag and drop, the file dialog (Ctrl+O) or a path on
   the command line. The file is mapped and indexed on a worker thread, so
   the window stays live; the last eight logs are kept under File > Open
-  recent.
+  recent. File > Open demo log opens an invented survey flight of eight
+  and a half minutes, generated on the spot, to try the tool without a
+  log at hand.
 - **The side panel** lists every message type in the log with its record
   count, and unfolds each to its fields, labeled with the units the log's
   own `UNIT`, `MULT` and `FMTU` records give them (`Roll (deg)`,
@@ -50,7 +52,9 @@ The tool is early. What works today:
   boot, in one list in time order with a toggle per kind and a filter;
   parameter changes start hidden, since a mission upload can log dozens.
   A click on a row seeks the plot and the map to its time; the row the
-  cursor has passed is highlighted.
+  cursor has passed is highlighted, and a seek from the map or a
+  parameter change scrolls the list to it, on the next switch to the
+  tab when it was not showing.
 - **Parameters**: a tab beside the events with every `PARM` name, its
   last value, its default where the log records one, and how often it
   changed after boot. A changed parameter unfolds to its history, the boot
@@ -113,6 +117,10 @@ The same app builds for the web and runs as a page. What differs there:
   bounded by the machine's memory rather than by wasm's 4 GB.
 - **`?webgl`** on the page's address makes the app draw through WebGL 2
   instead of WebGPU, for a browser whose WebGPU draws wrong.
+- **`?demo`** on the page's address opens the demo flight as the page
+  loads; File > Open demo log opens it later, and the empty page has a
+  Demo button.
+  The page holds for a moment while the flight is generated and indexed.
 
 ## Building and running
 

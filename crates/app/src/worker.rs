@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use dflog::Log;
 
+use crate::demo;
 use crate::model::LoadedLog;
 
 /// What a job is doing, for where its outcome goes.
@@ -20,9 +21,13 @@ pub enum Kind {
 /// What a finished job hands back.
 #[derive(Debug)]
 pub enum Done {
-    /// The log at `path`, modeled; boxed, so the enum stays the size of
-    /// its other variant.
-    Opened { path: PathBuf, log: Box<LoadedLog> },
+    /// A log modeled: the file at `path`, or one with no path to open
+    /// again, the bytes the browser read or the demo. Boxed, so the enum
+    /// stays the size of its other variant.
+    Opened {
+        path: Option<PathBuf>,
+        log: Box<LoadedLog>,
+    },
     /// A file written at `path`, or in the browser downloaded under that
     /// name; `summary` is what the status line says.
     Exported { path: PathBuf, summary: String },
@@ -61,20 +66,35 @@ impl Job {
         Self::run(Kind::Open, path.clone(), label, ctx, move || {
             let log = Log::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let log = Box::new(LoadedLog::build(log, file_name(&path)));
-            Ok(Done::Opened { path, log })
+            Ok(Done::Opened {
+                path: Some(path),
+                log,
+            })
         })
     }
 
-    /// Model a log the browser read into memory as `name`. Natively only
-    /// tests take this way in; the path the result carries is the name.
+    /// Model a log read into memory as `name`: one the browser read, or
+    /// a test's. It comes back with no path, since the browser has none
+    /// to open again; the name stands for one in an error.
     #[cfg(any(target_arch = "wasm32", test))]
     #[must_use]
     pub fn open_bytes(name: String, bytes: Vec<u8>, ctx: egui::Context) -> Self {
         let label = indexing_label(&name, Some(bytes.len() as u64));
-        let path = PathBuf::from(&name);
-        Self::run(Kind::Open, path.clone(), label, ctx, move || {
+        Self::run(Kind::Open, PathBuf::from(&name), label, ctx, move || {
             let log = Box::new(LoadedLog::build(Log::from_source(bytes.into()), name));
-            Ok(Done::Opened { path, log })
+            Ok(Done::Opened { path: None, log })
+        })
+    }
+
+    /// Generate the demo flight and model it, both under the one label,
+    /// since its size is not known before the work runs.
+    #[must_use]
+    pub fn open_demo(ctx: egui::Context) -> Self {
+        let label = demo::LABEL.to_string();
+        Self::run(Kind::Open, PathBuf::from(demo::NAME), label, ctx, || {
+            let log = Log::from_source(demo::bytes().into());
+            let log = Box::new(LoadedLog::build(log, demo::NAME.to_string()));
+            Ok(Done::Opened { path: None, log })
         })
     }
 
@@ -196,9 +216,23 @@ mod tests {
         let Done::Opened { path: opened, log } = wait(&mut job).unwrap() else {
             panic!("an open job opens");
         };
-        assert_eq!(opened, path);
+        assert_eq!(opened, Some(path));
         assert_eq!(log.name, "flight.bin");
         assert_eq!(log.type_named("ATT").unwrap().count, 4);
+    }
+
+    #[test]
+    fn the_demo_opens_without_a_path() {
+        let mut job = Job::open_demo(egui::Context::default());
+        assert_eq!(job.kind, Kind::Open);
+        assert_eq!(job.label, "Generating the demo log");
+        assert_eq!(job.path, PathBuf::from("demo.bin"));
+        let Done::Opened { path, log } = wait(&mut job).unwrap() else {
+            panic!("an open job opens");
+        };
+        assert_eq!(path, None);
+        assert_eq!(log.name, "demo.bin");
+        assert!(log.records() > 50_000, "{}", log.records());
     }
 
     #[test]

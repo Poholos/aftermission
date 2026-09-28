@@ -9,6 +9,7 @@
 mod app;
 mod codes;
 mod csv;
+mod demo;
 #[cfg(any(target_arch = "wasm32", test))]
 mod download;
 mod events;
@@ -96,15 +97,17 @@ fn main() {
             .and_then(|d| d.get_element_by_id("aftermission_canvas"))
             .and_then(|e| e.dyn_into::<eframe::web_sys::HtmlCanvasElement>().ok())
             .expect("index.html provides a canvas with id aftermission_canvas");
+        let search = window.location().search().unwrap_or_default();
         let mut options = eframe::WebOptions::default();
-        if asks_for_webgl(&window.location().search().unwrap_or_default()) {
+        if query_has(&search, "webgl") {
             force_webgl(&mut options);
         }
+        let open_demo = query_has(&search, "demo");
         if let Err(err) = eframe::WebRunner::new()
             .start(
                 canvas,
                 options,
-                Box::new(|cc| Ok(Box::new(app::AftermissionApp::new(cc)))),
+                Box::new(move |cc| Ok(Box::new(app::AftermissionApp::new(cc, open_demo)))),
             )
             .await
         {
@@ -121,13 +124,14 @@ fn icon() -> egui::IconData {
         .expect("the icon is a PNG the build ships")
 }
 
-/// Whether the page's query, `?webgl` or `?x=1&webgl`, asks for WebGL.
+/// Whether the page's query has `key`, bare or with a value: `?demo`,
+/// `?webgl=1`, `?x=1&demo`.
 #[cfg(any(target_arch = "wasm32", test))]
-fn asks_for_webgl(search: &str) -> bool {
+fn query_has(search: &str, key: &str) -> bool {
     search
         .trim_start_matches('?')
         .split('&')
-        .any(|pair| pair.split('=').next() == Some("webgl"))
+        .any(|pair| pair.split('=').next() == Some(key))
 }
 
 /// Leave WebGPU out of the backends wgpu may pick, so it starts on
@@ -178,7 +182,7 @@ mod web_log {
 
 #[cfg(test)]
 mod tests {
-    use super::{asks_for_webgl, icon};
+    use super::{icon, query_has};
 
     #[test]
     fn the_window_icon_is_the_painted_png() {
@@ -188,13 +192,18 @@ mod tests {
     }
 
     #[test]
-    fn the_address_asks_for_webgl_by_a_bare_or_valued_key() {
-        assert!(asks_for_webgl("?webgl"));
-        assert!(asks_for_webgl("?webgl=1"));
-        assert!(asks_for_webgl("?log=flight.bin&webgl"));
-        assert!(!asks_for_webgl(""));
-        assert!(!asks_for_webgl("?"));
-        assert!(!asks_for_webgl("?webgl2"));
-        assert!(!asks_for_webgl("?nowebgl"));
+    fn the_address_asks_by_a_bare_or_valued_key() {
+        assert!(query_has("?webgl", "webgl"));
+        assert!(query_has("?webgl=1", "webgl"));
+        assert!(query_has("?log=flight.bin&webgl", "webgl"));
+        assert!(query_has("?demo", "demo"));
+        assert!(query_has("?webgl&demo", "demo"));
+        assert!(query_has("?webgl&demo", "webgl"));
+        assert!(!query_has("", "webgl"));
+        assert!(!query_has("?", "webgl"));
+        assert!(!query_has("?webgl2", "webgl"));
+        assert!(!query_has("?nowebgl", "webgl"));
+        assert!(!query_has("?demonstration", "demo"));
+        assert!(!query_has("?webgl", "demo"));
     }
 }
