@@ -1,12 +1,14 @@
 //! Preferences that survive a restart: theme, time axis, mode bands, which
-//! panels are open and what the bottom one shows, map tiles, recent files
-//! and the export folder. Stored through eframe's key-value storage, a
-//! file next to the app's config on native.
+//! panels are open and what the bottom one shows, map tiles, the playback
+//! speed, recent files and the export folder. Stored through eframe's
+//! key-value storage, a file next to the app's config on native.
 
 use std::path::{Path, PathBuf};
 
 use egui::ThemePreference;
 use serde::{Deserialize, Serialize};
+
+use crate::playback::Speed;
 
 /// Recent paths kept in the File menu.
 const MAX_RECENT: usize = 8;
@@ -53,6 +55,8 @@ pub struct Settings {
     /// Map tiles downloaded from OpenStreetMap; off, the track draws on a
     /// plain background and nothing leaves the machine.
     pub online_tiles: bool,
+    /// How fast the log plays; whether it plays is not kept.
+    pub speed: Speed,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
     /// Where the last export went, for the next save dialog to open in.
@@ -70,6 +74,7 @@ impl Default for Settings {
             show_bottom: true,
             bottom_tab: BottomTab::default(),
             online_tiles: true,
+            speed: Speed::default(),
             recent: Vec::new(),
             export_dir: None,
         }
@@ -110,6 +115,7 @@ mod tests {
             theme: ThemePreference::Light,
             time_axis: TimeAxis::Utc,
             show_modes: false,
+            speed: Speed::default().faster(),
             ..Settings::default()
         };
         settings.remember(Path::new("flight.bin"));
@@ -125,12 +131,18 @@ mod tests {
         assert!(partial.show_modes);
         assert!(partial.show_map && partial.show_bottom && partial.online_tiles);
         assert_eq!(partial.bottom_tab, BottomTab::Events);
+        assert_eq!(partial.speed, Speed::default());
         assert!(partial.recent.is_empty());
         assert_eq!(partial.export_dir, None);
 
         // the bottom panel's toggle keeps its saved value under its old name
         let renamed: Settings = ron::from_str("(show_events: false)").unwrap();
         assert!(!renamed.show_bottom);
+
+        // a speed past the last one on offer reads as the fastest
+        let edited: Settings = ron::from_str("(speed: 99)").unwrap();
+        assert_eq!(edited.speed, Speed::from(99));
+        assert_eq!(edited.speed.label(), "60\u{d7}");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The application: menus, the side panel with the log's types, the plot,
 //! the map, the bottom panel with the events list and the parameter
-//! table, the ways a log gets opened, and the exports.
+//! table, the transport that plays the log back, the ways a log gets
+//! opened, and the exports.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::BufWriter;
@@ -26,8 +27,10 @@ use crate::params::ParamsPanel;
 use crate::parquetdir;
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::picks::{Outcome, Picks};
+use crate::playback::{self, Playback, Speed, Step};
 use crate::plot::PlotPanel;
 use crate::settings::{BottomTab, Settings, TimeAxis};
+use crate::timefmt;
 use crate::tree;
 use crate::worker::{self, Done, Job, Kind};
 
@@ -160,6 +163,8 @@ pub struct AftermissionApp {
     #[cfg(feature = "parquet")]
     parquet_dialog: Option<ParquetDialog>,
     plot: PlotPanel,
+    /// Whether the log plays; the playhead is the plot's.
+    playback: Playback,
     map: MapPanel,
     events: EventsPanel,
     params: ParamsPanel,
@@ -432,6 +437,8 @@ impl AftermissionApp {
                 if let Some(path) = path {
                     self.settings.remember(&path);
                 }
+                // the log that played is gone
+                self.playback.pause();
                 self.plot.reload(&log);
                 self.map.reload();
                 self.params.reload();
@@ -499,6 +506,124 @@ impl AftermissionApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
             self.open_dialog(ctx);
         }
+        self.transport_keys(ctx);
+    }
+
+    /// Space plays and pauses, Left and Right step a second back and
+    /// forward, ten with Shift, and `[` and `]` step the speed down and
+    /// up, while no widget has the keyboard. egui gives it only to a text
+    /// field that is clicked and to a widget reached with Tab, which take
+    /// Space and the arrows as their own: a focused Play button plays by
+    /// Space as its click. Not under an export's window either, where
+    /// playback holds still.
+    fn transport_keys(&mut self, ctx: &Context) {
+        use egui::{Key, Modifiers};
+
+        if self.time_range().is_none() || self.exporting() || ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        // Shift first: a key asked for without it matches with it too
+        let step = |i: &mut egui::InputState, key| {
+            if i.consume_key(Modifiers::SHIFT, key) {
+                10.0
+            } else if i.consume_key(Modifiers::NONE, key) {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let (toggle, back, on, slower, faster) = ctx.input_mut(|i| {
+            (
+                i.consume_key(Modifiers::NONE, Key::Space),
+                step(i, Key::ArrowLeft),
+                step(i, Key::ArrowRight),
+                i.consume_key(Modifiers::NONE, Key::OpenBracket),
+                i.consume_key(Modifiers::NONE, Key::CloseBracket),
+            )
+        });
+        if toggle {
+            self.toggle_playback();
+        }
+        if back + on != 0.0 {
+            self.step_playhead(on - back);
+        }
+        if slower {
+            self.settings.speed = self.settings.speed.slower();
+        }
+        if faster {
+            self.settings.speed = self.settings.speed.faster();
+        }
+    }
+
+    /// Whether an export's window is open. Playback holds still under
+    /// it, so the time range in view that the CSV export offers stays
+    /// the one the user saw.
+    fn exporting(&self) -> bool {
+        #[cfg(feature = "parquet")]
+        let parquet = self.parquet_dialog.is_some();
+        #[cfg(not(feature = "parquet"))]
+        let parquet = false;
+        self.csv_dialog.is_some() || self.param_dialog.is_some() || parquet
+    }
+
+    /// The time the open log plays through; None without a log or a
+    /// timed record in it.
+    fn time_range(&self) -> Option<RangeInclusive<f64>> {
+        self.log.as_ref().and_then(|log| log.time_range())
+    }
+
+    /// Play or pause. Play goes on from the playhead, or starts at the
+    /// log's first time when nothing has been played or sought yet, or
+    /// when playing last ran to the end.
+    fn toggle_playback(&mut self) {
+        let Some(range) = self.time_range() else {
+            return;
+        };
+        if self.playback.is_playing() {
+            self.playback.pause();
+            return;
+        }
+        let from = playback::start_from(self.plot.playhead(), &range);
+        if self.plot.playhead() != Some(from) {
+            self.plot.seek(from);
+        }
+        self.playback.play();
+    }
+
+    /// Move the playhead `seconds` forward, or back when negative, within
+    /// the log's time, playing or paused; from the log's first time when
+    /// it has not moved yet.
+    fn step_playhead(&mut self, seconds: f64) {
+        let Some(range) = self.time_range() else {
+            return;
+        };
+        let (start, end) = (*range.start(), *range.end());
+        let from = self.plot.playhead().unwrap_or(start);
+        self.plot.seek((from + seconds).clamp(start, end));
+    }
+
+    /// While playing, move the playhead by the time since the last frame
+    /// and ask for the next one; under an export's window, pause.
+    fn advance_playback(&mut self, ctx: &Context) {
+        if !self.playback.is_playing() {
+            return;
+        }
+        let range = self.time_range().filter(|_| !self.exporting());
+        let (Some(range), Some(playhead)) = (range, self.plot.playhead()) else {
+            self.playback.pause();
+            return;
+        };
+        let now = ctx.input(|i| i.time);
+        let frame = ctx.cumulative_frame_nr();
+        if let Some(Step::Moved(time) | Step::Ended(time)) =
+            self.playback
+                .advance(self.settings.speed, now, frame, playhead, &range)
+        {
+            self.plot.play_to(time);
+        }
+        if self.playback.is_playing() {
+            ctx.request_repaint();
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -532,6 +657,7 @@ impl AftermissionApp {
         }
         self.handle_drop(&ctx);
         self.shortcuts(&ctx);
+        self.advance_playback(&ctx);
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
@@ -747,7 +873,9 @@ impl AftermissionApp {
     }
 
     fn central_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(log) = &self.log else {
+        // a handle of its own, so the transport can play and seek while
+        // the panels read the log
+        let Some(log) = self.log.clone() else {
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.3);
                 ui.heading("Open a log to review");
@@ -765,8 +893,10 @@ impl AftermissionApp {
             });
             return;
         };
+        let log = &log;
         // The map to the right and the events or parameters below share
-        // the width and height with the plot, which takes what is left.
+        // the width and height with the plot, which takes what is left;
+        // the transport sits between the plot and the events.
         if self.settings.show_map {
             egui::Panel::right("map_panel")
                 .default_size(420.0)
@@ -810,7 +940,95 @@ impl AftermissionApp {
                     }
                 });
         }
-        self.plot.show(ui, log, &self.settings);
+        egui::Panel::bottom("transport")
+            .resizable(false)
+            .show(ui, |ui| self.transport_ui(ui, log));
+        let playing = self.playback.is_playing();
+        self.plot.show(ui, log, &self.settings, playing);
+    }
+
+    /// The transport: play and pause, a step back and one forward, the
+    /// playhead's time since the log's first and the log's length, the
+    /// time of day on the UTC axis, a slider to scrub, and the speed.
+    /// Disabled for a log without a timed record, and under an export's
+    /// window.
+    fn transport_ui(&mut self, ui: &mut egui::Ui, log: &LoadedLog) {
+        let range = log.time_range();
+        ui.add_enabled_ui(range.is_some() && !self.exporting(), |ui| {
+            ui.horizontal(|ui| {
+                let (icon, tip) = if self.playback.is_playing() {
+                    ("\u{23F8}", "Pause (Space)")
+                } else {
+                    ("\u{23F5}", "Play (Space)")
+                };
+                if ui.button(icon).on_hover_text(tip).clicked() {
+                    self.toggle_playback();
+                }
+                let by = if ui.input(|i| i.modifiers.shift) {
+                    10.0
+                } else {
+                    1.0
+                };
+                if ui
+                    .button("\u{23EA}")
+                    .on_hover_text("Back 1 s, with Shift 10 s (Left)")
+                    .clicked()
+                {
+                    self.step_playhead(-by);
+                }
+                if ui
+                    .button("\u{23E9}")
+                    .on_hover_text("Forward 1 s, with Shift 10 s (Right)")
+                    .clicked()
+                {
+                    self.step_playhead(by);
+                }
+                let Some(range) = range else {
+                    ui.weak("No timed records");
+                    return;
+                };
+                let (start, end) = (*range.start(), *range.end());
+                let at = self.plot.playhead().unwrap_or(start);
+                ui.monospace(format!(
+                    "{} / {}",
+                    timefmt::boot_time(at - start, 0.1),
+                    timefmt::boot_time(end - start, 0.1)
+                ));
+                if let Some(base) = log.wall_clock(self.settings.time_axis) {
+                    ui.monospace(timefmt::utc_time(base.wall_clock_unix_ms(at * 1000.0), 1.0));
+                }
+                // the speed at the right end, and the slider across the rest
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("playback_speed")
+                        .width(60.0)
+                        .selected_text(self.settings.speed.label())
+                        .show_ui(ui, |ui| {
+                            for speed in Speed::all() {
+                                ui.selectable_value(&mut self.settings.speed, speed, speed.label());
+                            }
+                        })
+                        .response
+                        .on_hover_text("Speed ([ and ])");
+                    ui.spacing_mut().slider_width = ui.available_width();
+                    let mut time = at;
+                    let slider = ui.add(
+                        egui::Slider::new(&mut time, start..=end)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    // a drag pauses while it lasts; a click seeks
+                    if slider.drag_started() {
+                        self.playback.begin_scrub();
+                    }
+                    if slider.changed() {
+                        self.plot.seek(time);
+                    }
+                    if slider.drag_stopped() {
+                        self.playback.end_scrub();
+                    }
+                });
+            });
+        });
     }
 
     fn about_ui(&mut self, ctx: &Context) {
@@ -2787,6 +3005,316 @@ mod tests {
         let ctx = Context::default();
         frames_until_idle(&mut app, &ctx);
         assert_eq!(app.log().unwrap().name, "b.bin");
+    }
+
+    /// A log of a hundred seconds, an attitude record a second from 1 s,
+    /// written to `dir` and opened.
+    fn long_flight(dir: &Path) -> AftermissionApp {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let mut w = LogWriter::new();
+        w.define(1, "ATT", "Qf", &["TimeUS", "Roll"]).unwrap();
+        for second in 1..=100u64 {
+            w.record(
+                "ATT",
+                &[Value::U64(second * 1_000_000), Value::F64(second as f64)],
+            )
+            .unwrap();
+        }
+        let path = dir.join("long.bin");
+        std::fs::write(&path, w.into_bytes()).unwrap();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        reopen(&mut app, &path);
+        assert_eq!(app.log().unwrap().time_range(), Some(1.0..=100.0));
+        app
+    }
+
+    /// `app` in a window with room for every panel, a twentieth of a
+    /// second a frame. Playing asks for frames without end, so the tests
+    /// step rather than run to a still window.
+    fn player(app: AftermissionApp) -> Harness<'static, AftermissionApp> {
+        Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .with_step_dt(0.05)
+            .build_ui_state(|ui, app: &mut AftermissionApp| app.show(ui), app)
+    }
+
+    fn playhead(harness: &Harness<'_, AftermissionApp>) -> f64 {
+        harness
+            .state()
+            .plot
+            .playhead()
+            .expect("the playhead has moved")
+    }
+
+    fn playing(harness: &Harness<'_, AftermissionApp>) -> bool {
+        harness.state().playback.is_playing()
+    }
+
+    #[test]
+    fn keys_play_step_and_change_the_speed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = long_flight(dir.path());
+        app.settings.speed = Speed::from(5);
+        assert_eq!(app.settings.speed.label(), "10\u{d7}");
+        let mut harness = player(app);
+        harness.get_by_label("0:00.0 / 1:39.0");
+
+        // Space plays from the log's first time; the frame it lands in
+        // counts no time, the next one does
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(playing(&harness));
+        let from = playhead(&harness);
+        assert!((from - 1.5).abs() < 1e-5, "{from}");
+        // ten frames of a twentieth of a second at 10x: five seconds
+        for _ in 0..10 {
+            harness.step();
+        }
+        let at = playhead(&harness);
+        assert!((at - from - 5.0).abs() < 1e-5, "{from} to {at}");
+        assert_eq!(
+            harness.state().plot.cursor,
+            Some(at),
+            "the cursor goes along"
+        );
+
+        // a seek while playing, as the map's or the events list's, is
+        // where playing goes on from
+        harness.state_mut().plot.seek(50.0);
+        harness.step();
+        let at = playhead(&harness);
+        assert!((at - 50.5).abs() < 1e-5, "{at}");
+
+        // Space pauses; Right steps a second forward, ten with Shift, and
+        // Left back, within the log's time
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(!playing(&harness));
+        let paused = playhead(&harness);
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        assert!((playhead(&harness) - paused - 1.0).abs() < 1e-9);
+        harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowRight);
+        harness.step();
+        assert!((playhead(&harness) - paused - 11.0).abs() < 1e-9);
+        harness.key_press(egui::Key::ArrowLeft);
+        harness.step();
+        assert!((playhead(&harness) - paused - 10.0).abs() < 1e-9);
+        for _ in 0..8 {
+            harness.key_press_modifiers(egui::Modifiers::SHIFT, egui::Key::ArrowLeft);
+        }
+        harness.step();
+        assert_eq!(harness.state().plot.playhead(), Some(1.0));
+        assert!(!playing(&harness), "stepping does not play");
+
+        // ] and [ step the speed, which the settings keep
+        harness.key_press(egui::Key::CloseBracket);
+        harness.step();
+        assert_eq!(harness.state().settings.speed.label(), "30\u{d7}");
+        harness.key_press(egui::Key::OpenBracket);
+        harness.key_press(egui::Key::OpenBracket);
+        harness.step();
+        assert_eq!(harness.state().settings.speed.label(), "5\u{d7}");
+    }
+
+    #[test]
+    fn playing_stops_at_the_end_and_play_there_starts_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = long_flight(dir.path());
+        app.settings.speed = Speed::from(7);
+        let mut harness = player(app);
+        harness.state_mut().plot.seek(99.0);
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(!playing(&harness), "60x runs out within a frame");
+        assert_eq!(harness.state().plot.playhead(), Some(100.0));
+        harness.get_by_label("1:39.0 / 1:39.0");
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(playing(&harness));
+        let at = playhead(&harness);
+        assert!(at < 5.0, "from the start again: {at}");
+    }
+
+    #[test]
+    fn a_widget_with_the_keyboard_keeps_space_and_the_arrows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = player(long_flight(dir.path()));
+
+        // with the side panel's filter focused, Space types a space there
+        let side = panel_rect(&harness, "side_panel");
+        let filter = harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| side.contains(node.rect().center()))
+            .expect("the side panel has its filter");
+        filter.focus();
+        harness.step();
+        harness.key_press(egui::Key::Space);
+        harness
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| side.contains(node.rect().center()))
+            .unwrap()
+            .type_text(" ");
+        harness.step();
+        assert_eq!(harness.state().filter, " ");
+        assert!(!playing(&harness));
+
+        // a widget reached with Tab takes Space as its click, and the
+        // arrows as its own, and the transport leaves them to it
+        harness.get_by_label("ATT (100)").focus();
+        harness.step();
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        harness.get_by_label("Roll");
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        assert!(!playing(&harness));
+        assert_eq!(harness.state().plot.playhead(), None);
+
+        // the Play button reached so plays once by Space, as its click
+        harness.get_by_label("\u{23F5}").focus();
+        harness.step();
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(playing(&harness));
+        // and with no widget focused, Space is the transport's again
+        harness.key_press(egui::Key::Escape);
+        harness.step();
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(!playing(&harness));
+    }
+
+    #[test]
+    fn opening_a_log_or_an_export_dialog_stops_playing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = player(long_flight(dir.path()));
+        let path = dir.path().join("long.bin");
+
+        // a new log stops playing when it arrives, and starts with no
+        // playhead
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(playing(&harness));
+        let ctx = harness.ctx.clone();
+        harness.state_mut().open_path(&path, &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while harness.state().job.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the open did not finish"
+            );
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!playing(&harness));
+        assert_eq!(harness.state().plot.playhead(), None);
+
+        // an export dialog pauses, so the range in view holds still under
+        // it, and Space leaves it paused
+        harness.state_mut().toggle_series(crate::model::SeriesKey {
+            type_name: "ATT".into(),
+            field: "Roll".into(),
+            instance: None,
+        });
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(playing(&harness));
+        harness.get_by_label("File").click();
+        harness.step();
+        harness.get_by_label("Export \u{23F5}").hover();
+        harness.step();
+        harness
+            .get_by_label("Plotted series as CSV\u{2026}")
+            .click();
+        harness.step();
+        assert!(harness.state().csv_dialog.is_some());
+        harness.step();
+        assert!(!playing(&harness));
+        // and holds it still while it is open: Space, the Play button and
+        // the steps do nothing
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        let play = harness.get_by_label("\u{23F5}");
+        assert!(play.accesskit_node().is_disabled());
+        play.click();
+        harness.step();
+        assert!(!playing(&harness));
+        let at = harness.state().plot.playhead();
+        harness.key_press(egui::Key::ArrowRight);
+        harness.step();
+        assert_eq!(harness.state().plot.playhead(), at);
+
+        // the About window, which moves nothing, leaves the keys be
+        harness.get_by_label("Cancel").click();
+        harness.step();
+        assert!(harness.state().csv_dialog.is_none());
+        harness.state_mut().about_open = true;
+        harness.step();
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(playing(&harness));
+    }
+
+    #[test]
+    fn a_drag_of_the_slider_pauses_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut harness = player(long_flight(dir.path()));
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(playing(&harness));
+
+        let rail = harness.get_by_role(egui::accesskit::Role::Slider).rect();
+        let from = egui::pos2(rail.left() + rail.width() * 0.5, rail.center().y);
+        harness.hover_at(from);
+        harness.step();
+        harness.drag_at(from);
+        harness.step();
+        for step in 1..=5u8 {
+            let x = rail.width() * 0.05 * f32::from(step);
+            harness.hover_at(from + egui::vec2(x, 0.0));
+            harness.step();
+            assert!(!playing(&harness), "paused while the hand moves it");
+        }
+        // three quarters along, give or take the handle's margins
+        let at = playhead(&harness);
+        assert!((65.0..85.0).contains(&at), "{at}");
+        harness.drop_at(from + egui::vec2(rail.width() * 0.25, 0.0));
+        harness.step();
+        assert!(playing(&harness), "playing again once it ends");
+    }
+
+    #[test]
+    fn a_log_without_a_timed_record_disables_the_transport() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let mut w = LogWriter::new();
+        w.define(8, "NOTM", "Bf", &["Idx", "Value"]).unwrap();
+        w.record("NOTM", &[Value::U64(7), Value::F64(42.0)])
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("untimed.bin");
+        std::fs::write(&path, w.into_bytes()).unwrap();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        reopen(&mut app, &path);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("No timed records");
+            assert!(
+                harness
+                    .get_by_label("\u{23F5}")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            harness.key_press(egui::Key::Space);
+            harness.run();
+        });
+        assert!(!app.playback.is_playing());
+        assert_eq!(app.plot.playhead(), None);
     }
 
     #[test]

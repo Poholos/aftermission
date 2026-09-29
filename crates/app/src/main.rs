@@ -23,6 +23,7 @@ mod params;
 mod parquetdir;
 #[cfg(any(target_arch = "wasm32", test))]
 mod picks;
+mod playback;
 mod plot;
 mod settings;
 mod timefmt;

@@ -4,6 +4,8 @@
 //! parameters. Built once, off the UI thread, from a [`dflog::Log`];
 //! series are extracted from it on demand.
 
+use std::ops::RangeInclusive;
+
 use dflog::columns::{self, ColumnError};
 use dflog::time::TimeBase;
 use dflog::{FmtDef, Log, ScanStats};
@@ -237,6 +239,8 @@ pub struct LoadedLog {
     /// without a time field takes the time of the last record before it
     /// that had one.
     pub timeline: Vec<f64>,
+    /// The earliest and the latest of the timeline's times, found once.
+    time_range: Option<(f64, f64)>,
     pub time_base: Option<TimeBase>,
     /// In log order, consecutive repeats of a mode merged.
     pub modes: Vec<ModeChange>,
@@ -317,11 +321,13 @@ impl LoadedLog {
         let modes = mode_changes(&log, &timeline, vehicle);
         let params = params::read(&log, &timeline);
 
+        let time_range = extent(timeline.iter().copied().filter(|t| t.is_finite()));
         let mut loaded = LoadedLog {
             name,
             types,
             params,
             timeline,
+            time_range,
             time_base: log.time_base(),
             modes,
             vehicle,
@@ -398,6 +404,14 @@ impl LoadedLog {
         let first = self.timeline.first()?;
         let last = self.timeline.last()?;
         (first.is_finite() && last.is_finite()).then(|| last - first)
+    }
+
+    /// The earliest to the latest time of any record, which playback
+    /// runs through; None for a log without a timed record. Unlike
+    /// [`Self::duration`], it holds a record logged out of time order.
+    #[must_use]
+    pub fn time_range(&self) -> Option<RangeInclusive<f64>> {
+        self.time_range.map(|(start, end)| start..=end)
     }
 
     /// Whether `key` names a numeric field of a type in this log, of one
@@ -489,10 +503,12 @@ impl LoadedLog {
 /// The lowest and highest of `values`, which are finite; None when there
 /// are none.
 #[must_use]
-pub fn extent(values: &[f64]) -> Option<(f64, f64)> {
-    values.iter().fold(None, |range: Option<(f64, f64)>, &y| {
-        Some(range.map_or((y, y), |(a, b)| (a.min(y), b.max(y))))
-    })
+pub fn extent(values: impl IntoIterator<Item = f64>) -> Option<(f64, f64)> {
+    values
+        .into_iter()
+        .fold(None, |range: Option<(f64, f64)>, y| {
+            Some(range.map_or((y, y), |(a, b)| (a.min(y), b.max(y))))
+        })
 }
 
 /// The index of the value of `xs`, which are non-decreasing, nearest to
@@ -681,7 +697,10 @@ fn positions(
         track.lons.push(lon);
         track.alts.push(alt);
     }
-    if let (Some((south, north)), Some((west, east))) = (extent(&track.lats), extent(&track.lons)) {
+    if let (Some((south, north)), Some((west, east))) = (
+        extent(track.lats.iter().copied()),
+        extent(track.lons.iter().copied()),
+    ) {
         track.bounds = Some(Bounds {
             south,
             west,
@@ -1039,6 +1058,9 @@ mod tests {
         assert_eq!(series.ys, [42.0]);
         assert!((series.xs[0] - 2.100_01).abs() < 1e-9, "{}", series.xs[0]);
         assert!((log.duration().unwrap() - 1.25).abs() < 1e-9);
+        // the mission's count logged at 2.33 s, before the last mode
+        // change at 2.25 s, ends the range
+        assert_eq!(log.time_range(), Some(1.0..=2.33));
     }
 
     #[test]
@@ -1431,9 +1453,26 @@ mod tests {
         assert!(log.types.is_empty());
         assert!(log.timeline.is_empty());
         assert_eq!(log.duration(), None);
+        assert_eq!(log.time_range(), None);
         assert!(log.modes.is_empty());
         assert_eq!(log.vehicle, Vehicle::Unknown);
         assert!(log.track.is_empty());
         assert!(log.events.is_empty());
+    }
+
+    #[test]
+    fn a_log_without_a_time_field_has_no_time_range() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let mut w = LogWriter::new();
+        w.define(8, "NOTM", "Bf", &["Idx", "Value"]).unwrap();
+        w.record("NOTM", &[Value::U64(7), Value::F64(42.0)])
+            .unwrap();
+        let log = LoadedLog::build(Log::from_bytes(&w.into_bytes()), "notm.bin".into());
+        assert!(log.type_named("NOTM").is_some());
+        assert!(log.timeline.iter().all(|t| t.is_nan()));
+        assert_eq!(log.duration(), None);
+        assert_eq!(log.time_range(), None);
     }
 }
