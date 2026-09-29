@@ -57,6 +57,8 @@ pub struct Settings {
     pub online_tiles: bool,
     /// How fast the log plays; whether it plays is not kept.
     pub speed: Speed,
+    /// The map keeps the vehicle in view, until moved by hand.
+    pub follow_map: bool,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
     /// Where the last export went, for the next save dialog to open in.
@@ -75,6 +77,7 @@ impl Default for Settings {
             bottom_tab: BottomTab::default(),
             online_tiles: true,
             speed: Speed::default(),
+            follow_map: true,
             recent: Vec::new(),
             export_dir: None,
         }
@@ -116,6 +119,7 @@ mod tests {
             time_axis: TimeAxis::Utc,
             show_modes: false,
             speed: Speed::default().faster(),
+            follow_map: false,
             ..Settings::default()
         };
         settings.remember(Path::new("flight.bin"));
@@ -132,6 +136,7 @@ mod tests {
         assert!(partial.show_map && partial.show_bottom && partial.online_tiles);
         assert_eq!(partial.bottom_tab, BottomTab::Events);
         assert_eq!(partial.speed, Speed::default());
+        assert!(partial.follow_map);
         assert!(partial.recent.is_empty());
         assert_eq!(partial.export_dir, None);
 

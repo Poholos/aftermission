@@ -904,7 +904,8 @@ impl AftermissionApp {
                     let cursor = self.plot.cursor;
                     let clock = log.wall_clock(self.settings.time_axis);
                     let online = self.settings.online_tiles;
-                    if let Some(time) = self.map.show(ui, log, cursor, clock, online) {
+                    let follow = &mut self.settings.follow_map;
+                    if let Some(time) = self.map.show(ui, log, cursor, clock, online, follow) {
                         self.plot.seek(time);
                     }
                 });
@@ -997,8 +998,13 @@ impl AftermissionApp {
                 if let Some(base) = log.wall_clock(self.settings.time_axis) {
                     ui.monospace(timefmt::utc_time(base.wall_clock_unix_ms(at * 1000.0), 1.0));
                 }
-                // the speed at the right end, and the slider across the rest
+                // Follow and the speed at the right end, and the slider
+                // across the rest
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.checkbox(&mut self.settings.follow_map, "Follow")
+                        .on_hover_text(
+                            "Keep the vehicle in view on the map; moving the map by hand turns it off",
+                        );
                     egui::ComboBox::from_id_salt("playback_speed")
                         .width(60.0)
                         .selected_text(self.settings.speed.label())

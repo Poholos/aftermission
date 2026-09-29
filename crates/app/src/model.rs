@@ -247,6 +247,9 @@ pub struct LoadedLog {
     pub vehicle: Vehicle,
     pub stats: ScanStats,
     pub track: Track,
+    /// `ATT.Yaw` in degrees, which the map's arrow points by; empty for
+    /// a log without it.
+    yaw: Series,
     /// In time order.
     pub events: Vec<Event>,
     /// Sorted by name.
@@ -334,9 +337,18 @@ impl LoadedLog {
             stats: log.stats,
             log,
             track: Track::default(),
+            yaw: Series::default(),
             events: Vec::new(),
         };
         loaded.track = track(&loaded);
+        let yaw = SeriesKey {
+            type_name: "ATT".into(),
+            field: "Yaw".into(),
+            instance: None,
+        };
+        if loaded.has_series(&yaw) {
+            loaded.yaw = loaded.series(&yaw).unwrap_or_default();
+        }
         loaded.events = events(&loaded);
         loaded
     }
@@ -412,6 +424,27 @@ impl LoadedLog {
     #[must_use]
     pub fn time_range(&self) -> Option<RangeInclusive<f64>> {
         self.time_range.map(|(start, end)| start..=end)
+    }
+
+    /// The vehicle's heading at `time`, in degrees clockwise from north:
+    /// the `ATT` yaw nearest in time where the log has one, else the
+    /// course over the ground between the track's points on either side
+    /// of the one nearest `time`. None with neither, and where the track
+    /// does not move.
+    #[must_use]
+    pub fn heading_at(&self, time: f64) -> Option<f64> {
+        if let Some(i) = nearest_index(&self.yaw.xs, time) {
+            return Some(self.yaw.ys[i].rem_euclid(360.0));
+        }
+        let track = &self.track;
+        let i = track.nearest(time)?;
+        let (a, b) = (i.saturating_sub(1), (i + 1).min(track.len() - 1));
+        // east and north in degrees of latitude, near enough over the
+        // few meters between two points
+        let middle = f64::midpoint(track.lats[a], track.lats[b]).to_radians();
+        let east = (track.lons[b] - track.lons[a]) * middle.cos();
+        let north = track.lats[b] - track.lats[a];
+        (east != 0.0 || north != 0.0).then(|| east.atan2(north).to_degrees().rem_euclid(360.0))
     }
 
     /// Whether `key` names a numeric field of a type in this log, of one
@@ -1136,6 +1169,9 @@ mod tests {
         ));
         assert_eq!(track.nearest(2.16), Some(1));
         assert_eq!(track.nearest(9.0), Some(2));
+        // the heading is the attitude's yaw nearest in time
+        assert_eq!(log.heading_at(2.16), Some(92.0));
+        assert_eq!(log.heading_at(-5.0), Some(90.0));
         assert_eq!(Track::default().nearest(1.0), None);
         assert_eq!(Track::default().bounds(), None);
         assert_eq!(nearest_index(&[0.0, 1.0, 2.0], 0.4), Some(0));
@@ -1298,6 +1334,8 @@ mod tests {
         // without POS the track comes from the GPS fix
         assert_eq!(log.track.source, "GPS");
         assert_eq!(log.track.len(), 1);
+        // the heading is this ATT's yaw
+        assert_eq!(log.heading_at(5.2), Some(3.0));
         assert!(close(&log.track.lats, &[47.0]) && close(&log.track.lons, &[8.0]));
         assert!((log.track.alts[0] - 450.0).abs() < 1e-6);
         assert!((log.track.times[0] - 5.2).abs() < 1e-9);
@@ -1458,6 +1496,51 @@ mod tests {
         assert_eq!(log.vehicle, Vehicle::Unknown);
         assert!(log.track.is_empty());
         assert!(log.events.is_empty());
+    }
+
+    #[test]
+    fn without_attitude_the_heading_is_the_course_over_the_ground() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        // due north, then due east, then standing still
+        let mut w = LogWriter::new();
+        w.define(1, "POS", "QLLf", &["TimeUS", "Lat", "Lng", "Alt"])
+            .unwrap();
+        for (second, lat, lon) in [
+            (1u64, 47.0, 8.0),
+            (2, 47.001, 8.0),
+            (3, 47.002, 8.0),
+            (4, 47.002, 8.001),
+            (5, 47.002, 8.002),
+            (6, 47.002, 8.002),
+            (7, 47.002, 8.002),
+        ] {
+            w.record(
+                "POS",
+                &[
+                    Value::U64(second * 1_000_000),
+                    Value::F64(lat),
+                    Value::F64(lon),
+                    Value::F64(400.0),
+                ],
+            )
+            .unwrap();
+        }
+        let log = LoadedLog::build(Log::from_bytes(&w.into_bytes()), "course.bin".into());
+        assert_eq!(log.track.len(), 7);
+        let heading = |time| log.heading_at(time).map(|h| (h * 1e6).round() / 1e6);
+        assert_eq!(heading(2.0), Some(0.0), "north");
+        assert_eq!(heading(1.0), Some(0.0), "from the first point on");
+        assert_eq!(heading(4.9), Some(90.0), "east");
+        assert_eq!(heading(7.0), None, "standing still");
+        // at the corner, as far north as east in degrees: north of 45
+        // degrees on the ground, where a degree of longitude at 47 degrees
+        // north is the shorter
+        let turn = log.heading_at(3.0).unwrap();
+        let expected = 47.002_f64.to_radians().cos().atan().to_degrees();
+        assert!((turn - expected).abs() < 1e-3, "{turn} against {expected}");
+        assert!(turn < 45.0);
     }
 
     #[test]
