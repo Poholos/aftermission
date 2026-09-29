@@ -195,9 +195,10 @@ nowhere unless redirected: `aftermission flight.bin > aftermission.log`
 writes it to a file, with `RUST_LOG` as usual. A debug build (`cargo
 run`) keeps the console.
 
-On Linux, eframe needs the X11 or Wayland and xkbcommon development
-libraries; the file dialogs ask the desktop portal over D-Bus and need
-no GTK. The CI workflow lists the Debian packages it installs.
+On Linux the build needs a C compiler and no system development
+libraries: `build-essential` on Debian or Ubuntu is enough. The app
+loads X11 or Wayland and xkbcommon when it starts, and the file dialogs
+ask the desktop portal over D-Bus.
 
 ```bash
 cargo fmt --all --check

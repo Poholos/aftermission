@@ -26,12 +26,6 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      - name: Install Linux libraries for eframe and the file dialog
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev cmake
       - uses: Swatinem/rust-cache@v2
       - name: Format
         if: runner.os == 'Linux'
