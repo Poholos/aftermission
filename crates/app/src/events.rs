@@ -1,7 +1,8 @@
 //! The events panel: the log's messages, errors, events, mode changes and
 //! parameter changes in one list, in time order, a click on a row seeking
 //! the plot and the map to its time, and a seek from the map or a
-//! parameter change bringing its row into view.
+//! parameter change, or playback reaching the next event, bringing its
+//! row into view.
 
 use egui::{Rect, RichText};
 
@@ -25,6 +26,10 @@ pub struct EventsPanel {
     /// Per kind of [`KINDS`].
     shown: [bool; 5],
     filter: String,
+    /// The event highlighted last frame, by its place in the log's
+    /// events, so a filter or a toggle that renumbers the rows is not
+    /// playback reaching another.
+    highlighted: Option<usize>,
 }
 
 impl Default for EventsPanel {
@@ -34,11 +39,17 @@ impl Default for EventsPanel {
             // dozens
             shown: KINDS.map(|kind| kind != EventKind::Param),
             filter: String::new(),
+            highlighted: None,
         }
     }
 }
 
 impl EventsPanel {
+    /// A new log is on: nothing of the last one is highlighted.
+    pub fn reload(&mut self) {
+        self.highlighted = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn set_filter(&mut self, filter: &str) {
         self.filter = filter.to_string();
@@ -49,9 +60,11 @@ impl EventsPanel {
     /// moved the cursor: the highlighted row is scrolled into view, or
     /// the top when the cursor is before every row, and `follow` is
     /// cleared, unless the filters leave no rows, when it waits for them.
-    /// The cursor's own moves, as the pointer sweeps the plot, leave the
-    /// list where it is. The time of a clicked row is returned, to seek
-    /// to.
+    /// While `playing`, the list scrolls to each event the cursor reaches,
+    /// unless the pointer is over the panel, so it can be scrolled by hand
+    /// at any speed. The cursor's own moves, as the pointer sweeps the
+    /// plot, leave the list where it is. The time of a clicked row is
+    /// returned, to seek to.
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
@@ -59,7 +72,10 @@ impl EventsPanel {
         settings: &Settings,
         cursor: Option<f64>,
         follow: &mut bool,
+        playing: bool,
     ) -> Option<f64> {
+        // the panel's whole room: nothing is laid out in it yet
+        let pointed_at = ui.rect_contains_pointer(ui.max_rect());
         ui.horizontal(|ui| {
             for (kind, shown) in KINDS.iter().zip(&mut self.shown) {
                 ui.toggle_value(shown, kind_name(*kind));
@@ -71,10 +87,11 @@ impl EventsPanel {
             );
         });
         let filter = Filter::new(&self.filter);
-        let rows: Vec<&Event> = log
+        let rows: Vec<(usize, &Event)> = log
             .events
             .iter()
-            .filter(|e| self.is_shown(e.kind) && filter.matches(&e.text))
+            .enumerate()
+            .filter(|(_, e)| self.is_shown(e.kind) && filter.matches(&e.text))
             .collect();
         if rows.is_empty() {
             ui.weak(if log.events.is_empty() {
@@ -87,16 +104,20 @@ impl EventsPanel {
             });
             // the panel keeps its height: it stores what its content used
             ui.take_available_space();
+            self.highlighted = None;
             return None;
         }
         // the row the cursor has passed most recently
         let current = cursor
-            .map(|c| rows.partition_point(|e| e.time <= c))
+            .map(|c| rows.partition_point(|(_, e)| e.time <= c))
             .and_then(|next| next.checked_sub(1));
+        let highlighted = current.map(|row| rows[row].0);
+        let reached = playing && highlighted != self.highlighted && !pointed_at;
+        self.highlighted = highlighted;
         // a cursor before every row has passed none: the top then. A list
         // dragged too short for a row keeps the follow for when it has room.
         let room = ui.available_height() >= ui.spacing().interact_size.y;
-        let scroll_to = (room && std::mem::take(follow)).then(|| current.unwrap_or(0));
+        let scroll_to = (room && (reached || std::mem::take(follow))).then(|| current.unwrap_or(0));
         let time_base = log.wall_clock(settings.time_axis);
         let error_color = ui.visuals().error_fg_color;
 
@@ -119,7 +140,7 @@ impl EventsPanel {
                     ui.scroll_to_rect(row, None);
                 }
                 for index in range {
-                    let e = rows[index];
+                    let (_, e) = rows[index];
                     let text = format!(
                         "{}  {:<4} {}",
                         timefmt::stamp(time_base, e.time),
@@ -202,6 +223,7 @@ mod tests {
         cursor: Option<f64>,
         /// A seek has moved the cursor, as the app reports it.
         follow: bool,
+        playing: bool,
         seek: Option<f64>,
         /// The top of the list's viewport, where row 0 sits unscrolled.
         top: f32,
@@ -250,6 +272,7 @@ mod tests {
             settings: Settings::default(),
             cursor: None,
             follow: false,
+            playing: false,
             seek: None,
             top: 0.0,
             bottom: 0.0,
@@ -268,6 +291,7 @@ mod tests {
                         &bench.settings,
                         bench.cursor,
                         &mut bench.follow,
+                        bench.playing,
                     );
                     if seek.is_some() {
                         bench.seek = seek;
@@ -331,6 +355,116 @@ mod tests {
         assert!(in_view(&harness, 44));
     }
 
+    /// [`notes`], with an error half a second before each note.
+    fn notes_and_errors() -> LoadedLog {
+        let mut w = LogWriter::new();
+        w.define(1, "MSG", "QZ", &["TimeUS", "Message"]).unwrap();
+        w.define(2, "ERR", "QBB", &["TimeUS", "Subsys", "ECode"])
+            .unwrap();
+        for i in 0..60u64 {
+            w.record(
+                "ERR",
+                &[
+                    Value::U64(1_000_000 * (i + 1) - 500_000),
+                    Value::U64(3),
+                    Value::U64(0),
+                ],
+            )
+            .unwrap();
+            w.record(
+                "MSG",
+                &[
+                    Value::U64(1_000_000 * (i + 1)),
+                    Value::Str(format!("note {i:02}")),
+                ],
+            )
+            .unwrap();
+        }
+        LoadedLog::build(Log::from_source(w.into_bytes().into()), "both.bin".into())
+    }
+
+    #[test]
+    fn while_playing_the_list_keeps_up_with_each_event_reached() {
+        let bench = Bench {
+            panel: EventsPanel::default(),
+            log: notes_and_errors(),
+            settings: Settings::default(),
+            cursor: Some(0.2),
+            follow: false,
+            playing: true,
+            seek: None,
+            top: 0.0,
+            bottom: 0.0,
+        };
+        let mut harness = Harness::builder()
+            .with_size(egui::vec2(600.0, 200.0))
+            .with_max_steps(60)
+            .build_ui_state(
+                |ui, bench: &mut Bench| {
+                    bench.bottom = ui.max_rect().bottom();
+                    bench.panel.show(
+                        ui,
+                        &bench.log,
+                        &bench.settings,
+                        bench.cursor,
+                        &mut bench.follow,
+                        bench.playing,
+                    );
+                },
+                bench,
+            );
+        harness.run();
+        // unscrolled, the first row, an error, marks where the viewport
+        // starts
+        let top = harness
+            .get_all_by_label_contains("ERR ")
+            .map(|node| node.rect().top())
+            .fold(f32::INFINITY, f32::min);
+        harness.state_mut().top = top;
+
+        // playing, the cursor reaching note 44 brings it into view, with
+        // no seek to follow
+        harness.state_mut().cursor = Some(45.2);
+        harness.run();
+        assert!(in_view(&harness, 44));
+
+        // scrolled back to the top by hand, the pointer over the list
+        // holds it there while events pass
+        let middle = egui::pos2(300.0, f32::midpoint(top, harness.state().bottom));
+        harness.hover_at(middle);
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, 10_000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::NONE,
+        });
+        harness.run();
+        assert!(in_view(&harness, 0));
+        harness.state_mut().cursor = Some(50.2);
+        harness.run();
+        assert!(in_view(&harness, 0));
+
+        // with the pointer gone, a toggle that renumbers the rows reaches
+        // no new event, and the list stays
+        harness.event(egui::Event::PointerGone);
+        harness.run();
+        harness.state_mut().panel.shown[1] = false;
+        harness.run();
+        assert!(in_view(&harness, 0));
+
+        // the next event reached brings the list along again
+        harness.state_mut().cursor = Some(51.2);
+        harness.run();
+        assert!(in_view(&harness, 50));
+        assert!(above(&harness, 0));
+
+        // paused, events reached leave the list where it is
+        harness.state_mut().playing = false;
+        harness.state_mut().cursor = Some(10.2);
+        harness.run();
+        assert!(in_view(&harness, 50));
+    }
+
     #[test]
     fn a_list_with_no_room_keeps_the_follow() {
         let bench = Bench {
@@ -339,6 +473,7 @@ mod tests {
             settings: Settings::default(),
             cursor: Some(45.5),
             follow: true,
+            playing: false,
             seek: None,
             top: 0.0,
             bottom: 0.0,
@@ -354,6 +489,7 @@ mod tests {
                         &bench.settings,
                         bench.cursor,
                         &mut bench.follow,
+                        bench.playing,
                     );
                 },
                 bench,

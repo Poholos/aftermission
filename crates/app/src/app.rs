@@ -442,6 +442,7 @@ impl AftermissionApp {
                 self.plot.reload(&log);
                 self.map.reload();
                 self.params.reload();
+                self.events.reload();
                 // an export set up on the log before would write the wrong one
                 self.csv_dialog = None;
                 self.param_dialog = None;
@@ -894,6 +895,7 @@ impl AftermissionApp {
             return;
         };
         let log = &log;
+        let playing = self.playback.is_playing();
         // The map to the right and the events or parameters below share
         // the width and height with the plot, which takes what is left;
         // the transport sits between the plot and the events.
@@ -924,7 +926,9 @@ impl AftermissionApp {
                         BottomTab::Events => {
                             let cursor = self.plot.cursor;
                             let follow = self.plot.follow_mut();
-                            let seek = self.events.show(ui, log, &self.settings, cursor, follow);
+                            let seek =
+                                self.events
+                                    .show(ui, log, &self.settings, cursor, follow, playing);
                             if let Some(time) = seek {
                                 // the clicked row is in view: the list does
                                 // not follow its own click, which would scroll
@@ -944,7 +948,6 @@ impl AftermissionApp {
         egui::Panel::bottom("transport")
             .resizable(false)
             .show(ui, |ui| self.transport_ui(ui, log));
-        let playing = self.playback.is_playing();
         self.plot.show(ui, log, &self.settings, playing);
     }
 

@@ -8,8 +8,8 @@ with [walkers](https://github.com/podusowski/walkers). It is for looking
 at what a vehicle did after the flight, drive or dive: plotting any field
 of any message against time, over the flight modes, with the values under
 the cursor read out, the track on a map, the log's events in a list and
-its parameters in a table, and the data out again as CSV, a `.param` file
-or Parquet.
+its parameters in a table, the whole flight played back across them, and
+the data out again as CSV, a `.param` file or Parquet.
 
 ![The whole window at the demo flight's GPS fault: roll against desired
 roll and altitude over the flight mode bands, the survey track on the
@@ -96,8 +96,10 @@ The tool is early. What works today:
   and Blimp mode tables), the vehicle read from the firmware banner.
 - **The map** draws the vehicle's track from the EKF's `POS` records, or
   from `GPS` when a log has none, over OpenStreetMap tiles, with the
-  plot's cursor marked on it. Hovering the track reads a point's time and
-  altitude; a click seeks the plot to it. The tiles come from
+  plot's cursor marked on it by an arrow along the vehicle's heading: the
+  yaw of the `ATT` records, or the course over the ground in a log
+  without them. Hovering the track reads a point's time and altitude; a
+  click seeks the plot to it. The tiles come from
   `tile.openstreetmap.org` under its [usage
   policy](https://operations.osmfoundation.org/policies/tiles/), cached on
   disk next to the settings; View > Map tiles turns them off, and the
@@ -109,13 +111,24 @@ The tool is early. What works today:
   A click on a row seeks the plot and the map to its time; the row the
   cursor has passed is highlighted, and a seek from the map or a
   parameter change scrolls the list to it, on the next switch to the
-  tab when it was not showing.
+  tab when it was not showing. While the log plays, the list keeps the
+  highlighted row in view, except while the pointer is over it.
 - **Parameters**: a tab beside the events with every `PARM` name, its
   last value, its default where the log records one, and how often it
   changed after boot. A changed parameter unfolds to its history, the boot
   value first; a click on a change seeks the plot and the map to it.
   Toggles narrow the table to parameters off their default or changed
   after boot, and a filter to a name.
+- **Playback**: the bar under the plot plays the log back at 0.25 to 60
+  times its pace, 5 at first, steps a second back or forward (ten with
+  Shift), and scrubs with its slider; Space, Left, Right, `[` and `]` do
+  the same while no field or control has the keyboard. The plot's
+  readout, the map's arrow and the events list's highlight move along
+  with the playhead, and a click on the plot puts the playhead there. A
+  zoomed plot turns to the next page as the playhead nears its edge, and
+  a view moved away from it by hand stays. With Follow on, the map
+  centers on the vehicle as it nears the map's edge, until the map is
+  moved by hand. Playback pauses while an export's window is open.
 - **CSV export** (File > Export) of the series on the plot: one row per
   sample time, one column per series, a cell empty where a series has no
   sample at that time, and nothing interpolated. A `time_s` column in
@@ -141,8 +154,8 @@ The tool is early. What works today:
 - **Closing during an export asks twice** (desktop): the first close while one
   writes is held with a notice, and a second close quits anyway.
 - **Preferences** persist: theme, time axis, mode bands, which panels are
-  open and which tab the bottom one shows, map tiles, the recent files and
-  the export folder.
+  open and which tab the bottom one shows, map tiles, the playback speed
+  and Follow, the recent files and the export folder.
 
 A plot set up on one log carries over when another opens: series the new
 log also has are re-read, the rest are dropped.
