@@ -12,8 +12,9 @@ its parameters in a table, the whole flight played back across them, and
 the data out again as CSV, a `.param` file or Parquet.
 
 ![The whole window at the demo flight's GPS fault: roll against desired
-roll and altitude over the flight mode bands, the survey track on the
-map, and the fault's rows in the events
+roll and altitude over the flight mode bands with the playhead at the
+fault and the playback controls under the plot, the vehicle's arrow on
+the survey track on the map, and the fault's rows in the events
 list](assets/hero/overview.png)
 
 The pictures are of the demo log, which the app generates on the spot:
