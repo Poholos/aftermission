@@ -74,11 +74,10 @@ jobs:
       - name: Clippy for wasm
         run: cargo clippy -p aftermission --target wasm32-unknown-unknown --no-default-features -- -D warnings
       # Trunk.toml leaves the parquet feature out. The Pages site serves
-      # the bundle under the repository's name, case included; a local
-      # trunk serve keeps /. The web-bundle artifact carries the path too:
-      # it runs served from a folder named aftermission, not from its root.
+      # the bundle at the root of its own domain, as a local trunk serve
+      # does; the web-bundle artifact runs served from a server's root.
       - name: Build the release bundle
-        run: trunk build --release --public-url /aftermission/
+        run: trunk build --release
       # The copyright notices and license texts of everything the bundle
       # links, which its MIT and BSD components require to travel with it.
       # The feature is left out here as well: with it, the wasm32 graph
@@ -96,7 +95,10 @@ jobs:
         with:
           path: dist
 
-  # Publishes the web build to https://poholos.github.io/aftermission/.
+  # Publishes the web build to https://aftermission.poholos.com/, a
+  # domain of its own: eframe keeps egui's memory in the browser under
+  # one key per origin, which Slicewise's demo at poholos.github.io
+  # would share. The old address redirects there.
   # The github-pages environment lets main alone deploy; the Pages
   # permissions are this job's, the rest of the workflow reads only.
   deploy:

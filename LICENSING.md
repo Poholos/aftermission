@@ -7,7 +7,7 @@ you run a modified version and let users interact with it over a network,
 for example as a hosted log viewer, you must offer those users the
 corresponding source code.
 
-The web build at <https://poholos.github.io/aftermission/> is Aftermission
+The web build at <https://aftermission.poholos.com/> is Aftermission
 itself, under the same license. It is built from this repository, from the
 commit its About dialog names, so the source it runs is the source here.
 

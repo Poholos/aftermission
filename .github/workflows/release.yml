@@ -147,7 +147,7 @@ jobs:
           # one line per paragraph: a release page breaks lines where the
           # text does
           {
-            echo "Aftermission $version, post-mission review of ArduPilot dataflash logs, for Windows, Linux and macOS. It also runs in the browser, with a demo flight: https://poholos.github.io/aftermission/?demo"
+            echo "Aftermission $version, post-mission review of ArduPilot dataflash logs, for Windows, Linux and macOS. It also runs in the browser, with a demo flight: https://aftermission.poholos.com/?demo"
             echo
             echo "| System | Archive |"
             echo "|---|---|"
