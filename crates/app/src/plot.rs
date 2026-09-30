@@ -4,7 +4,7 @@
 
 use std::ops::RangeInclusive;
 
-use egui::{Align2, Color32, Id, Pos2, Shape, Stroke, pos2};
+use egui::{Align2, Color32, Id, Pos2, Rect, Shape, Stroke, pos2};
 use egui_plot::{
     AxisHints, Corner, GridMark, HPlacement, Legend, Line, Plot, PlotBounds, PlotGeometry,
     PlotItem, PlotItemBase, PlotMemory, PlotPoint, PlotPoints, PlotTransform, Span,
@@ -291,18 +291,20 @@ impl PlotPanel {
         memory.store(ctx, id);
     }
 
-    /// The series chips, the plot and the cursor readout. The readout takes
-    /// a panel at the bottom sized to its lines, and the plot the rest.
-    /// While `playing`, the pointer leaves the cursor alone and a zoomed
-    /// view pages to keep the playhead on screen.
+    /// The series chips, the lane of flight mode names, the plot and the
+    /// cursor readout. The readout takes a panel at the bottom sized to its
+    /// lines, and the plot the rest. While `playing`, the pointer leaves
+    /// the cursor alone and a zoomed view pages to keep the playhead on
+    /// screen.
     pub fn show(&mut self, ui: &mut egui::Ui, log: &LoadedLog, settings: &Settings, playing: bool) {
         self.series_bar(ui);
         egui::Panel::bottom("plot_readout")
             .resizable(false)
             .show_separator_line(false)
             .show(ui, |ui| self.readout_bar(ui, log, settings));
+        let strip = settings.show_modes.then(|| mode_strip(ui));
         let plot_height = ui.available_height().max(120.0);
-        self.plot(ui, log, settings, plot_height, playing);
+        self.plot(ui, log, settings, plot_height, playing, strip);
     }
 
     /// One chip per series: its color, name, axis and a way off the plot.
@@ -349,6 +351,7 @@ impl PlotPanel {
         settings: &Settings,
         height: f32,
         playing: bool,
+        strip: Option<Rect>,
     ) {
         let map = AxisMap::new(&self.selected);
         // A reset rebuilds the plot's memory with nothing hidden and the
@@ -452,10 +455,12 @@ impl PlotPanel {
             }
         });
 
-        // The mode names are painted over the frame rather than as plot
-        // items, so they do not enter the bounds the plot fits its data in.
-        if show_modes {
-            mode_labels(ui, log, &response.transform);
+        // The mode names go in their own lane above the plot, where
+        // neither the legend nor the data covers them, painted rather than
+        // plot items, so they do not enter the bounds the plot fits its
+        // data in.
+        if let Some(strip) = strip {
+            mode_labels(ui, log, &response.transform, strip);
         }
         let found = response.inner;
         self.hover = found.at;
@@ -907,18 +912,43 @@ impl PlotItem for TimeMark {
     }
 }
 
-/// Each visible band's mode name at its top left, a band that starts off
-/// the left edge labeled at the edge, clipped to the plot frame.
-fn mode_labels(ui: &egui::Ui, log: &LoadedLog, transform: &egui_plot::PlotTransform) {
-    let frame = *transform.frame();
-    let painter = ui.painter().with_clip_rect(frame);
+/// The lane above the plot that the flight modes' names go in, a line of
+/// small text high, taken from the top of `ui`'s room.
+fn mode_strip(ui: &mut egui::Ui) -> Rect {
+    let height = egui::TextStyle::Small.resolve(ui.style()).size + 4.0;
+    ui.allocate_space(egui::vec2(ui.available_width(), height))
+        .1
+}
+
+/// Where each visible band's mode name goes in `strip`, the lane above
+/// the plot's frame: over the band's start, or at the frame's left edge
+/// for a band that starts off it.
+fn label_spots<'a>(
+    log: &'a LoadedLog,
+    transform: &PlotTransform,
+    strip: Rect,
+) -> Vec<(Pos2, &'a ModeChange)> {
+    let frame = transform.frame();
+    visible_bands(log, &transform.bounds().range_x())
+        .into_iter()
+        .map(|(mode, _)| {
+            let x = transform
+                .position_from_point_x(mode.time)
+                .max(frame.left() + 2.0);
+            (pos2(x + 2.0, strip.top() + 2.0), mode)
+        })
+        .collect()
+}
+
+/// Each visible band's mode name in `strip`, clipped to the width of the
+/// plot's frame.
+fn mode_labels(ui: &egui::Ui, log: &LoadedLog, transform: &PlotTransform, strip: Rect) {
+    let lane = Rect::from_x_y_ranges(transform.frame().x_range(), strip.y_range());
+    let painter = ui.painter().with_clip_rect(lane);
     let font = egui::TextStyle::Small.resolve(ui.style());
-    for (mode, _) in visible_bands(log, &transform.bounds().range_x()) {
-        let x = transform
-            .position_from_point_x(mode.time)
-            .max(frame.left() + 2.0);
+    for (at, mode) in label_spots(log, transform, strip) {
         painter.text(
-            egui::pos2(x + 2.0, frame.top() + 2.0),
+            at,
             Align2::LEFT_TOP,
             &mode.name,
             font.clone(),
@@ -1625,6 +1655,37 @@ mod tests {
         harness.step();
         assert!(harness.state().hidden.is_empty(), "and after it");
         assert!(harness.state().zoomed_range(&harness.ctx).is_none());
+    }
+
+    /// The mode names sit in a lane of their own above the plot, clear of
+    /// the legend in its top left corner, and the lane goes with the
+    /// bands.
+    #[test]
+    fn the_mode_names_sit_above_the_plot() {
+        let log = LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::bytes()),
+            "test.bin".into(),
+        );
+        let with = Settings::default();
+        let without = Settings {
+            show_modes: false,
+            ..Settings::default()
+        };
+        let frame = |settings: &Settings| *transform(&roll_plot(&log, settings)).frame();
+        let (frame, bare) = (frame(&with), frame(&without));
+        let lane = frame.top() - bare.top();
+        assert!(lane > 10.0, "the lane takes {lane}");
+
+        let transform = transform(&roll_plot(&log, &with));
+        let strip = Rect::from_x_y_ranges(frame.x_range(), frame.top() - lane..=frame.top());
+        let spots = label_spots(&log, &transform, strip);
+        let names: Vec<&str> = spots.iter().map(|(_, m)| m.name.as_str()).collect();
+        // Stabilize began before the view, so it is named at its left edge
+        assert_eq!(names, ["Stabilize", "Loiter"]);
+        assert!(spots.iter().all(|(at, _)| at.y < frame.top()));
+        assert!((spots[0].0.x - (frame.left() + 4.0)).abs() < 1e-3);
+        let loiter = transform.position_from_point_x(2.25) + 2.0;
+        assert!((spots[1].0.x - loiter).abs() < 1e-3);
     }
 
     #[test]
