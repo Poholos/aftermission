@@ -52,8 +52,13 @@ jobs:
       # cargo-about publishes no Intel Mac binary, and its source build
       # needs the cli feature, which binstall's fallback to cargo install
       # leaves out: it builds no binary and reports success. So a source
-      # build there, and elsewhere no fallback.
+      # build there, and elsewhere no fallback. binstall asks the GitHub
+      # API for the release; unauthenticated, the runners' shared address
+      # is rate-limited and the asks come back 403 until binstall gives
+      # up, so it gets the run's token.
       - name: Install cargo-about
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
             cargo install cargo-about --locked --features cli
