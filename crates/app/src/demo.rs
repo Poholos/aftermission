@@ -1,16 +1,22 @@
-//! The demo flight: an invented quadcopter survey of about eight and a
-//! half minutes, written as a log through dflog's writer when asked, so
-//! the repository holds no binary and the page downloads none. Every
-//! value comes from the formulas here and a seeded noise generator;
+//! The demo flights: invented quadcopter surveys of about eight and a
+//! half minutes each, written as logs through dflog's writer when asked,
+//! so the repository holds no binary and the page downloads none.
+//! Every value comes from the formulas here and a seeded noise generator;
 //! nothing was read from a real log.
 //!
-//! The flight, in seconds since boot: the tables and the parameter dump;
-//! GPS acquiring a fix while the copter sits on a field in Grundy County,
-//! Iowa; at 45 s arming in Loiter and a takeoff to 50 m; at 80 s Auto
-//! over six survey legs of 400 m, 40 m apart, in a crosswind, with a
-//! speed change at 250 s and a GPS fault at 300 s; then RTL, Land, and
-//! the disarm. The message types, formats, units and multipliers are
+//! Flight A, the demo, in seconds since boot: the tables and the
+//! parameter dump; GPS acquiring a fix while the copter sits on a field in
+//! Grundy County, Iowa; at 45 s arming in Loiter and a takeoff to 50 m; at
+//! 80 s Auto over six survey legs of 400 m, 40 m apart, in a crosswind,
+//! with a speed change at 250 s and a GPS fault at 300 s; then RTL, Land,
+//! and the disarm. The message types, formats, units and multipliers are
 //! ArduPilot's, so the app reads it as it reads a real log.
+//!
+//! Flight B, which the demo pair compares with it, is a second sortie
+//! from the same field two hours later: armed 12 s sooner after boot, it
+//! flies out to a survey laid 250 m north of A's at the speed A ends on,
+//! in a stronger wind, with no fault, on retuned rate gains and the hover
+//! throttle and ground pressure the autopilot learned since.
 //!
 //! The flight path is integrated with sums, products and square roots
 //! only, which every platform rounds the same way, so the record counts
@@ -27,8 +33,13 @@ use dflog::write::LogWriter;
 
 /// What the opened log is called.
 pub const NAME: &str = "demo.bin";
+/// What the second sortie, flight B, is called: no slot's letter in it,
+/// since a swap opens it as A.
+pub const NAME_SECOND: &str = "demo2.bin";
 /// What the status line says while the log is generated and indexed.
 pub const LABEL: &str = "Generating the demo log";
+/// What it says while the pair is.
+pub const PAIR_LABEL: &str = "Generating the demo pair";
 
 /// Home: a field about 5 km south of Morrison in Grundy County, Iowa,
 /// clear of the airports, towers and wind farms on the sectional chart.
@@ -316,6 +327,8 @@ const PARAMS: [(&str, f64, f64); 107] = [
     ("LOG_BITMASK", 176_126.0, 176_126.0),
     ("LOG_DISARMED", 0.0, 0.0),
     ("LOG_FILE_BUFSIZE", 200.0, 200.0),
+    // this value and those of MOT_THST_HOVER and WPNAV_SPEED stand for
+    // the flight's own, which `Variant::param` gives in their place
     ("MIS_TOTAL", 13.0, 0.0),
     ("MOT_PWM_MIN", 1000.0, 1000.0),
     ("MOT_PWM_MAX", 2000.0, 2000.0),
@@ -323,6 +336,7 @@ const PARAMS: [(&str, f64, f64); 107] = [
     ("MOT_SPIN_MIN", 0.15, 0.15),
     ("MOT_SPIN_MAX", 0.95, 0.95),
     ("MOT_THST_EXPO", 0.65, 0.65),
+    // the flight's: `Variant::param`
     ("MOT_THST_HOVER", HOVER, 0.35),
     ("MOT_HOVER_LEARN", 2.0, 2.0),
     ("PILOT_SPEED_UP", 250.0, 250.0),
@@ -356,15 +370,142 @@ const PARAMS: [(&str, f64, f64); 107] = [
     ("WPNAV_ACCEL", 250.0, 250.0),
     ("WPNAV_ACCEL_Z", 100.0, 100.0),
     ("WPNAV_RADIUS", 200.0, 200.0),
+    // the flight's: `Variant::param`
     ("WPNAV_SPEED", 800.0, 1000.0),
     ("WPNAV_SPEED_DN", 150.0, 150.0),
     ("WPNAV_SPEED_UP", 250.0, 250.0),
 ];
 
-/// The demo log as bytes.
+/// Which of the demo's flights to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flight {
+    /// The demo flight.
+    A,
+    /// The second sortie, which the demo pair compares with the first.
+    B,
+}
+
+impl Flight {
+    /// What the opened log is called.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Flight::A => NAME,
+            Flight::B => NAME_SECOND,
+        }
+    }
+
+    fn variant(self) -> &'static Variant {
+        match self {
+            Flight::A => &VARIANT_A,
+            Flight::B => &VARIANT_B,
+        }
+    }
+}
+
+/// What sets the two flights apart, the knobs the script reads. Flight
+/// A's are the constants it has always had, so its arithmetic, and its
+/// log, stay as they were.
+struct Variant {
+    /// The milliseconds into the GPS week at boot.
+    gps_ms_at_boot: u64,
+    /// Arming, the takeoff and Auto, in ticks; the script from arming on
+    /// runs from them.
+    arm: u64,
+    takeoff: u64,
+    auto: u64,
+    /// The ground station's change of the survey speed, and the GPS
+    /// fault, each where the flight has one.
+    speed_change: Option<u64>,
+    fault: Option<u64>,
+    /// Meters north of home the survey's first leg lies; with `transit`,
+    /// the mission flies there first, as a waypoint of its own.
+    north: f64,
+    transit: bool,
+    /// The speed over the legs from the start, meters per second.
+    cruise: f64,
+    /// The west wind's lean and its two gusts', meters per second squared.
+    wind: [f64; 3],
+    /// The throttle that hovers.
+    hover: f64,
+    /// Values of the parameter dump set apart from A's, besides those
+    /// the knobs above set; see [`Variant::param`].
+    params: &'static [(&'static str, f64)],
+    /// The noise generator's seed.
+    seed: u64,
+}
+
+impl Variant {
+    /// The mission's waypoints, home included.
+    fn waypoints(&self) -> usize {
+        WAYPOINTS + usize::from(self.transit)
+    }
+
+    /// The dump's value for `name` where the flight sets it: the
+    /// mission's items, home, the waypoints and the RTL after them, its
+    /// speed and its hover throttle, as the flight flies them; else where
+    /// `params` sets it apart from A's.
+    fn param(&self, name: &str) -> Option<f64> {
+        match name {
+            "MIS_TOTAL" => return Some((self.waypoints() + 1) as f64),
+            "WPNAV_SPEED" => return Some(self.cruise * 100.0),
+            "MOT_THST_HOVER" => return Some(self.hover),
+            _ => {}
+        }
+        self.params
+            .iter()
+            .find_map(|&(n, value)| (n == name).then_some(value))
+    }
+}
+
+/// The demo flight.
+const VARIANT_A: Variant = Variant {
+    gps_ms_at_boot: GPS_MS_AT_BOOT,
+    arm: T_ARM,
+    takeoff: T_TAKEOFF,
+    auto: T_AUTO,
+    speed_change: Some(T_SPEED),
+    fault: Some(T_FAULT),
+    north: 0.0,
+    transit: false,
+    cruise: 8.0,
+    wind: [0.8, 0.25, 0.15],
+    hover: HOVER,
+    params: &[],
+    seed: 0x9E37_79B9_7F4A_7C15,
+};
+
+/// Flight B's script from arming on runs this much sooner than A's.
+const B_SOONER: u64 = ticks(12.0);
+/// Flight B's hover throttle, learned since A.
+const B_HOVER: f64 = 0.44;
+
+/// The second sortie.
+const VARIANT_B: Variant = Variant {
+    // two hours after A's boot
+    gps_ms_at_boot: GPS_MS_AT_BOOT + 7_200_000,
+    arm: T_ARM - B_SOONER,
+    takeoff: T_TAKEOFF - B_SOONER,
+    auto: T_AUTO - B_SOONER,
+    speed_change: None,
+    fault: None,
+    north: 250.0,
+    transit: true,
+    cruise: 10.0,
+    wind: [1.4, 0.35, 0.25],
+    hover: B_HOVER,
+    params: &[
+        ("ATC_RAT_PIT_P", 0.15),
+        ("ATC_RAT_RLL_P", 0.15),
+        ("BARO1_GND_PRESS", 97_655.0),
+    ],
+    seed: 0xD1B5_4A32_D192_ED03,
+};
+
+/// One of the demo's flights as the bytes of a log.
 #[must_use]
-pub fn bytes() -> Vec<u8> {
-    let mut demo = Demo::new();
+pub fn bytes(flight: Flight) -> Vec<u8> {
+    let mut demo = Demo::new(flight.variant());
     demo.run();
     demo.w.into_bytes()
 }
@@ -374,13 +515,18 @@ const fn ticks(seconds: f64) -> u64 {
     (seconds * 100.0 + 0.5) as u64
 }
 
-/// Waypoint `index` of the survey, meters north and east of home: the
-/// legs run east and back, each 40 m north of the last, starting at home.
-/// Index 0 is home, where the mission starts; it is not flown to.
-fn waypoint(index: usize) -> [f64; 2] {
+/// Waypoint `index` of the flight's mission, meters north and east of
+/// home: the legs run east and back, each 40 m north of the last, the
+/// first `v.north` of home, and with `v.transit` the mission flies to its
+/// start first. Index 0 is home, where the mission starts; it is not
+/// flown to.
+fn waypoint(index: usize, v: &Variant) -> [f64; 2] {
+    let Some(index) = index.checked_sub(usize::from(v.transit)) else {
+        return [0.0, 0.0];
+    };
     let leg = (index / 2) as f64;
     let east = if matches!(index % 4, 1 | 2) { LEG } else { 0.0 };
-    [leg * SPACING, east]
+    [v.north + leg * SPACING, east]
 }
 
 /// Where the flight is, for what the step does.
@@ -405,6 +551,8 @@ enum Phase {
 /// The simulated copter, with the writer it logs to.
 struct Demo {
     w: LogWriter,
+    /// The flight it flies.
+    v: &'static Variant,
     noise: Noise,
     tick: u64,
     phase: Phase,
@@ -443,10 +591,11 @@ struct Demo {
 }
 
 impl Demo {
-    fn new() -> Self {
+    fn new(v: &'static Variant) -> Self {
         Self {
             w: LogWriter::new(),
-            noise: Noise::new(),
+            v,
+            noise: Noise(v.seed),
             tick: 0,
             phase: Phase::Ground,
             pos: [0.0; 3],
@@ -455,7 +604,7 @@ impl Demo {
             vz_acc: 0.0,
             vz_want: 0.0,
             wp: 0,
-            cruise: 8.0,
+            cruise: v.cruise,
             target_alt: 0.0,
             armed: false,
             airborne: false,
@@ -595,6 +744,7 @@ impl Demo {
     /// What the script says happens at this tick, and what follows the
     /// landing.
     fn scheduled(&mut self) {
+        let v = self.v;
         match self.tick {
             0 => {
                 self.tables();
@@ -604,24 +754,24 @@ impl Demo {
             }
             T_PARAMS..T_PARAMS_END => {
                 let (name, value, default) = PARAMS[(self.tick - T_PARAMS) as usize];
-                self.param(name, value, default, 0);
+                self.param(name, v.param(name).unwrap_or(value), default, 0);
             }
             T_BOOT_MODE => self.mode(STABILIZE, REASON_INITIALIZED, 0),
             T_EKF_GPS => self.msg("EKF3 IMU0 is using GPS", 0),
             t if t == T_EKF_GPS + 10 => self.msg("EKF3 IMU1 is using GPS", 0),
             T_ORIGIN => self.msg("EKF3 IMU0 origin set", 0),
             t if t == T_ORIGIN + 5 => self.event(EV_HOME_SET, 0),
-            T_ARM => self.mode(LOITER, REASON_RC, 0),
-            t if t == T_ARM + 20 => self.msg("Arming motors", 0),
-            t if t == T_ARM + 25 => {
+            t if t == v.arm => self.mode(LOITER, REASON_RC, 0),
+            t if t == v.arm + 20 => self.msg("Arming motors", 0),
+            t if t == v.arm + 25 => {
                 self.event(EV_ARMED, 0);
                 self.armed = true;
             }
-            T_TAKEOFF => {
+            t if t == v.takeoff => {
                 self.phase = Phase::Takeoff;
                 self.target_alt = SURVEY_ALT;
             }
-            T_AUTO => {
+            t if t == v.auto => {
                 self.mode(AUTO, REASON_RC, 0);
                 self.event(EV_AUTO_ARMED, 100);
                 // item 0 is home, where the copter is
@@ -630,16 +780,16 @@ impl Demo {
                 self.wp = 1;
             }
             // a set from the ground station is logged twice
-            t if t == T_SPEED || t == T_SPEED + 5 => {
+            t if v.speed_change.is_some_and(|at| t == at || t == at + 5) => {
                 self.param("WPNAV_SPEED", 1000.0, 1000.0, 0);
                 self.cruise = 10.0;
             }
-            T_FAULT => {
+            t if v.fault == Some(t) => {
                 self.error(GPS_SUBSYSTEM, CODE_UNHEALTHY, 0);
                 self.event(EV_LOST_GPS, 100);
                 self.fault = true;
             }
-            t if t == T_FAULT + FAULT_TICKS => {
+            t if v.fault.is_some_and(|at| t == at + FAULT_TICKS) => {
                 self.error(GPS_SUBSYSTEM, CODE_RESOLVED, 0);
                 self.fault = false;
             }
@@ -674,7 +824,7 @@ impl Demo {
             }
             Phase::Survey | Phase::Return => {
                 let target = if self.phase == Phase::Survey {
-                    waypoint(self.wp)
+                    waypoint(self.wp, self.v)
                 } else {
                     [0.0, 0.0]
                 };
@@ -731,10 +881,11 @@ impl Demo {
         }
         self.wp += 1;
         // the mission's items: home, the waypoints, then RTL
-        if self.wp < WAYPOINTS {
+        let waypoints = self.v.waypoints();
+        if self.wp < waypoints {
             self.msg(&format!("Mission: {} WP", self.wp), 300);
         } else {
-            self.msg(&format!("Mission: {WAYPOINTS} RTL"), 300);
+            self.msg(&format!("Mission: {waypoints} RTL"), 300);
             self.mode(RTL, REASON_MISSION_END, 400);
             self.phase = Phase::Return;
         }
@@ -788,8 +939,9 @@ impl Demo {
     fn attitude(&mut self) {
         let t = self.secs();
         // a wind from the west, gusting a little: the copter leans into it
+        let [wind, slow_gust, quick_gust] = self.v.wind;
         let lean_east = if self.flying() {
-            -0.8 - 0.25 * (t / 7.3).sin() - 0.15 * (t / 2.9).sin()
+            -wind - slow_gust * (t / 7.3).sin() - quick_gust * (t / 2.9).sin()
         } else {
             0.0
         };
@@ -827,7 +979,7 @@ impl Demo {
         } else if !self.flying() {
             SPIN_ARM
         } else {
-            (HOVER * (G + self.vz_acc) / G / self.tilt()).clamp(0.1, 0.9)
+            (self.v.hover * (G + self.vz_acc) / G / self.tilt()).clamp(0.1, 0.9)
         };
         self.current = if !self.armed {
             0.8
@@ -1003,7 +1155,7 @@ impl Demo {
                 Value::F64(if flying { 0.5 } else { 0.0 }),
                 Value::F64(boost),
                 Value::F64(self.throttle),
-                Value::F64(HOVER),
+                Value::F64(self.v.hover),
                 Value::F64(self.target_alt.max(0.0)),
                 Value::F64(self.pos[2]),
                 Value::F64(self.baro_alt()),
@@ -1084,7 +1236,7 @@ impl Demo {
         };
         let fixed = status >= 3;
         let (week, week_ms) = if fixed {
-            (GPS_WEEK, GPS_MS_AT_BOOT + self.tick * 10)
+            (GPS_WEEK, self.v.gps_ms_at_boot + self.tick * 10)
         } else {
             (0, 0)
         };
@@ -1197,14 +1349,11 @@ fn course(from: [f64; 3], to: [f64; 2]) -> f64 {
         .rem_euclid(360.0)
 }
 
-/// A seeded xorshift generator: the same noise on every run.
+/// A seeded xorshift generator: the same noise on every run. The seed
+/// must not be zero.
 struct Noise(u64);
 
 impl Noise {
-    fn new() -> Self {
-        Self(0x9E37_79B9_7F4A_7C15)
-    }
-
     /// Uniform in 0 to 1.
     fn uniform(&mut self) -> f64 {
         self.0 ^= self.0 >> 12;
@@ -1229,7 +1378,11 @@ mod tests {
     use dflog::Log;
 
     fn loaded() -> LoadedLog {
-        LoadedLog::build(Log::from_source(bytes().into()), NAME.into())
+        flight(Flight::A)
+    }
+
+    fn flight(flight: Flight) -> LoadedLog {
+        LoadedLog::build(Log::from_source(bytes(flight).into()), flight.name().into())
     }
 
     fn close(a: f64, b: f64) -> bool {
@@ -1238,14 +1391,16 @@ mod tests {
 
     #[test]
     fn the_demo_is_the_same_log_every_time() {
-        let first = bytes();
-        let again = bytes();
-        assert!(first.iter().eq(again.iter()), "the bytes differ");
-        assert!(
-            (2_000_000..3_500_000).contains(&first.len()),
-            "{} bytes",
-            first.len()
-        );
+        for flight in [Flight::A, Flight::B] {
+            let first = bytes(flight);
+            let again = bytes(flight);
+            assert!(first.iter().eq(again.iter()), "the bytes differ");
+            assert!(
+                (2_000_000..3_500_000).contains(&first.len()),
+                "{} bytes",
+                first.len()
+            );
+        }
     }
 
     #[test]
@@ -1259,7 +1414,7 @@ mod tests {
 
     #[test]
     fn the_survey_folds_back_on_itself() {
-        let points: Vec<[f64; 2]> = (0..WAYPOINTS).map(waypoint).collect();
+        let points: Vec<[f64; 2]> = (0..WAYPOINTS).map(|i| waypoint(i, &VARIANT_A)).collect();
         let expected = [[0.0, 0.0], [0.0, 400.0], [40.0, 400.0], [40.0, 0.0]];
         for (point, want) in points.iter().zip(expected) {
             assert!(
@@ -1272,6 +1427,16 @@ mod tests {
         assert!(close(course([0.0; 3], [0.0, 400.0]), 90.0));
         assert!(close(course([40.0, 400.0, 50.0], [40.0, 0.0]), 270.0));
         assert_eq!(ticks(250.0), 25_000);
+
+        // flight B flies out to the same survey 250 m north, then flies it
+        let b: Vec<[f64; 2]> = (0..VARIANT_B.waypoints())
+            .map(|i| waypoint(i, &VARIANT_B))
+            .collect();
+        assert_eq!(b.len(), WAYPOINTS + 1);
+        assert!(close(b[0][0], 0.0) && close(b[0][1], 0.0), "home");
+        for (b, a) in b[1..].iter().zip(&points) {
+            assert!(close(b[0], a[0] + 250.0) && close(b[1], a[1]), "{b:?}");
+        }
     }
 
     #[test]
@@ -1414,11 +1579,11 @@ mod tests {
         let speed = log.params.iter().find(|p| p.name == "WPNAV_SPEED").unwrap();
         assert!(close(speed.initial.into(), 800.0));
         assert_eq!(speed.default, Some(1000.0));
-        assert_eq!(speed.off_default(), Some(false), "set to the default");
+        assert_eq!(speed.off_default(None), Some(false), "set to the default");
         let off_default = log
             .params
             .iter()
-            .filter(|p| p.off_default() == Some(true))
+            .filter(|p| p.off_default(None) == Some(true))
             .count();
         assert_eq!(off_default, 16);
         let no_default = log.params.iter().filter(|p| p.default.is_none()).count();
@@ -1508,5 +1673,133 @@ mod tests {
         assert!(motor.iter().any(|&pwm| pwm > 1350.0));
         let unused = series("RCOU", "C5", None).ys;
         assert!(unused.iter().all(|&pwm| close(pwm, 0.0)));
+    }
+
+    /// The mean of `|ATT.Pitch|` while `log` flies Auto.
+    fn auto_pitch(log: &LoadedLog) -> f64 {
+        let pitch = log
+            .series(&SeriesKey {
+                type_name: "ATT".into(),
+                field: "Pitch".into(),
+                instance: None,
+            })
+            .unwrap();
+        let auto = log.modes.iter().find(|m| m.name == "Auto").unwrap().time;
+        let rtl = log.modes.iter().find(|m| m.name == "RTL").unwrap().time;
+        let during: Vec<f64> = pitch
+            .xs
+            .iter()
+            .zip(&pitch.ys)
+            .filter(|(x, _)| (auto..rtl).contains(*x))
+            .map(|(_, y)| y.abs())
+            .collect();
+        during.iter().sum::<f64>() / during.len() as f64
+    }
+
+    #[test]
+    fn flight_b_is_a_second_sortie_beside_the_first() {
+        let a = loaded();
+        let b = flight(Flight::B);
+        assert_eq!(b.vehicle, Vehicle::Copter);
+        let duration = b.duration().unwrap();
+        assert!((480.0..560.0).contains(&duration), "{duration} s");
+
+        // booted two hours after A
+        let boot = |log: &LoadedLog| {
+            let base = log.time_base.unwrap();
+            base.gps_start_unix_ms - base.ms_offset
+        };
+        assert_eq!(boot(&b) - boot(&a), 7_200_000);
+
+        // everything from arming on 12 s sooner after boot: the events
+        // list's Armed at 33.25 s, the takeoff and Auto
+        let event = |text: &str| b.events.iter().find(|e| e.text == text).unwrap().time;
+        assert!(close(event("Armed"), 33.25), "{}", event("Armed"));
+        assert!(close(event("Home set"), 22.05), "the boot as A's");
+        let modes: Vec<(&str, f64)> = b.modes.iter().map(|m| (m.name.as_str(), m.time)).collect();
+        assert_eq!(modes[1].0, "Loiter");
+        assert!(
+            close(modes[1].1, 33.0) && close(modes[2].1, 68.0),
+            "{modes:?}"
+        );
+        // the takeoff's climb as A's: half a meter a hundred steps on
+        let not_landed = (event("Not landed") * 100.0).round() / 100.0;
+        assert!(close(not_landed, 38.99), "{not_landed}");
+
+        // the survey 250 m north of A's, whose legs end 200 m north: the
+        // tracks share the field and the way home, not the legs
+        let (north_a, north_b) = (
+            a.track.bounds().unwrap().north,
+            b.track.bounds().unwrap().north,
+        );
+        let meters = (north_b - north_a) * M_PER_DEG;
+        assert!((245.0..255.0).contains(&meters), "{meters} m");
+        assert!(b.track.bounds().unwrap().south >= HOME_LAT - 0.0001);
+        let mission = b
+            .events
+            .iter()
+            .filter(|e| e.text.starts_with("Mission:"))
+            .count();
+        assert_eq!(mission, WAYPOINTS + 1, "the flight out is an item");
+
+        // at 10 m/s from the start, with no change and no fault
+        assert!(b.events.iter().all(|e| e.kind != EventKind::Error));
+        assert!(b.events.iter().all(|e| e.kind != EventKind::Param));
+        let speed = b
+            .series(&SeriesKey {
+                type_name: "GPS".into(),
+                field: "Spd".into(),
+                instance: None,
+            })
+            .unwrap();
+        let peak = speed.ys.iter().fold(0.0f64, |peak, &y| peak.max(y));
+        assert!((peak - 10.0).abs() < 0.3, "{peak}");
+        let param = |name: &str| b.params.iter().find(|p| p.name == name).unwrap();
+        assert!(close(param("WPNAV_SPEED").initial.into(), 1000.0));
+        assert!(param("WPNAV_SPEED").changes.is_empty());
+
+        // its hover throttle drives the throttle, and is logged as the
+        // parameter and in CTUN alike
+        let hover = param("MOT_THST_HOVER").last();
+        assert_eq!(hover.to_bits(), (B_HOVER as f32).to_bits());
+        let logged = b
+            .series(&SeriesKey {
+                type_name: "CTUN".into(),
+                field: "ThH".into(),
+                instance: None,
+            })
+            .unwrap();
+        assert!(logged.ys.iter().all(|&y| close(y, f64::from(hover))));
+
+        // the stronger wind leans it harder into the legs, degrees more
+        // on the whole of Auto, its flight out north, wind in roll, included
+        let (pitch_a, pitch_b) = (auto_pitch(&a), auto_pitch(&b));
+        assert!(pitch_b > pitch_a + 1.5, "{pitch_a} and {pitch_b}");
+
+        // the dump as A's but for what the variant sets apart
+        let differ: Vec<&str> = a
+            .params
+            .iter()
+            .zip(&b.params)
+            .filter(|(pa, pb)| {
+                assert_eq!(pa.name, pb.name);
+                pa.initial.to_bits() != pb.initial.to_bits()
+            })
+            .map(|(pa, _)| pa.name.as_str())
+            .collect();
+        // the retuned gains and the ground pressure, and what the transit,
+        // the speed and the hover throttle set
+        assert_eq!(
+            differ,
+            [
+                "ATC_RAT_PIT_P",
+                "ATC_RAT_RLL_P",
+                "BARO1_GND_PRESS",
+                "MIS_TOTAL",
+                "MOT_THST_HOVER",
+                "WPNAV_SPEED"
+            ]
+        );
+        assert!(close(param("MIS_TOTAL").initial.into(), 14.0));
     }
 }

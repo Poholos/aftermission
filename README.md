@@ -8,8 +8,9 @@ with [walkers](https://github.com/podusowski/walkers). It is for looking
 at what a vehicle did after the flight, drive or dive: plotting any field
 of any message against time, over the flight modes, with the values under
 the cursor read out, the track on a map, the log's events in a list and
-its parameters in a table, the whole flight played back across them, and
-the data out again as CSV, a `.param` file or Parquet.
+its parameters in a table, the whole flight played back across them, a
+second flight compared beside it, and the data out again as CSV, a
+`.param` file or Parquet.
 
 ![The whole window at the demo flight's GPS fault: roll against desired
 roll and altitude over the flight mode bands with the playhead at the
@@ -24,13 +25,26 @@ station and its GPS fail for two seconds on the way, and returns to
 land, eight and a half minutes in all. Every value in it is invented,
 the date included. File > Open demo log opens it, as do the Demo button
 of the empty window and `?demo` on the web page's address: [the demo
-in the browser](https://aftermission.poholos.com/?demo). Map tiles
-© [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors.
+in the browser](https://aftermission.poholos.com/?demo). File > Open demo
+pair opens it beside a second sortie from the same field two hours later,
+flown on retuned gains in a stronger wind, to try comparing two logs: [the
+pair in the browser](https://aftermission.poholos.com/?compare). Map
+tiles © [OpenStreetMap](https://www.openstreetmap.org/copyright)
+contributors.
 
 | | |
 |---|---|
 | ![The ground speed over the flight above the parameter table, filtered to WPNAV, with WPNAV_SPEED unfolded to its change](assets/hero/parameters.png) | ![The plot alone, zoomed on one turn of the survey: roll against desired roll with the legend and the readout](assets/hero/survey-turn.png) |
 | The speed parameter unfolded to its history; a click on its change put the cursor there, where the ground speed rises from 8 to 10 m/s. | One turn of the survey zoomed in: the roll the controller asked for against the roll flown, read out at the cursor. |
+
+![The demo pair compared: the pitch of both flights lined up at arming,
+the second one's line lighter, over the four parameters whose values
+differ between them](assets/hero/compare.png)
+
+The demo pair compared: both flights' pitch lined up at arming, the second
+sortie's lighter line leaning further into its stronger wind, read out
+with the difference at the cursor, over the four parameters whose values
+differ between the two.
 
 ## Downloads
 
@@ -74,7 +88,8 @@ The tool is early. What works today:
   the command line. The file is mapped and indexed on a worker thread, so
   the window stays live; the last eight logs are kept under File > Open
   recent. File > Open demo log opens the demo flight above, to try the
-  tool without a log at hand.
+  tool without a log at hand. The items that open a log wait while
+  another is being indexed or an export written.
 - **The side panel** lists every message type in the log with its record
   count, and unfolds each to its fields, labeled with the units the log's
   own `UNIT`, `MULT` and `FMTU` records give them (`Roll (deg)`,
@@ -113,13 +128,34 @@ The tool is early. What works today:
   cursor has passed is highlighted, and a seek from the map or a
   parameter change scrolls the list to it, on the next switch to the
   tab when it was not showing. While the log plays, the list keeps the
-  highlighted row in view, except while the pointer is over it.
+  highlighted row in view; once you scroll it yourself, it stays put
+  until the pointer leaves it; on a touch screen, until the next seek or
+  a tap outside it.
 - **Parameters**: a tab beside the events with every `PARM` name, its
   last value, its default where the log records one, and how often it
   changed after boot. A changed parameter unfolds to its history, the boot
   value first; a click on a change seeks the plot and the map to it.
   Toggles narrow the table to parameters off their default or changed
   after boot, and a filter to a name.
+- **Comparing two logs**: File > Compare with… opens a second log, B,
+  beside the one under review, A, named in a row above the plot with a
+  button that closes it and one that swaps the two; two files dropped
+  on the window together open as A and B (desktop). Every series on the
+  plot draws B's samples too, in its color but lighter, lined up with
+  A's at arming, at the start, by UTC, or by an offset set by hand, and
+  the readout gives B's value and the difference from A's. Opening
+  another log as A closes B, so the two on screen are always a pair
+  chosen together.
+- **B in the other panels**: the parameter table shows B's values beside
+  A's, and Differences narrows it to the parameters both logs have whose
+  values differ at boot or at the end, with the values the autopilot
+  learns by itself from flight to flight, such as the hover throttle, and
+  the names only one log has, each added by a toggle of its own. What B
+  logs and A does not, a newer firmware's messages and fields, is listed
+  under A's types as Only in B, to plot from B alone. The map draws B's
+  track beside A's in a lighter orange with a marker of its own, the
+  events list can take B's events in at their places, and a second lane
+  names B's flight modes.
 - **Playback**: the bar under the plot plays the log back at 0.25 to 60
   times its pace, 5 at first, steps a second back or forward (ten with
   Shift), and scrubs with its slider; Space, Left, Right, `[` and `]` do
@@ -156,7 +192,8 @@ The tool is early. What works today:
   writes is held with a notice, and a second close quits anyway.
 - **Preferences** persist: theme, time axis, mode bands, which panels are
   open and which tab the bottom one shows, map tiles, the playback speed
-  and Follow, the recent files and the export folder.
+  and Follow, how a second log lines up with the first, the recent files
+  and the export folder.
 
 A plot set up on one log carries over when another opens: series the new
 log also has are re-read, the rest are dropped.
@@ -174,6 +211,8 @@ page. What differs there:
   uploaded anywhere. The page holds while a log is indexed, longer for a
   large one, with the status line saying so first. There is no
   list of recent files, since the browser gives no path to open again.
+  Of two files dropped together, the first opens; File > Compare with…
+  opens a second log beside it.
 - **Exports download.** CSV and `.param` files go to the browser's
   downloads folder, or wherever it asks, and replace nothing: the browser
   names a second one of the same name itself. The export runs to its end
@@ -185,15 +224,20 @@ page. What differs there:
 - **Memory.** While a log is read, the browser holds it twice, once as
   the file it read and once in the app's memory, and the app's model on
   top; a wasm program's memory tops out at 4 GB. Logs of a few hundred
-  megabytes are the practical ceiling in a page. The desktop app maps
-  the file instead of reading it and builds the same model, so it is
-  bounded by the machine's memory rather than by wasm's 4 GB.
+  megabytes are the practical ceiling in a page, for all the logs open
+  together: two while comparing, and three while one of them is being
+  replaced. The desktop app maps the file instead of reading it and
+  builds the same model, so it is bounded by the machine's memory rather
+  than by wasm's 4 GB.
 - **`?webgl`** on the page's address makes the app draw through WebGL 2
   instead of WebGPU, for a browser whose WebGPU draws wrong.
 - **`?demo`** on the page's address opens the demo flight as the page
   loads; File > Open demo log opens it later, and the empty page has a
   Demo button.
   The page holds for a moment while the flight is generated and indexed.
+- **`?compare`** opens the demo pair instead, the two flights side by
+  side, and wins over `?demo`; File > Open demo pair opens it later. The
+  page holds about twice as long, for two flights.
 
 ## Building and running
 

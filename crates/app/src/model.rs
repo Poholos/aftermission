@@ -5,6 +5,7 @@
 //! series are extracted from it on demand.
 
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dflog::columns::{self, ColumnError};
 use dflog::time::TimeBase;
@@ -96,6 +97,50 @@ impl MessageType {
     pub fn field(&self, label: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.label == label)
     }
+
+    /// This type's key for the field `key` names, `key` being this log's
+    /// or the other log's of a pair: the same key where this type has it,
+    /// else that of instance 0 for a type one log logs as one instance and
+    /// the other as several, or the other way round, which stand for each
+    /// other. None where the field is no number here, or neither instance
+    /// is logged. The one place the rule lives: [`key_in`],
+    /// [`LoadedLog::has_series`] and the list of what only B logs all
+    /// come here.
+    #[must_use]
+    pub fn key_for(&self, key: &SeriesKey) -> Option<SeriesKey> {
+        if !self.field(&key.field).is_some_and(|f| f.numeric) {
+            return None;
+        }
+        let logged = |instance: Option<i64>| match instance {
+            Some(instance) => self.instances.contains(&instance),
+            None => self.instances.is_empty(),
+        };
+        let instance = if logged(key.instance) {
+            key.instance
+        } else {
+            let other = match key.instance {
+                None => Some(0),
+                Some(0) => None,
+                Some(_) => return None,
+            };
+            if !logged(other) {
+                return None;
+            }
+            other
+        };
+        Some(SeriesKey {
+            instance,
+            ..key.clone()
+        })
+    }
+}
+
+/// `log`'s key for the field `key` names in the other log of the pair;
+/// see [`MessageType::key_for`]. None where `log` has no type of that
+/// name. B's side of a series is found by it, and on a swap A's.
+#[must_use]
+pub fn key_in(log: &LoadedLog, key: &SeriesKey) -> Option<SeriesKey> {
+    log.type_named(&key.type_name)?.key_for(key)
 }
 
 /// A flight mode the vehicle entered.
@@ -227,10 +272,16 @@ impl TimedColumns {
     }
 }
 
+/// The id the next log built takes.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A scanned log with everything the panels show derived from it.
 #[derive(Debug)]
 pub struct LoadedLog {
     log: Log,
+    /// Unique to this log among those built, so what a panel keeps for one
+    /// log, as the map its points on screen, is never taken for another's.
+    pub id: u64,
     /// The file's name, for titles.
     pub name: String,
     /// Sorted by name; only types the log holds records of.
@@ -242,6 +293,8 @@ pub struct LoadedLog {
     /// The earliest and the latest of the timeline's times, found once.
     time_range: Option<(f64, f64)>,
     pub time_base: Option<TimeBase>,
+    /// Seconds since boot of the first arming; see [`first_arming`].
+    pub armed: Option<f64>,
     /// In log order, consecutive repeats of a mode merged.
     pub modes: Vec<ModeChange>,
     pub vehicle: Vehicle,
@@ -323,15 +376,18 @@ impl LoadedLog {
             .unwrap_or_default();
         let modes = mode_changes(&log, &timeline, vehicle);
         let params = params::read(&log, &timeline);
+        let armed = first_arming(&log, &timeline);
 
         let time_range = extent(timeline.iter().copied().filter(|t| t.is_finite()));
         let mut loaded = LoadedLog {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name,
             types,
             params,
             timeline,
             time_range,
             time_base: log.time_base(),
+            armed,
             modes,
             vehicle,
             stats: log.stats,
@@ -409,6 +465,14 @@ impl LoadedLog {
         }
     }
 
+    /// The autopilot's boot on the wall clock, in Unix milliseconds;
+    /// None without a GPS time base.
+    #[must_use]
+    pub fn boot_unix_ms(&self) -> Option<i64> {
+        self.time_base
+            .map(|base| base.gps_start_unix_ms - base.ms_offset)
+    }
+
     /// Seconds from the first record's time to the last one's; None for a
     /// log without a timed record.
     #[must_use]
@@ -451,15 +515,9 @@ impl LoadedLog {
     /// of its instances when it has several.
     #[must_use]
     pub fn has_series(&self, key: &SeriesKey) -> bool {
-        let Some(t) = self.type_named(&key.type_name) else {
-            return false;
-        };
-        let field_ok = t.field(&key.field).is_some_and(|f| f.numeric);
-        let instance_ok = match key.instance {
-            Some(instance) => t.instances.contains(&instance),
-            None => t.instances.is_empty(),
-        };
-        field_ok && instance_ok
+        // the rule's own key, not one standing for it
+        self.type_named(&key.type_name)
+            .is_some_and(|t| t.key_for(key).as_ref() == Some(key))
     }
 
     /// The samples of `key`, in the field's unit against seconds since
@@ -542,6 +600,17 @@ pub fn extent(values: impl IntoIterator<Item = f64>) -> Option<(f64, f64)> {
         .fold(None, |range: Option<(f64, f64)>, y| {
             Some(range.map_or((y, y), |(a, b)| (a.min(y), b.max(y))))
         })
+}
+
+/// [`nearest_index`], only for an `x` within `xs`, from the first to
+/// the last: where a log's samples do not reach, it has no value.
+#[must_use]
+pub fn nearest_within(xs: &[f64], x: f64) -> Option<usize> {
+    let (first, last) = (xs.first()?, xs.last()?);
+    if x < *first || x > *last {
+        return None;
+    }
+    nearest_index(xs, x)
 }
 
 /// The index of the value of `xs`, which are non-decreasing, nearest to
@@ -809,6 +878,20 @@ fn events(log: &LoadedLog) -> Vec<Event> {
     events
 }
 
+/// Seconds since boot of the first arming: the first `EV` record of the
+/// Armed event, id 10, which firmware has logged for many releases, else
+/// the first `ARM` record with `ArmState` 1, which newer firmware logs;
+/// None with neither, or neither timed.
+fn first_arming(log: &Log, timeline: &[f64]) -> Option<f64> {
+    let first = |name: &str, field: &str, value: f64| {
+        log.records_of(&[name])
+            .filter(|record| record.value(field).and_then(|v| v.as_f64()) == Some(value))
+            .map(|record| time_of(timeline, record.lineno))
+            .find(|time| time.is_finite())
+    };
+    first("EV", "Id", 10.0).or_else(|| first("ARM", "ArmState", 1.0))
+}
+
 /// Seconds since boot of the record at `lineno` of the timeline.
 pub(crate) fn time_of(timeline: &[f64], lineno: u64) -> f64 {
     timeline.get(lineno as usize).copied().unwrap_or(f64::NAN)
@@ -945,6 +1028,115 @@ pub(crate) mod testlog {
             &[us(2_250_000), Value::U64(5), Value::U64(5), Value::U64(1)],
         )
         .unwrap();
+        w.into_bytes()
+    }
+
+    /// A log to compare with [`bytes`] as B: `ATT` with a roll of 5 to 8
+    /// from 10.0 to 10.3 s, then 9 after a gap, at 20 s, and no pitch;
+    /// `IMU` logged as one instance; no units, no arming and no GPS.
+    pub fn b_bytes() -> Vec<u8> {
+        let mut w = LogWriter::new();
+        w.define(6, "ATT", "Qc", &["TimeUS", "Roll"]).unwrap();
+        w.define(7, "IMU", "QBf", &["TimeUS", "I", "GyrX"]).unwrap();
+        for (i, t) in [
+            10_000_000u64,
+            10_100_000,
+            10_200_000,
+            10_300_000,
+            20_000_000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            w.record("ATT", &[Value::U64(t), Value::F64(5.0 + i as f64)])
+                .unwrap();
+            w.record("IMU", &[Value::U64(t), Value::U64(0), Value::F64(0.75)])
+                .unwrap();
+        }
+        w.into_bytes()
+    }
+
+    /// A log to compare with [`bytes`] as B that logs what A does not: a
+    /// `VIBE` type A has none of, with a text field among its numbers;
+    /// `ATT` with a `DesRoll` beside A's fields; and `IMU` in three
+    /// instances against A's two. From 12 s, four samples 0.1 s apart.
+    pub fn b_extra_bytes() -> Vec<u8> {
+        let mut w = LogWriter::new();
+        w.define(2, "UNIT", "QbZ", &["TimeUS", "Id", "Label"])
+            .unwrap();
+        w.define(3, "MULT", "Qbd", &["TimeUS", "Id", "Mult"])
+            .unwrap();
+        w.define(
+            4,
+            "FMTU",
+            "QBNN",
+            &["TimeUS", "FmtType", "UnitIds", "MultIds"],
+        )
+        .unwrap();
+        w.define(
+            6,
+            "ATT",
+            "QccCc",
+            &["TimeUS", "Roll", "Pitch", "Yaw", "DesRoll"],
+        )
+        .unwrap();
+        w.define(7, "IMU", "QBfff", &["TimeUS", "I", "GyrX", "GyrY", "GyrZ"])
+            .unwrap();
+        w.define(13, "VIBE", "QfZ", &["TimeUS", "VibeX", "Note"])
+            .unwrap();
+        let start = Value::U64(1_000_000);
+        let id = |c: char| Value::I64(i64::from(c as u8));
+        for (c, name) in [('s', "s"), ('E', "rad/s"), ('#', "instance")] {
+            w.record("UNIT", &[start.clone(), id(c), Value::Str(name.into())])
+                .unwrap();
+        }
+        for (c, factor) in [('-', 0.0), ('F', 1e-6), ('0', 1.0)] {
+            w.record("MULT", &[start.clone(), id(c), Value::F64(factor)])
+                .unwrap();
+        }
+        w.record(
+            "FMTU",
+            &[
+                start,
+                Value::U64(7),
+                Value::Str("s#EEE".into()),
+                Value::Str("F-000".into()),
+            ],
+        )
+        .unwrap();
+        for i in 0..4u64 {
+            let t = Value::U64(12_000_000 + i * 100_000);
+            let step = i as f64;
+            w.record(
+                "ATT",
+                &[
+                    t.clone(),
+                    Value::F64(1.0 + step),
+                    Value::F64(-1.0),
+                    Value::F64(45.0),
+                    Value::F64(1.5 + step),
+                ],
+            )
+            .unwrap();
+            for instance in 0..3u64 {
+                w.record(
+                    "IMU",
+                    &[
+                        t.clone(),
+                        Value::U64(instance),
+                        Value::F64(0.25 * (instance + 1) as f64),
+                        Value::F64(0.0),
+                        Value::F64(0.5),
+                    ],
+                )
+                .unwrap();
+            }
+            w.record(
+                "VIBE",
+                &[t, Value::F64(3.0 + step), Value::Str("calm".into())],
+            )
+            .unwrap();
+        }
         w.into_bytes()
     }
 
@@ -1205,7 +1397,7 @@ mod tests {
             .iter()
             .map(|p| {
                 let times = p.changes.iter().map(|&(time, _)| time).collect();
-                (p.name.as_str(), p.off_default(), times)
+                (p.name.as_str(), p.off_default(None), times)
             })
             .collect();
         assert_eq!(params.len(), 4);
@@ -1557,5 +1749,105 @@ mod tests {
         assert!(log.timeline.iter().all(|t| t.is_nan()));
         assert_eq!(log.duration(), None);
         assert_eq!(log.time_range(), None);
+        assert_eq!(log.armed, None);
+        assert_eq!(log.boot_unix_ms(), None);
+    }
+
+    #[test]
+    fn a_type_finds_its_key_for_another_log_s_by_the_instance_rule() {
+        let key = |instance| SeriesKey {
+            type_name: "IMU".into(),
+            field: "GyrX".into(),
+            instance,
+        };
+        let two = loaded();
+        let one = LoadedLog::build(Log::from_bytes(&testlog::b_bytes()), "b.bin".into());
+        let three = LoadedLog::build(Log::from_bytes(&testlog::b_extra_bytes()), "c.bin".into());
+        let imu = |log: &LoadedLog| log.type_named("IMU").unwrap().clone();
+        assert_eq!(imu(&three).instances, [0, 1, 2]);
+        // the same key, else instance 0 and one instance for each other,
+        // both ways; nothing for another instance or a field not there
+        let cases = [
+            (&two, key(Some(1)), Some(key(Some(1)))),
+            (&two, key(None), Some(key(Some(0)))),
+            (&one, key(Some(0)), Some(key(None))),
+            (&one, key(Some(1)), None),
+            (&three, key(Some(2)), Some(key(Some(2)))),
+            (&two, key(Some(2)), None),
+        ];
+        for (log, asked, found) in cases {
+            assert_eq!(key_in(log, &asked), found, "{asked:?} in {}", log.name);
+            // every key the rule finds is one the log reads a series by,
+            // as the plot's B side and a swap's A side rely on
+            if let Some(key) = found {
+                assert!(log.has_series(&key), "{key:?} in {}", log.name);
+                let series = log.series(&key).unwrap();
+                assert!(!series.xs.is_empty(), "{key:?} in {}", log.name);
+            }
+        }
+        let no_field = SeriesKey {
+            field: "AccX".into(),
+            ..key(Some(0))
+        };
+        assert_eq!(imu(&two).key_for(&no_field), None);
+        // and a field that is no number has no key
+        let note = SeriesKey {
+            type_name: "VIBE".into(),
+            field: "Note".into(),
+            instance: None,
+        };
+        assert_eq!(key_in(&three, &note), None);
+        assert_eq!(key_in(&two, &note), None, "no VIBE in A");
+    }
+
+    #[test]
+    fn the_arming_is_the_first_armed_event_else_the_first_arm_record() {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        // the test log's EV Armed
+        assert_eq!(loaded().armed, Some(2.03));
+
+        // ARM records, as newer firmware logs them, where no EV Armed is:
+        // the first with ArmState 1, not a disarm before it
+        let arm = |events: &[(u64, u64)], arms: &[(u64, u64)]| {
+            let mut w = LogWriter::new();
+            w.define(1, "EV", "QB", &["TimeUS", "Id"]).unwrap();
+            w.define(
+                2,
+                "ARM",
+                "QBIBB",
+                &["TimeUS", "ArmState", "ArmChecks", "Forced", "Method"],
+            )
+            .unwrap();
+            for &(us, id) in events {
+                w.record("EV", &[Value::U64(us), Value::U64(id)]).unwrap();
+            }
+            for &(us, state) in arms {
+                w.record(
+                    "ARM",
+                    &[
+                        Value::U64(us),
+                        Value::U64(state),
+                        Value::U64(0),
+                        Value::U64(0),
+                        Value::U64(0),
+                    ],
+                )
+                .unwrap();
+            }
+            LoadedLog::build(Log::from_bytes(&w.into_bytes()), "arm.bin".into()).armed
+        };
+        assert_eq!(
+            arm(&[(1_000_000, 25)], &[(3_000_000, 0), (4_000_000, 1)]),
+            Some(4.0)
+        );
+        // EV wins where both are
+        assert_eq!(arm(&[(5_000_000, 10)], &[(4_000_000, 1)]), Some(5.0));
+        // neither: a home set and a disarm are no arming
+        assert_eq!(
+            arm(&[(1_000_000, 25), (2_000_000, 11)], &[(3_000_000, 0)]),
+            None
+        );
     }
 }

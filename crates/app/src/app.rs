@@ -1,7 +1,11 @@
 //! The application: menus, the side panel with the log's types, the plot,
 //! the map, the bottom panel with the events list and the parameter
 //! table, the transport that plays the log back, the ways a log gets
-//! opened, and the exports.
+//! opened, a second log compared with it, and the exports.
+//!
+//! The log under review is A. A second log, B, opens beside it through
+//! Compare with…, and closes when a new A lands, so the two on screen are
+//! always a pair chosen together.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::BufWriter;
@@ -14,6 +18,7 @@ use std::sync::Arc;
 
 use egui::{Align2, Color32, Context};
 
+use crate::align::{self, Lineup};
 use crate::csv::{self, Column, Digits, Export};
 #[cfg(any(target_arch = "wasm32", test))]
 use crate::demo;
@@ -29,10 +34,10 @@ use crate::parquetdir;
 use crate::picks::{Outcome, Picks};
 use crate::playback::{self, Playback, Speed, Step};
 use crate::plot::PlotPanel;
-use crate::settings::{BottomTab, Settings, TimeAxis};
+use crate::settings::{Align, BottomTab, Settings, TimeAxis};
 use crate::timefmt;
 use crate::tree;
-use crate::worker::{self, Done, Job, Kind};
+use crate::worker::{self, Done, Job, Kind, Opened, Slot};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -85,11 +90,17 @@ struct Armed {
 /// What an armed scan opens.
 #[cfg(any(target_arch = "wasm32", test))]
 enum Pending {
-    /// A file the browser read.
-    Bytes { name: String, bytes: Vec<u8> },
+    /// A file the browser read, for its slot.
+    Bytes {
+        name: String,
+        bytes: Vec<u8>,
+        slot: Slot,
+    },
     /// The demo flight, generated once the scan starts, so that too runs
     /// under the label rather than in the frame that asked for it.
     Demo,
+    /// The demo pair, both flights generated once the scan starts.
+    Pair,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -97,10 +108,76 @@ impl Pending {
     /// What the status line says while it waits and while it runs.
     fn label(&self) -> String {
         match self {
-            Self::Bytes { name, bytes } => worker::indexing_label(name, Some(bytes.len() as u64)),
+            Self::Bytes { name, bytes, slot } => {
+                worker::indexing_label(name, Some(bytes.len() as u64)) + slot.suffix()
+            }
             Self::Demo => demo::LABEL.to_string(),
+            Self::Pair => demo::PAIR_LABEL.to_string(),
         }
     }
+
+    /// The slot the scan opens into; a pair opens from A.
+    fn slot(&self) -> Slot {
+        match self {
+            Self::Bytes { slot, .. } => *slot,
+            Self::Demo | Self::Pair => Slot::A,
+        }
+    }
+}
+
+/// What the page opens as it starts, as its address asks.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Startup {
+    Nothing,
+    /// The demo flight, for `?demo`.
+    Demo,
+    /// The demo pair, for `?compare`.
+    Pair,
+}
+
+/// Log B, the one compared with the log under review, A, and how it
+/// lines up with A.
+#[derive(Debug)]
+struct LogB {
+    log: Arc<LoadedLog>,
+    /// How B lines up under the alignment chosen: the offset worked out.
+    lineup: Lineup,
+    /// An offset set by hand, in seconds; None follows the lineup. It
+    /// lasts until A or B is replaced or closed.
+    by_hand: Option<f64>,
+}
+
+impl LogB {
+    /// Seconds added to B's times to put them on A's clock.
+    fn offset(&self) -> f64 {
+        self.by_hand.unwrap_or(self.lineup.offset)
+    }
+}
+
+/// What only B logs, worked out once for a pair, by the ids of its two
+/// logs ([`LoadedLog::id`] never repeats), and kept between frames:
+/// owned, since the logs are reached through `Arc`s cloned each frame.
+#[derive(Debug)]
+struct OnlyInB {
+    pair: (u64, u64),
+    types: Vec<tree::OnlyType>,
+}
+
+/// What the user asks of the pair in the row above the plot, applied
+/// once the panels have drawn, so no frame draws half with one pair and
+/// half with another.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PairAction {
+    CloseB,
+    /// Line up the worked-out way chosen, which the settings keep.
+    Align(Align),
+    /// An offset set by hand, in seconds.
+    ByHand(f64),
+    /// Back from an offset set by hand to the one worked out.
+    Reset,
+    /// Review B as A and A as B.
+    Swap,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -147,8 +224,14 @@ struct ParquetDialog {
 #[derive(Debug, Default)]
 pub struct AftermissionApp {
     settings: Settings,
-    /// Shared with an export job that reads the whole log on a worker.
+    /// A, the log under review. Shared with an export job that reads the
+    /// whole log on a worker.
     log: Option<Arc<LoadedLog>>,
+    /// B, the log compared with A, while one is open.
+    log_b: Option<LogB>,
+    /// What only B logs, which the side panel lists under A's types,
+    /// kept for the pair it was worked out for.
+    only_in_b: Option<OnlyInB>,
     /// The one job running: an open or an export.
     job: Option<Job>,
     /// Why the last open failed, until the next one starts.
@@ -197,12 +280,15 @@ impl AftermissionApp {
     }
 
     /// The app with its saved settings; the page has no command line,
-    /// but its address can ask for the demo with `?demo`.
+    /// but its address can ask for the demo with `?demo`, or the demo
+    /// pair with `?compare`.
     #[cfg(target_arch = "wasm32")]
-    pub fn new(cc: &eframe::CreationContext<'_>, open_demo: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
         let mut app = Self::with_settings(cc);
-        if open_demo {
-            app.arm_demo(&cc.egui_ctx);
+        match startup {
+            Startup::Nothing => {}
+            Startup::Demo => app.arm_demo(&cc.egui_ctx),
+            Startup::Pair => app.arm(Pending::Pair, &cc.egui_ctx),
         }
         app
     }
@@ -217,12 +303,36 @@ impl AftermissionApp {
         app
     }
 
-    /// Start opening `path`. The log on screen stays until the new one is
-    /// ready. Refused while a job runs.
+    /// Start opening `path` as A. The logs on screen stay until the new
+    /// one is ready, and B closes when it lands. Refused while a job runs.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_path(&mut self, path: &Path, ctx: &Context) {
         if self.may_start() {
-            self.job = Some(Job::open(path.to_path_buf(), ctx.clone()));
+            self.job = Some(Job::open(path.to_path_buf(), Slot::A, ctx.clone()));
+        }
+    }
+
+    /// Start opening `a` and `b` as a pair, A and B, in one job, as two
+    /// dropped files do: B closes and opens anew with the new A, and a B
+    /// that fails leaves A open alone. Refused while a job runs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_pair(&mut self, a: &Path, b: &Path, ctx: &Context) {
+        if self.may_start() {
+            self.job = Some(Job::open_pair(
+                a.to_path_buf(),
+                b.to_path_buf(),
+                ctx.clone(),
+            ));
+        }
+    }
+
+    /// Start opening `path` as B, beside A, replacing any B before it;
+    /// A stays as it is. Refused while a job runs, and without an A to
+    /// compare it with.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn compare_path(&mut self, path: &Path, ctx: &Context) {
+        if self.log.is_some() && self.may_start() {
+            self.job = Some(Job::open(path.to_path_buf(), Slot::B, ctx.clone()));
         }
     }
 
@@ -249,13 +359,132 @@ impl AftermissionApp {
         self.arm_demo(ctx);
     }
 
+    /// Start opening the demo pair, the demo flight as A and the second
+    /// sortie as B, as the demo is opened.
+    fn open_demo_pair(&mut self, ctx: &Context) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.may_start() {
+            self.job = Some(Job::open_demo_pair(ctx.clone()));
+        }
+        #[cfg(target_arch = "wasm32")]
+        self.arm(Pending::Pair, ctx);
+    }
+
+    /// Close B, as the button above the plot and File > Close B do. Not
+    /// while a job runs or a file is read, as B does not open then either.
+    fn close_b(&mut self, ctx: &Context) {
+        if self.pair_busy().is_none() && self.log_b.take().is_some() {
+            tracing::info!("log B closed");
+            self.b_changed();
+            self.retitle(ctx);
+        }
+    }
+
+    /// What follows B's arrival or departure: each series takes B's side
+    /// or loses it, the events list forgets its highlight, which would
+    /// name another event of this B, the map's view takes in both tracks
+    /// or A's alone again, and the list of what only B logs is worked out
+    /// anew for the pair, or goes.
+    fn b_changed(&mut self) {
+        self.sync_b();
+        self.events.reload();
+        self.map.refit();
+        self.only_in_b = None;
+    }
+
+    /// Seek to a time of A's, or to one of B's moved onto A's clock by
+    /// the offset and kept within A's range, so the playhead never leaves
+    /// A's log: what a click on B's track or on a B event asks.
+    fn seek_to(&mut self, slot: Slot, time: f64) {
+        let time = match slot {
+            Slot::A => time,
+            Slot::B => {
+                let (Some(b), Some(range)) = (&self.log_b, self.time_range()) else {
+                    return;
+                };
+                (time + b.offset()).clamp(*range.start(), *range.end())
+            }
+        };
+        self.plot.seek(time);
+    }
+
+    /// Give the plot B and its offset as they are now, so the readout it
+    /// refreshes before it draws reads them.
+    fn sync_b(&mut self) {
+        let b = self
+            .log_b
+            .as_ref()
+            .map(|b| (Arc::clone(&b.log), b.offset()));
+        self.plot.set_b(b);
+    }
+
+    /// Do what the row above the plot asked, once the panels have drawn.
+    fn apply(&mut self, action: PairAction, ctx: &Context) {
+        match action {
+            PairAction::CloseB => self.close_b(ctx),
+            PairAction::Swap => self.swap(ctx),
+            PairAction::Align(chosen) => {
+                self.settings.align = chosen;
+                if let (Some(a), Some(b)) = (&self.log, &mut self.log_b) {
+                    b.lineup = align::line_up(a, &b.log, chosen);
+                    b.by_hand = None;
+                }
+                self.sync_b();
+            }
+            // a typed inf or NaN is no offset: the field shows the last one
+            PairAction::ByHand(offset) if !offset.is_finite() => {}
+            PairAction::ByHand(offset) => {
+                if let Some(b) = &mut self.log_b {
+                    b.by_hand = Some(offset);
+                }
+                self.sync_b();
+            }
+            PairAction::Reset => {
+                if let Some(b) = &mut self.log_b {
+                    b.by_hand = None;
+                }
+                self.sync_b();
+            }
+        }
+    }
+
+    /// Why B may not open or close now, for the items that wait: while a
+    /// job runs or a file is being read, a B could land in a slot that
+    /// changed meaning under it. None when it may.
+    fn pair_busy(&self) -> Option<&'static str> {
+        #[cfg(any(target_arch = "wasm32", test))]
+        let reading = self.picks.reading().is_some();
+        #[cfg(not(any(target_arch = "wasm32", test)))]
+        let reading = false;
+        if self.running().is_some() {
+            Some(WAIT_JOB)
+        } else if reading {
+            Some("Wait for the file being read")
+        } else {
+            None
+        }
+    }
+
+    /// Name the window after the logs open.
+    fn retitle(&self, ctx: &Context) {
+        if let Some(log) = &self.log {
+            let b = self.log_b.as_ref().map(|b| b.log.name.as_str());
+            set_title(ctx, &window_title(&log.name, b));
+        }
+    }
+
     /// Arm a scan: the job starts two frames on, its label shown from
     /// this frame or the next; see [`Armed`]. Refused while a job runs or
-    /// a scan is armed, as an open by path is.
+    /// a scan is armed, as an open by path is. A scan for A drops any
+    /// file the browser is still reading: it is the newer choice, as a
+    /// newer pick is, and a B would land beside the wrong A.
     #[cfg(any(target_arch = "wasm32", test))]
     fn arm(&mut self, pending: Pending, ctx: &Context) {
         if !self.may_start() {
             return;
+        }
+        if pending.slot() == Slot::A {
+            self.picks.drop_reading();
         }
         self.armed = Some(Armed {
             frames_left: 2,
@@ -315,8 +544,14 @@ impl AftermissionApp {
         // rely on the screen changing.
         ctx.request_repaint();
         match outcome {
-            Outcome::File { name, bytes } => self.arm(Pending::Bytes { name, bytes }, ctx),
-            Outcome::Unreadable { name, dropped } => {
+            Outcome::File { name, bytes, slot } => {
+                self.arm(Pending::Bytes { name, bytes, slot }, ctx);
+            }
+            Outcome::Unreadable {
+                name,
+                dropped,
+                slot,
+            } => {
                 // a dropped folder arrives as an entry with no file behind
                 // it; the chooser takes files only
                 let hint = if dropped {
@@ -324,11 +559,17 @@ impl AftermissionApp {
                 } else {
                     ""
                 };
-                self.error = Some(format!("{name}: the browser could not read it.{hint}"));
-            }
-            Outcome::Refused => {
                 self.error =
-                    Some("The browser did not open the file chooser. Try again.".to_string());
+                    Some(slot.error(&format!("{name}: the browser could not read it.{hint}")));
+            }
+            Outcome::Refused { slot } => {
+                let what = match slot {
+                    Slot::A => "",
+                    Slot::B => " for B",
+                };
+                self.error = Some(format!(
+                    "The browser did not open the file chooser{what}. Try again."
+                ));
             }
         }
     }
@@ -356,8 +597,9 @@ impl AftermissionApp {
             return;
         };
         self.job = Some(match pending {
-            Pending::Bytes { name, bytes } => Job::open_bytes(name, bytes, ctx.clone()),
+            Pending::Bytes { name, bytes, slot } => Job::open_bytes(name, bytes, slot, ctx.clone()),
             Pending::Demo => Job::open_demo(ctx.clone()),
+            Pending::Pair => Job::open_demo_pair(ctx.clone()),
         });
     }
 
@@ -386,6 +628,12 @@ impl AftermissionApp {
     #[cfg(test)]
     pub(crate) fn log(&self) -> Option<&LoadedLog> {
         self.log.as_deref()
+    }
+
+    /// Log B, for tests.
+    #[cfg(test)]
+    pub(crate) fn log_b(&self) -> Option<&LoadedLog> {
+        self.log_b.as_ref().map(|b| &*b.log)
     }
 
     #[cfg(test)]
@@ -431,26 +679,13 @@ impl AftermissionApp {
         // a refusal made while the job ran is over with it
         self.notice = None;
         match result {
-            Ok(Done::Opened { path, log }) => {
-                // only a log that opened from a file is worth offering
-                // again: the browser's have no path, and the demo needs none
-                if let Some(path) = path {
-                    self.settings.remember(&path);
+            Ok(Done::Opened { path, log, b }) => {
+                if kind == Kind::Open(Slot::B) {
+                    self.land_b(Opened { path, log });
+                } else {
+                    self.land_a(path, log, b);
                 }
-                // the log that played is gone
-                self.playback.pause();
-                self.plot.reload(&log);
-                self.map.reload();
-                self.params.reload();
-                self.events.reload();
-                // an export set up on the log before would write the wrong one
-                self.csv_dialog = None;
-                self.param_dialog = None;
-                #[cfg(feature = "parquet")]
-                self.parquet_dialog.take();
-                set_title(ctx, &format!("{} - Aftermission", log.name));
-                tracing::info!(name = %log.name, records = log.records(), "log opened");
-                self.log = Some(Arc::from(log));
+                self.retitle(ctx);
             }
             Ok(Done::Exported { path, summary }) => {
                 tracing::info!(%summary, "export done");
@@ -463,18 +698,120 @@ impl AftermissionApp {
                     error: false,
                 });
             }
-            Err(message) if kind == Kind::Open => {
-                tracing::warn!(%message, "cannot open the log");
-                self.error = Some(message);
-            }
-            Err(message) => {
-                tracing::warn!(%message, "the export failed");
-                self.notice = Some(Notice {
-                    text: message,
-                    error: true,
-                });
-            }
+            Err(message) => match kind {
+                // the logs on screen stay as they were
+                Kind::Open(slot) => {
+                    tracing::warn!(%message, ?slot, "cannot open the log");
+                    self.error = Some(slot.error(&message));
+                }
+                Kind::Export => {
+                    tracing::warn!(%message, "the export failed");
+                    self.notice = Some(Notice {
+                        text: message,
+                        error: true,
+                    });
+                }
+            },
         }
+    }
+
+    /// A new A, opened: every panel starts over on it, and B closes, so
+    /// the two on screen are a pair chosen together. For a pair, its B
+    /// lands beside it, or its error names B.
+    fn land_a(
+        &mut self,
+        path: Option<PathBuf>,
+        log: Box<LoadedLog>,
+        b: Option<Result<Opened, String>>,
+    ) {
+        tracing::info!(name = %log.name, records = log.records(), "log opened");
+        self.start_over();
+        self.plot.reload(&log);
+        self.log = Some(Arc::from(log));
+        self.log_b = None;
+        self.only_in_b = None;
+        match b {
+            Some(Ok(b)) => self.land_b(b),
+            Some(Err(message)) => {
+                tracing::warn!(%message, "cannot open the pair's B");
+                self.error = Some(Slot::B.error(&message));
+            }
+            None => {}
+        }
+        // only a log that opened from a file is worth offering again: the
+        // browser's have no path, and the demo needs none. A's goes last,
+        // at the top of the list.
+        if let Some(path) = path {
+            self.settings.remember(&path);
+        }
+    }
+
+    /// Every panel but the plot starts over on a new A: playback pauses,
+    /// the map fits the tracks again, the events and the parameters forget
+    /// what they held, and an export set up before goes.
+    fn start_over(&mut self) {
+        // the log that played is gone
+        self.playback.pause();
+        self.map.reload();
+        self.params.reload();
+        self.events.reload();
+        // an export set up on the log before would write the wrong one
+        self.csv_dialog = None;
+        self.param_dialog = None;
+        #[cfg(feature = "parquet")]
+        self.parquet_dialog.take();
+    }
+
+    /// B, opened beside A, replacing any B before it, and lined up with A
+    /// the way the settings keep. Nothing else moves: the playhead, the
+    /// view and the series stay as they were, and each series takes B's
+    /// side.
+    fn land_b(&mut self, Opened { path, log }: Opened) {
+        let Some(a) = &self.log else {
+            // nothing opens B without an A to compare it with
+            tracing::warn!(name = %log.name, "a log B with no A; dropped");
+            return;
+        };
+        let lineup = align::line_up(a, &log, self.settings.align);
+        // offered again as any log is, and opened from there as A
+        if let Some(path) = path {
+            self.settings.remember(&path);
+        }
+        tracing::info!(name = %log.name, records = log.records(), "log B opened");
+        self.log_b = Some(LogB {
+            log: Arc::from(log),
+            lineup,
+            by_hand: None,
+        });
+        self.b_changed();
+    }
+
+    /// Review B as A and A as B, as the row's Swap does for a pair that
+    /// came the other way round, as two dropped files can. The other
+    /// panels start over on the new A, as on any new A; the plot keeps its
+    /// series and its moment in view, and an offset set by hand stays with
+    /// the pair, turned round, so a second swap undoes the first. Not
+    /// while a job runs or a file is read, as B does not open or close
+    /// then either.
+    fn swap(&mut self, ctx: &Context) {
+        if self.pair_busy().is_some() {
+            return;
+        }
+        let (Some(a), Some(b)) = (&self.log, &self.log_b) else {
+            return;
+        };
+        let (a, b, by_hand) = (Arc::clone(a), Arc::clone(&b.log), b.by_hand);
+        tracing::info!(a = %b.name, b = %a.name, "logs A and B swapped");
+        let pair = LogB {
+            lineup: align::line_up(&b, &a, self.settings.align),
+            log: a,
+            by_hand: by_hand.map(|offset| -offset),
+        };
+        self.start_over();
+        self.plot.swap(&b, Arc::clone(&pair.log), pair.offset());
+        self.log = Some(b);
+        self.log_b = Some(pair);
+        self.retitle(ctx);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -486,28 +823,40 @@ impl AftermissionApp {
                 .map(|f| f.path().to_path_buf())
                 .collect()
         });
-        // Several files dropped at once: the first opens, as one log is shown.
-        if let Some(path) = dropped.first() {
-            self.open_path(path, ctx);
+        // two files dropped at once open as a pair, the first as A and the
+        // second as B; more than two, the first two
+        match dropped.as_slice() {
+            [] => {}
+            [a] => self.open_path(a, ctx),
+            [a, b, ..] => self.open_pair(a, b, ctx),
         }
     }
 
     /// A drop in the browser is a file to read, not a path: the first
-    /// dropped file becomes a numbered pick, read in the background.
+    /// dropped file becomes a numbered pick for A, read in the background.
     #[cfg(target_arch = "wasm32")]
     fn handle_drop(&mut self, ctx: &Context) {
         let first = ctx.input(|i| i.raw.dropped_files.first().cloned());
         if let Some(handle) = first {
-            let (pick, tx) = self.picks.start();
+            let (pick, tx) = self.picks.start(Slot::A);
             crate::picks::read_dropped(pick, handle, tx, ctx.clone());
         }
     }
 
     fn shortcuts(&mut self, ctx: &Context) {
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+        if self.open_key(ctx) {
             self.open_dialog(ctx);
         }
         self.transport_keys(ctx);
+    }
+
+    /// Whether Ctrl+O asks for the open dialog: pressed, and no job runs,
+    /// as File > Open waits, since a job on a large log runs for minutes
+    /// and a choice refused after its dialog is lost. The key is taken
+    /// either way.
+    fn open_key(&self, ctx: &Context) -> bool {
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O))
+            && self.running().is_none()
     }
 
     /// Space plays and pauses, Left and Right step a second back and
@@ -641,7 +990,26 @@ impl AftermissionApp {
     /// arrives through [`Self::poll_picks`].
     #[cfg(target_arch = "wasm32")]
     fn open_dialog(&mut self, ctx: &Context) {
-        let (pick, tx) = self.picks.start();
+        let (pick, tx) = self.picks.start(Slot::A);
+        crate::picks::pick_file(pick, &tx, ctx);
+    }
+
+    /// Ask for the log to open as B.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn compare_dialog(&mut self, ctx: &Context) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Compare with")
+            .add_filter("Dataflash log", &["bin", "BIN"])
+            .pick_file();
+        if let Some(path) = picked {
+            self.compare_path(&path, ctx);
+        }
+    }
+
+    /// The browser's file chooser for B, as a numbered pick.
+    #[cfg(target_arch = "wasm32")]
+    fn compare_dialog(&mut self, ctx: &Context) {
+        let (pick, tx) = self.picks.start(Slot::B);
         crate::picks::pick_file(pick, &tx, ctx);
     }
 
@@ -686,20 +1054,54 @@ impl AftermissionApp {
     }
 
     fn file_menu(&mut self, ui: &mut egui::Ui) {
+        // Nothing opens while a job runs: the job would refuse it after the
+        // dialog, with the choice lost. B waits for a file being read too.
+        let idle = self.running().is_none();
+        let pair_busy = self.pair_busy();
+        let has_log = self.log.is_some();
         ui.menu_button("File", |ui| {
-            if ui.button("Open\u{2026}").clicked() {
+            if ui
+                .add_enabled(idle, egui::Button::new("Open\u{2026}"))
+                .on_disabled_hover_text(WAIT_JOB)
+                .clicked()
+            {
                 ui.close();
                 self.open_dialog(ui.ctx());
             }
-            if ui.button("Open demo log").clicked() {
+            if ui
+                .add_enabled(
+                    has_log && pair_busy.is_none(),
+                    egui::Button::new("Compare with\u{2026}"),
+                )
+                .on_hover_text("Open a second log as B, beside this one")
+                .on_disabled_hover_text(pair_busy.unwrap_or("Open a log first"))
+                .clicked()
+            {
+                ui.close();
+                self.compare_dialog(ui.ctx());
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new("Open demo log"))
+                .on_disabled_hover_text(WAIT_JOB)
+                .clicked()
+            {
                 ui.close();
                 self.open_demo(ui.ctx());
+            }
+            if ui
+                .add_enabled(idle, egui::Button::new("Open demo pair"))
+                .on_hover_text("The demo flight as A, and a second sortie as B to compare it with")
+                .on_disabled_hover_text(WAIT_JOB)
+                .clicked()
+            {
+                ui.close();
+                self.open_demo_pair(ui.ctx());
             }
             // the browser has no path to offer again
             #[cfg(not(target_arch = "wasm32"))]
             let recent = self.settings.recent.clone();
             #[cfg(not(target_arch = "wasm32"))]
-            ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.add_enabled_ui(!recent.is_empty() && idle, |ui| {
                 ui.menu_button("Open recent", |ui| {
                     for path in &recent {
                         if ui.button(path.display().to_string()).clicked() {
@@ -714,52 +1116,17 @@ impl AftermissionApp {
                     }
                 });
             });
+            if self.log_b.is_some()
+                && ui
+                    .add_enabled(pair_busy.is_none(), egui::Button::new("Close B"))
+                    .on_disabled_hover_text(pair_busy.unwrap_or_default())
+                    .clicked()
+            {
+                ui.close();
+                self.close_b(ui.ctx());
+            }
             ui.separator();
-            // not while a job runs: the export would be refused after the
-            // save dialog, with the chosen path lost
-            let plotted = self.log.is_some() && self.plot.showing().next().is_some();
-            let has_params = self.log.as_ref().is_some_and(|l| !l.params.is_empty());
-            #[cfg(feature = "parquet")]
-            let has_records = self.log.as_ref().is_some_and(|l| l.parquet_counts().1 > 0);
-            let idle = self.running().is_none();
-            let has_log = self.log.is_some();
-            let why = |reason| disabled_reason(idle, has_log, reason);
-            ui.menu_button("Export", |ui| {
-                if ui
-                    .add_enabled(
-                        plotted && idle,
-                        egui::Button::new("Plotted series as CSV\u{2026}"),
-                    )
-                    .on_disabled_hover_text(why("Plot a series first"))
-                    .clicked()
-                {
-                    ui.close();
-                    self.csv_dialog = Some(CsvDialog::default());
-                }
-                if ui
-                    .add_enabled(
-                        has_params && idle,
-                        egui::Button::new("Parameters as .param\u{2026}"),
-                    )
-                    .on_disabled_hover_text(why("The log has no parameters"))
-                    .clicked()
-                {
-                    ui.close();
-                    self.param_dialog = Some(ParamDialog::default());
-                }
-                #[cfg(feature = "parquet")]
-                if ui
-                    .add_enabled(
-                        has_records && idle,
-                        egui::Button::new("Whole log as Parquet\u{2026}"),
-                    )
-                    .on_disabled_hover_text(why("The log has no records"))
-                    .clicked()
-                {
-                    ui.close();
-                    self.parquet_dialog = Some(ParquetDialog::default());
-                }
-            });
+            self.export_menu(ui, idle);
             // a page has no window to close
             #[cfg(not(target_arch = "wasm32"))]
             {
@@ -767,6 +1134,64 @@ impl AftermissionApp {
                 if ui.button("Quit").clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
+            }
+        });
+    }
+
+    /// Why the CSV export has nothing to write: B's lines alone are
+    /// plotted, which no export writes, or no line of A's shows.
+    fn unplotted(&self) -> &'static str {
+        if self.plot.selected.is_empty() || self.plot.has_a_series() {
+            "Plot a series first"
+        } else {
+            "B's lines are not exported"
+        }
+    }
+
+    /// The exports of A, none while a job runs: the export would be
+    /// refused after the save dialog, with the chosen path lost.
+    fn export_menu(&mut self, ui: &mut egui::Ui, idle: bool) {
+        let plotted = self.log.is_some() && self.plot.showing().next().is_some();
+        let unplotted = self.unplotted();
+        let has_params = self.log.as_ref().is_some_and(|l| !l.params.is_empty());
+        #[cfg(feature = "parquet")]
+        let has_records = self.log.as_ref().is_some_and(|l| l.parquet_counts().1 > 0);
+        let has_log = self.log.is_some();
+        let why = |reason| disabled_reason(idle, has_log, reason);
+        ui.menu_button("Export", |ui| {
+            if ui
+                .add_enabled(
+                    plotted && idle,
+                    egui::Button::new("Plotted series as CSV\u{2026}"),
+                )
+                .on_disabled_hover_text(why(unplotted))
+                .clicked()
+            {
+                ui.close();
+                self.csv_dialog = Some(CsvDialog::default());
+            }
+            if ui
+                .add_enabled(
+                    has_params && idle,
+                    egui::Button::new("Parameters as .param\u{2026}"),
+                )
+                .on_disabled_hover_text(why("The log has no parameters"))
+                .clicked()
+            {
+                ui.close();
+                self.param_dialog = Some(ParamDialog::default());
+            }
+            #[cfg(feature = "parquet")]
+            if ui
+                .add_enabled(
+                    has_records && idle,
+                    egui::Button::new("Whole log as Parquet\u{2026}"),
+                )
+                .on_disabled_hover_text(why("The log has no records"))
+                .clicked()
+            {
+                ui.close();
+                self.parquet_dialog = Some(ParquetDialog::default());
             }
         });
     }
@@ -827,9 +1252,9 @@ impl AftermissionApp {
             ui.label(format!("{label}\u{2026}"));
         }
         #[cfg(any(target_arch = "wasm32", test))]
-        if let Some(name) = self.picks.reading() {
+        if let Some((name, slot)) = self.picks.reading() {
             ui.spinner();
-            ui.label(format!("Reading {name}\u{2026}"));
+            ui.label(format!("Reading {name}{}\u{2026}", slot.suffix()));
         }
         if let Some(notice) = &self.notice {
             if notice.error {
@@ -840,7 +1265,25 @@ impl AftermissionApp {
         }
     }
 
+    /// Keep the list of what only B logs for the pair on screen: worked
+    /// out when the pair's ids are not those it was worked out for, as
+    /// after a swap, a new B or a new A, and gone with B.
+    fn keep_only_in_b(&mut self) {
+        let (Some(a), Some(b)) = (&self.log, &self.log_b) else {
+            self.only_in_b = None;
+            return;
+        };
+        let pair = (a.id, b.log.id);
+        if self.only_in_b.as_ref().is_none_or(|kept| kept.pair != pair) {
+            self.only_in_b = Some(OnlyInB {
+                pair,
+                types: tree::only_in(&b.log, a),
+            });
+        }
+    }
+
     fn side_ui(&mut self, ui: &mut egui::Ui) {
+        self.keep_only_in_b();
         if let Some(error) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, error);
             ui.separator();
@@ -870,23 +1313,35 @@ impl AftermissionApp {
             None
         };
         self.filter_was_active = filtering;
-        tree::types(ui, log, &mut self.plot, &filter, open);
+        let shown = tree::types(ui, log, &mut self.plot, &filter, open);
+        let shown_b = self.only_in_b.as_ref().map_or(0, |only| {
+            tree::b_types(ui, &only.types, &mut self.plot, &filter, open)
+        });
+        if shown + shown_b == 0 {
+            ui.weak("Nothing matches the filter.");
+        }
     }
 
     fn central_ui(&mut self, ui: &mut egui::Ui) {
         // a handle of its own, so the transport can play and seek while
         // the panels read the log
         let Some(log) = self.log.clone() else {
+            let idle = self.running().is_none();
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.3);
                 ui.heading("Open a log to review");
                 ui.label("Drop an ArduPilot .bin file here, press Ctrl+O, or try the demo.");
-                if ui.button("Open\u{2026}").clicked() {
+                if ui
+                    .add_enabled(idle, egui::Button::new("Open\u{2026}"))
+                    .on_disabled_hover_text(WAIT_JOB)
+                    .clicked()
+                {
                     self.open_dialog(ui.ctx());
                 }
                 if ui
-                    .button("Demo")
+                    .add_enabled(idle, egui::Button::new("Demo"))
                     .on_hover_text("An invented survey flight, generated here")
+                    .on_disabled_hover_text(WAIT_JOB)
                     .clicked()
                 {
                     self.open_demo(ui.ctx());
@@ -895,6 +1350,12 @@ impl AftermissionApp {
             return;
         };
         let log = &log;
+        let b = self.log_b.as_ref().map(|b| Arc::clone(&b.log));
+        let b = b.as_deref();
+        // B with its offset onto A's clock, for the map and the events
+        let b_moved = b.zip(self.log_b.as_ref().map(LogB::offset));
+        let pair_busy = self.pair_busy();
+        let axis = self.settings.time_axis;
         let playing = self.playback.is_playing();
         // The map to the right and the events or parameters below share
         // the width and height with the plot, which takes what is left;
@@ -904,11 +1365,13 @@ impl AftermissionApp {
                 .default_size(420.0)
                 .show(ui, |ui| {
                     let cursor = self.plot.cursor;
-                    let clock = log.wall_clock(self.settings.time_axis);
                     let online = self.settings.online_tiles;
                     let follow = &mut self.settings.follow_map;
-                    if let Some(time) = self.map.show(ui, log, cursor, clock, online, follow) {
-                        self.plot.seek(time);
+                    if let Some((slot, time)) = self
+                        .map
+                        .show(ui, log, b_moved, cursor, axis, online, follow)
+                    {
+                        self.seek_to(slot, time);
                     }
                 });
         }
@@ -926,19 +1389,25 @@ impl AftermissionApp {
                         BottomTab::Events => {
                             let cursor = self.plot.cursor;
                             let follow = self.plot.follow_mut();
-                            let seek =
-                                self.events
-                                    .show(ui, log, &self.settings, cursor, follow, playing);
-                            if let Some(time) = seek {
+                            let seek = self.events.show(
+                                ui,
+                                log,
+                                b_moved,
+                                &self.settings,
+                                cursor,
+                                follow,
+                                playing,
+                            );
+                            if let Some((slot, time)) = seek {
                                 // the clicked row is in view: the list does
                                 // not follow its own click, which would scroll
                                 // to the last of rows sharing its time
-                                self.plot.seek(time);
+                                self.seek_to(slot, time);
                                 *self.plot.follow_mut() = false;
                             }
                             None
                         }
-                        BottomTab::Parameters => self.params.show(ui, log, &self.settings),
+                        BottomTab::Parameters => self.params.show(ui, log, b, &self.settings),
                     };
                     if let Some(time) = seek {
                         self.plot.seek(time);
@@ -948,7 +1417,14 @@ impl AftermissionApp {
         egui::Panel::bottom("transport")
             .resizable(false)
             .show(ui, |ui| self.transport_ui(ui, log));
+        let action = self
+            .log_b
+            .as_ref()
+            .and_then(|b| pair_row(ui, log, b, pair_busy, axis));
         self.plot.show(ui, log, &self.settings, playing);
+        if let Some(action) = action {
+            self.apply(action, ui.ctx());
+        }
     }
 
     /// The transport: play and pause, a step back and one forward, the
@@ -1059,6 +1535,7 @@ impl AftermissionApp {
         if self.running().is_some() {
             self.csv_dialog = None;
         }
+        let b_open = self.log_b.is_some();
         let (Some(dialog), Some(log)) = (&mut self.csv_dialog, &self.log) else {
             return;
         };
@@ -1082,9 +1559,13 @@ impl AftermissionApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
+                from_a(ui, b_open, log);
                 ui.label("Columns:");
                 for name in &header {
                     ui.monospace(name);
+                }
+                if b_open {
+                    ui.weak("B's lines are left out: the file holds A's series");
                 }
                 ui.add_enabled(
                     zoomed.is_some(),
@@ -1118,6 +1599,7 @@ impl AftermissionApp {
         if self.running().is_some() {
             self.param_dialog = None;
         }
+        let b_open = self.log_b.is_some();
         let (Some(dialog), Some(log)) = (&mut self.param_dialog, &self.log) else {
             return;
         };
@@ -1139,6 +1621,7 @@ impl AftermissionApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
+                from_a(ui, b_open, log);
                 ui.label(format!(
                     "{written} parameters, {changed} changed after boot"
                 ));
@@ -1182,6 +1665,7 @@ impl AftermissionApp {
         if self.running().is_some() {
             self.parquet_dialog = None;
         }
+        let b_open = self.log_b.is_some();
         let (Some(dialog), Some(log)) = (&mut self.parquet_dialog, &self.log) else {
             return;
         };
@@ -1199,6 +1683,7 @@ impl AftermissionApp {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
+                from_a(ui, b_open, log);
                 let (types, records) = log.parquet_counts();
                 ui.label(format!("{types} message types, {records} records"));
                 ui.label(format!(
@@ -1407,9 +1892,11 @@ impl AftermissionApp {
         ));
     }
 
-    /// A shade over the window while a file is being dragged over it.
+    /// A shade over the window while a file is being dragged over it, and
+    /// what dropping it does.
     fn drop_overlay(ctx: &Context) {
-        if ctx.input(|i| i.raw.hovered_files.is_empty()) {
+        let files = ctx.input(|i| i.raw.hovered_files.len());
+        if files == 0 {
             return;
         }
         let rect = ctx.content_rect();
@@ -1421,7 +1908,7 @@ impl AftermissionApp {
         painter.text(
             rect.center(),
             Align2::CENTER_CENTER,
-            "Drop the log to open it",
+            drop_text(files),
             egui::FontId::proportional(24.0),
             Color32::WHITE,
         );
@@ -1451,13 +1938,134 @@ fn csv_export(log: &LoadedLog, plot: &PlotPanel, range: Option<RangeInclusive<f6
     }
 }
 
-/// Name the window after the log.
+/// The row above the plot while B is open: the names of A and B, a
+/// button that closes B and one that swaps the two, which wait while
+/// `busy` says why, and how B
+/// lines up: the alignment, the offset, which a drag sets by hand and a
+/// reset takes back, the two times put together on each log's clock,
+/// what stood in for what was asked, and when the two share no time. What
+/// the user asks is returned, to apply once the panels have drawn.
+fn pair_row(
+    ui: &mut egui::Ui,
+    a: &LoadedLog,
+    b: &LogB,
+    busy: Option<&'static str>,
+    axis: TimeAxis,
+) -> Option<PairAction> {
+    let mut action = None;
+    // wrapped, so long names leave the controls on screen
+    ui.horizontal_wrapped(|ui| {
+        ui.strong("A");
+        ui.label(&a.name);
+        ui.add_space(12.0);
+        ui.strong("B");
+        ui.label(&b.log.name);
+        if ui
+            .add_enabled(busy.is_none(), egui::Button::new("\u{d7}").small())
+            .on_hover_text("Close B")
+            .on_disabled_hover_text(busy.unwrap_or_default())
+            .clicked()
+        {
+            action = Some(PairAction::CloseB);
+        }
+        if ui
+            .add_enabled(busy.is_none(), egui::Button::new("Swap").small())
+            .on_hover_text("Review B as A, and A as B")
+            .on_disabled_hover_text(busy.unwrap_or_default())
+            .clicked()
+        {
+            action = Some(PairAction::Swap);
+        }
+        ui.separator();
+        let by_hand = b.by_hand.is_some();
+        let shown = if by_hand {
+            "By hand"
+        } else {
+            b.lineup.took.label()
+        };
+        egui::ComboBox::from_id_salt("pair_align")
+            .selected_text(shown)
+            .show_ui(ui, |ui| {
+                for align in Align::ALL {
+                    let current = !by_hand && b.lineup.took == align;
+                    if ui.selectable_label(current, align.label()).clicked() {
+                        action = Some(PairAction::Align(align));
+                    }
+                }
+            })
+            .response
+            .on_hover_text("How B lines up with A on the time axis");
+        let mut offset = b.offset();
+        if ui
+            .add(
+                egui::DragValue::new(&mut offset)
+                    .speed(0.1)
+                    .max_decimals(3)
+                    .suffix(" s"),
+            )
+            .on_hover_text("Seconds added to B's times; drag or type to set by hand")
+            .changed()
+        {
+            action = Some(PairAction::ByHand(offset));
+        }
+        if ui
+            .add_enabled(by_hand, egui::Button::new("Reset").small())
+            .on_hover_text("Back to the offset worked out")
+            .clicked()
+        {
+            action = Some(PairAction::Reset);
+        }
+        if let Some((at_a, at_b)) = b.lineup.at.filter(|_| !by_hand) {
+            ui.weak(format!(
+                "A {} with B {}",
+                timefmt::clock(a.wall_clock(axis), at_a, 0.01),
+                timefmt::clock(b.log.wall_clock(axis), at_b, 0.01)
+            ));
+        }
+        if let Some(note) = b.lineup.note.as_deref().filter(|_| !by_hand) {
+            ui.weak(note);
+        }
+        if let Some(apart) = align::apart(a.time_range(), b.log.time_range(), b.offset()) {
+            ui.colored_label(ui.visuals().warn_fg_color, apart);
+        }
+    });
+    action
+}
+
+/// The line an export's window starts with while B is open: the log it
+/// writes is A.
+fn from_a(ui: &mut egui::Ui, b_open: bool, log: &LoadedLog) {
+    if b_open {
+        ui.label(format!("From A: {}", log.name));
+    }
+}
+
+/// What the shade over the window says while `files` are dragged over
+/// it: natively two or more open as a pair; the browser opens the first.
+fn drop_text(files: usize) -> &'static str {
+    if files > 1 && cfg!(not(target_arch = "wasm32")) {
+        "Drop the logs to compare them: the first as A, the second as B"
+    } else {
+        "Drop the log to open it"
+    }
+}
+
+/// The window's title: `flight.bin - Aftermission`, and with B open
+/// `flight.bin vs baseline.bin - Aftermission`.
+fn window_title(a: &str, b: Option<&str>) -> String {
+    match b {
+        Some(b) => format!("{a} vs {b} - Aftermission"),
+        None => format!("{a} - Aftermission"),
+    }
+}
+
+/// Name the window after the logs.
 #[cfg(not(target_arch = "wasm32"))]
 fn set_title(ctx: &Context, title: &str) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
 }
 
-/// Name the tab after the log. eframe's web runner acts on no viewport
+/// Name the tab after the logs. eframe's web runner acts on no viewport
 /// command but the screenshot, and warns about each other one, so the
 /// title goes to the document itself.
 #[cfg(target_arch = "wasm32")]
@@ -1467,11 +2075,14 @@ fn set_title(_ctx: &Context, title: &str) {
     }
 }
 
+/// What an item that waits for a job says while it waits.
+const WAIT_JOB: &str = "Wait for the running job";
+
 /// Why an export item is disabled: a running job comes first, then no log
 /// to export from, then what the item itself lacks.
 fn disabled_reason(idle: bool, has_log: bool, reason: &'static str) -> &'static str {
     if !idle {
-        "Wait for the running job"
+        WAIT_JOB
     } else if !has_log {
         "Open a log first"
     } else {
@@ -2645,6 +3256,7 @@ mod tests {
         app.job = Some(Job::open_bytes(
             "flight.bin".into(),
             crate::model::testlog::bytes(),
+            Slot::A,
             ctx.clone(),
         ));
         assert_eq!(
@@ -2673,11 +3285,11 @@ mod tests {
                 "flight.bin".into(),
             ));
             app.job = Some(Job::run(
-                Kind::Open,
+                Kind::Open(Slot::A),
                 "flight.bin".into(),
                 "Indexing flight.bin".into(),
                 ctx.clone(),
-                move || Ok(Done::Opened { path, log }),
+                move || Ok(Done::Opened { path, log, b: None }),
             ));
             wait(&mut app, &ctx);
             assert_eq!(app.settings.recent, expected);
@@ -2725,6 +3337,904 @@ mod tests {
         assert!(app.error.is_none(), "{:?}", app.error);
         assert_eq!(app.log().unwrap().name, "demo.bin");
         assert!(app.settings.recent.is_empty());
+    }
+
+    /// Open `path` as B in `app` and wait until the job is done.
+    fn compare(app: &mut AftermissionApp, path: &Path) {
+        let ctx = Context::default();
+        app.compare_path(path, &ctx);
+        assert!(app.job.is_some(), "B opens in the background");
+        wait(app, &ctx);
+    }
+
+    #[test]
+    fn the_title_names_a_and_b() {
+        assert_eq!(
+            window_title("flight.bin", None),
+            "flight.bin - Aftermission"
+        );
+        assert_eq!(
+            window_title("flight.bin", Some("baseline.bin")),
+            "flight.bin vs baseline.bin - Aftermission"
+        );
+    }
+
+    #[test]
+    fn compare_with_opens_b_beside_a_and_a_new_a_closes_it() {
+        use crate::model::SeriesKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let a_path = app.settings.recent[0].clone();
+        app.toggle_series(SeriesKey {
+            type_name: "ATT".into(),
+            field: "Roll".into(),
+            instance: None,
+        });
+        // a frame shows the new log whole; a seek sets the playhead
+        with_ui(&mut app, |_| {});
+        app.plot.seek(2.1);
+        assert!(!app.plot().resets_view());
+
+        let baseline = dir.path().join("baseline.bin");
+        std::fs::write(&baseline, crate::model::testlog::bytes()).unwrap();
+        compare(&mut app, &baseline);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        assert_eq!(app.log_b().unwrap().name, "baseline.bin");
+        // A stays as it was: its series, its playhead and its view
+        assert_eq!(app.plot().selected.len(), 1);
+        assert_eq!(app.plot().playhead(), Some(2.1));
+        assert!(!app.plot().resets_view());
+        // B's path is offered again, as any log's is
+        assert_eq!(app.settings.recent, [baseline.clone(), a_path.clone()]);
+        // the row above the plot names B, and the export windows say they
+        // write A
+        app.param_dialog = Some(ParamDialog::default());
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("baseline.bin");
+            let window =
+                harness.get_by_role_and_label(egui::accesskit::Role::Window, "Export parameters");
+            window.get_by_label("From A: flight.bin");
+        });
+        app.param_dialog = None;
+
+        // a second one replaces B, and A stays
+        let other = dir.path().join("other.bin");
+        std::fs::write(&other, crate::model::testlog::bytes()).unwrap();
+        compare(&mut app, &other);
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        assert_eq!(app.log_b().unwrap().name, "other.bin");
+        assert_eq!(app.plot().playhead(), Some(2.1));
+
+        // a B that fails names B, and leaves A and the B before it
+        let gone = dir.path().join("gone.bin");
+        app.compare_path(&gone, &ctx);
+        wait(&mut app, &ctx);
+        let error = app.error.clone().unwrap();
+        assert!(
+            error.starts_with(&format!("B: {}", gone.display())),
+            "{error}"
+        );
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        assert_eq!(app.log_b().unwrap().name, "other.bin");
+        with_ui(&mut app, |harness| {
+            harness.get_by_label(error.as_str());
+        });
+
+        // an A that fails leaves both
+        app.open_path(&gone, &ctx);
+        wait(&mut app, &ctx);
+        let error = app.error.clone().unwrap();
+        assert!(error.starts_with(&gone.display().to_string()), "{error}");
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        assert_eq!(app.log_b().unwrap().name, "other.bin");
+
+        // an A that lands closes B
+        reopen(&mut app, &a_path);
+        assert!(app.log_b().is_none());
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label("other.bin").is_none());
+        });
+    }
+
+    /// The row's alignment box, showing `shown`: a combo box carries its
+    /// text as its value, not its label.
+    /// The row's offset field, the one spin button on screen; being
+    /// edited, a text box, the one with text in it.
+    fn offset_field<'h>(harness: &'h Harness<'_>) -> egui_kittest::Node<'h> {
+        harness
+            .query_by_role(egui::accesskit::Role::SpinButton)
+            .or_else(|| {
+                harness
+                    .get_all_by_role(egui::accesskit::Role::TextInput)
+                    .find(|node| {
+                        node.accesskit_node()
+                            .value()
+                            .is_some_and(|value| !value.is_empty())
+                    })
+            })
+            .expect("the row's offset field")
+    }
+
+    fn align_box<'h>(harness: &'h Harness<'_>, shown: &str) -> egui_kittest::Node<'h> {
+        harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .find(|node| node.accesskit_node().value().as_deref() == Some(shown))
+            .unwrap_or_else(|| panic!("no alignment box showing {shown:?}"))
+    }
+
+    #[test]
+    fn the_row_lines_b_up_and_a_hand_offset_goes_with_the_pair() {
+        use crate::model::SeriesKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let b_path = dir.path().join("b.bin");
+        std::fs::write(&b_path, crate::model::testlog::b_bytes()).unwrap();
+        app.toggle_series(SeriesKey {
+            type_name: "ATT".into(),
+            field: "Roll".into(),
+            instance: None,
+        });
+        compare(&mut app, &b_path);
+        let offset = |app: &AftermissionApp| app.log_b.as_ref().unwrap().offset();
+
+        // at arming, the default: A armed at 2.03 s, and B, with no
+        // arming, lines up at its start, 10 s, which the row names
+        let lineup = &app.log_b.as_ref().unwrap().lineup;
+        assert_eq!(lineup.took, Align::Arming);
+        assert!((offset(&app) + 7.97).abs() < 1e-9, "{}", offset(&app));
+        with_ui(&mut app, |harness| {
+            align_box(harness, "At arming");
+            harness.get_by_label("A 0:02.03 with B 0:10.00");
+            harness.get_by_label("No arming in B; its start stands in");
+        });
+        // the plot reads B on A's clock
+        app.plot.seek(2.1);
+        assert_eq!(app.plot().readout[0].b, Some((10.1, 6.0)));
+
+        // an offset set by hand, which the plot reads at once, and back
+        app.apply(PairAction::ByHand(-8.0), &ctx);
+        assert!((offset(&app) + 8.0).abs() < 1e-9);
+        assert_eq!(app.plot().readout[0].b, Some((10.1, 6.0)));
+        app.apply(PairAction::ByHand(-7.9), &ctx);
+        assert_eq!(app.plot().readout[0].b, Some((10.0, 5.0)));
+        with_ui(&mut app, |harness| {
+            align_box(harness, "By hand");
+            assert!(harness.query_by_label("A 0:02.03 with B 0:10.00").is_none());
+        });
+        // typed into the row's field, the same; a value that is no number
+        // leaves the offset as it was
+        let typed = |app: &mut AftermissionApp, text: &str| {
+            with_ui(app, |harness| {
+                offset_field(harness).click();
+                harness.run();
+                offset_field(harness).type_text(text);
+                harness.run();
+                harness.key_press(egui::Key::Enter);
+                harness.run();
+            });
+        };
+        typed(&mut app, "-8.5");
+        assert!((offset(&app) + 8.5).abs() < 1e-9, "{}", offset(&app));
+        typed(&mut app, "inf");
+        assert!((offset(&app) + 8.5).abs() < 1e-9, "{}", offset(&app));
+        app.apply(PairAction::Reset, &ctx);
+        assert!((offset(&app) + 7.97).abs() < 1e-9);
+
+        // at the start, picked in the box: A's 1 s with B's 10 s, kept in
+        // the settings
+        with_ui(&mut app, |harness| {
+            align_box(harness, "At arming").click();
+            harness.run();
+            harness.get_by_label("At the start").click();
+            harness.run();
+        });
+        assert_eq!(app.settings.align, Align::Start);
+        assert!((offset(&app) + 9.0).abs() < 1e-9, "{}", offset(&app));
+
+        // by UTC cannot hold without GPS time: at arming takes effect, the
+        // row says why, and the choice made stays for the next pair
+        app.apply(PairAction::Align(Align::Utc), &ctx);
+        assert_eq!(app.settings.align, Align::Utc);
+        let lineup = &app.log_b.as_ref().unwrap().lineup;
+        assert_eq!(lineup.took, Align::Arming);
+        assert_eq!(
+            lineup.note.as_deref(),
+            Some(
+                "No GPS time in either log; lined up at arming. No arming in B; its start stands in"
+            )
+        );
+
+        // a typed inf or NaN leaves the offset as it was
+        let before = offset(&app);
+        for typed in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            app.apply(PairAction::ByHand(typed), &ctx);
+            assert_eq!(offset(&app).to_bits(), before.to_bits(), "{typed}");
+        }
+
+        // a hand offset goes when B is replaced
+        app.apply(PairAction::ByHand(3.0), &ctx);
+        compare(&mut app, &b_path);
+        assert_eq!(app.log_b.as_ref().unwrap().by_hand, None);
+        assert!((offset(&app) + 7.97).abs() < 1e-9);
+
+        // the CSV window says B's lines stay out of the file
+        app.csv_dialog = Some(CsvDialog::default());
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("B's lines are left out: the file holds A's series");
+        });
+        app.csv_dialog = None;
+
+        // closing B fits the map to A's track again
+        with_ui(&mut app, |_| {});
+        assert!(!app.map.fits());
+        app.close_b(&ctx);
+        assert!(app.map.fits());
+    }
+
+    #[test]
+    fn swap_reviews_b_as_a_and_a_second_swap_undoes_it() {
+        use crate::model::SeriesKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let b_path = dir.path().join("b.bin");
+        std::fs::write(&b_path, crate::model::testlog::b_bytes()).unwrap();
+        let att = |field: &str| SeriesKey {
+            type_name: "ATT".into(),
+            field: field.into(),
+            instance: None,
+        };
+        // B logs no pitch
+        app.toggle_series(att("Roll"));
+        app.toggle_series(att("Pitch"));
+        compare(&mut app, &b_path);
+        app.apply(PairAction::ByHand(-8.0), &ctx);
+
+        // not while a job runs: B could land in a slot that changed. The
+        // alignment and a hand offset apply meanwhile, and the B that
+        // lands takes the alignment chosen, with no hand offset
+        app.compare_path(&b_path, &ctx);
+        app.apply(PairAction::Swap, &ctx);
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        app.apply(PairAction::Align(Align::Start), &ctx);
+        app.apply(PairAction::ByHand(-3.0), &ctx);
+        wait(&mut app, &ctx);
+        let b = app.log_b.as_ref().unwrap();
+        assert_eq!((b.lineup.took, b.by_hand), (Align::Start, None));
+        app.apply(PairAction::Align(Align::Arming), &ctx);
+
+        app.apply(PairAction::ByHand(-8.0), &ctx);
+        app.plot.seek(2.1);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Swap").click();
+            harness.run();
+        });
+        assert_eq!(app.log().unwrap().name, "b.bin");
+        assert_eq!(app.log_b().unwrap().name, "flight.bin");
+        let b = app.log_b.as_ref().unwrap();
+        assert_eq!(b.by_hand, Some(8.0));
+        // worked out afresh the other way round: A's start, 10 s, with
+        // B's arming at 2.03 s
+        assert!((b.lineup.offset - 7.97).abs() < 1e-9, "{}", b.lineup.offset);
+        assert_eq!(
+            b.lineup.note.as_deref(),
+            Some("No arming in A; its start stands in")
+        );
+        // the plot keeps both series, pitch for B's side alone, and the
+        // playhead stays at the same moment, on the new A's clock
+        assert_eq!(app.plot().selected.len(), 2);
+        assert!(app.plot().selected[1].data.xs.is_empty());
+        assert!(app.plot().selected[1].data_b.is_some());
+        let playhead = app.plot().playhead().unwrap();
+        assert!((playhead - 10.1).abs() < 1e-9, "{playhead}");
+
+        // and back, as it was
+        app.apply(PairAction::Swap, &ctx);
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        assert_eq!(app.log_b.as_ref().unwrap().by_hand, Some(-8.0));
+        assert_eq!(app.plot().selected.len(), 2);
+        assert!(!app.plot().selected[1].data.xs.is_empty());
+        let playhead = app.plot().playhead().unwrap();
+        assert!((playhead - 2.1).abs() < 1e-9, "{playhead}");
+
+        // closing B takes the series only B had along
+        app.apply(PairAction::Swap, &ctx);
+        app.close_b(&ctx);
+        assert_eq!(app.plot().selected.len(), 1);
+    }
+
+    #[test]
+    fn what_only_b_logs_is_listed_under_a_s_types_to_plot_from_b() {
+        use crate::model::SeriesKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let b_path = dir.path().join("extra.bin");
+        std::fs::write(&b_path, crate::model::testlog::b_extra_bytes()).unwrap();
+        compare(&mut app, &b_path);
+        let vibe = SeriesKey {
+            type_name: "VIBE".into(),
+            field: "VibeX".into(),
+            instance: None,
+        };
+
+        // the section, closed, counts ATT, IMU and VIBE; opened, a tick
+        // plots VIBE.VibeX from B, its chip marked B's
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label("VIBE (4)").is_none(), "closed");
+            harness.get_by_label("Only in B (3)").click();
+            harness.run();
+            harness.get_by_label("VIBE (4)").click();
+            harness.run();
+            harness.get_by_label("VibeX").click();
+            harness.run();
+            harness.get_by_label("B VIBE.VibeX");
+        });
+        assert!(app.plot().is_selected_b(&vibe));
+        assert_eq!(app.plot().showing().count(), 0, "B's, no A series");
+        assert_eq!(app.unplotted(), "B's lines are not exported");
+
+        // the list is worked out once for the pair and kept: emptied by
+        // hand, it stays empty over a frame, as nothing works it out again
+        let ids = (app.log().unwrap().id, app.log_b().unwrap().id);
+        let types = |app: &AftermissionApp| app.only_in_b.as_ref().unwrap().types.len();
+        assert_eq!(app.only_in_b.as_ref().unwrap().pair, ids);
+        app.only_in_b.as_mut().unwrap().types.clear();
+        with_ui(&mut app, |_| {});
+        assert_eq!(types(&app), 0, "kept, not worked out again");
+
+        // a swap works it out anew for the pair the other way round, and
+        // swapping back, anew again
+        app.apply(PairAction::Swap, &ctx);
+        with_ui(&mut app, |_| {});
+        assert_eq!(app.only_in_b.as_ref().unwrap().pair, (ids.1, ids.0));
+        assert_ne!(types(&app), 0);
+        app.apply(PairAction::Swap, &ctx);
+        with_ui(&mut app, |_| {});
+        assert_eq!(app.only_in_b.as_ref().unwrap().pair, ids);
+        assert_eq!(types(&app), 3);
+
+        // with a series of A's, the hint is A's (hidden through the
+        // legend, still A's: see the plot's has_a_series)
+        app.toggle_series(SeriesKey {
+            type_name: "ATT".into(),
+            field: "Roll".into(),
+            instance: None,
+        });
+        assert_eq!(app.unplotted(), "Plot a series first");
+
+        // the filter matches B's type names and field names, not units,
+        // and the header counts the types it shows
+        app.filter = "Vibe".into();
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Only in B (1)");
+            harness.get_by_label("VibeX");
+        });
+        app.filter = "rad".into();
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label("Only in B (3)").is_none());
+        });
+        app.filter.clear();
+
+        // a new B, the same file opened again, is another log: only B's
+        // id changes, and the list, emptied by hand, is worked out anew
+        app.only_in_b.as_mut().unwrap().types.clear();
+        compare(&mut app, &b_path);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Only in B (3)");
+        });
+        let new_b = app.log_b().unwrap().id;
+        assert_ne!(new_b, ids.1);
+        assert_eq!(app.only_in_b.as_ref().unwrap().pair, (ids.0, new_b));
+        assert_eq!(types(&app), 3);
+
+        // Close B takes the section and B's series away
+        app.close_b(&ctx);
+        with_ui(&mut app, |harness| {
+            assert!(harness.query_by_label("Only in B (3)").is_none());
+        });
+        assert!(app.only_in_b.is_none());
+        assert!(!app.plot().is_selected_b(&vibe));
+        assert_eq!(app.plot().selected.len(), 1);
+    }
+
+    #[test]
+    fn on_the_utc_axis_each_log_reads_through_its_own_clock() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        app.settings.time_axis = TimeAxis::Utc;
+        app.open_demo_pair(&ctx);
+        wait(&mut app, &ctx);
+        // the armings put together: A's at 14:30:45 and B's two hours on
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("A 14:30:45.25 with B 16:30:33.25");
+        });
+    }
+
+    #[test]
+    fn a_click_on_a_b_event_seeks_to_its_moved_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let baseline = dir.path().join("baseline.bin");
+        std::fs::write(&baseline, crate::model::testlog::bytes()).unwrap();
+        compare(&mut app, &baseline);
+        // the same flight half a second earlier, by hand
+        app.apply(PairAction::ByHand(-0.5), &ctx);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("B's events").click();
+            harness.run();
+            // B's Armed at 2.03 s on its clock, 1.53 s on A's
+            harness
+                .get_by_label_contains("0:01.530  EV   B Armed")
+                .click();
+            harness.run();
+        });
+        let playhead = app.plot().playhead().unwrap();
+        assert!((playhead - 1.53).abs() < 1e-9, "{playhead}");
+        assert!(!*app.plot.follow_mut(), "the list took the seek");
+    }
+
+    #[test]
+    fn a_seek_to_a_time_of_b_moves_by_the_offset_and_stays_in_a() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let b_path = dir.path().join("b.bin");
+        std::fs::write(&b_path, crate::model::testlog::b_bytes()).unwrap();
+        compare(&mut app, &b_path);
+        // at arming: B's 10 s start stands in for its arming, A armed at
+        // 2.03 s, so B's times draw 7.97 s earlier; A's run 1 s to 2.33 s
+        let seeks = [(10.1, 2.13), (20.0, 2.33), (0.0, 1.0)];
+        for (b_time, a_time) in seeks {
+            app.seek_to(Slot::B, b_time);
+            let playhead = app.plot().playhead().unwrap();
+            assert!((playhead - a_time).abs() < 1e-9, "{b_time}: {playhead}");
+        }
+        // A's own times go as they are, as before
+        app.seek_to(Slot::A, 5.0);
+        assert_eq!(app.plot().playhead(), Some(5.0));
+    }
+
+    /// A file dropped on the window, as the desktop hands one over: a
+    /// path.
+    #[derive(Debug)]
+    struct DroppedPath(PathBuf);
+
+    impl egui::DroppedFile for DroppedPath {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    #[test]
+    fn two_dropped_files_open_as_a_and_b_and_three_as_the_first_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, crate::model::testlog::bytes()).unwrap();
+            path
+        };
+        let (a, b, c) = (file("a.bin"), file("b.bin"), file("c.bin"));
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        let drop = |app: &mut AftermissionApp, paths: &[&PathBuf]| {
+            let ctx = Context::default();
+            let input = egui::RawInput {
+                dropped_files: paths
+                    .iter()
+                    .map(|path| Arc::new(DroppedPath((*path).clone())) as egui::DroppedFileHandle)
+                    .collect(),
+                ..egui::RawInput::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.show(ui));
+            output.textures_delta.clear();
+            wait(app, &ctx);
+        };
+        drop(&mut app, &[&a, &b]);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.log().unwrap().name, "a.bin");
+        assert_eq!(app.log_b().unwrap().name, "b.bin");
+        drop(&mut app, &[&c, &a, &b]);
+        assert_eq!(app.log().unwrap().name, "c.bin");
+        assert_eq!(app.log_b().unwrap().name, "a.bin");
+        // one file opens as A and closes B
+        drop(&mut app, &[&b]);
+        assert_eq!(app.log().unwrap().name, "b.bin");
+        assert!(app.log_b().is_none());
+
+        // by the pair's rule: B gone, A opens alone and the error names B;
+        // A gone, nothing changes
+        let gone = dir.path().join("gone.bin");
+        drop(&mut app, &[&a, &gone]);
+        assert_eq!(app.log().unwrap().name, "a.bin");
+        assert!(app.log_b().is_none());
+        assert!(app.error.as_deref().unwrap().starts_with("B: "));
+        drop(&mut app, &[&c, &b]);
+        drop(&mut app, &[&gone, &a]);
+        assert_eq!(app.log().unwrap().name, "c.bin");
+        assert_eq!(app.log_b().unwrap().name, "b.bin");
+        let error = app.error.clone().unwrap();
+        assert!(error.starts_with(&gone.display().to_string()), "{error}");
+
+        // the shade says what a drop of two will do
+        assert_eq!(drop_text(1), "Drop the log to open it");
+        assert_eq!(
+            drop_text(2),
+            "Drop the logs to compare them: the first as A, the second as B"
+        );
+    }
+
+    #[test]
+    fn a_pair_opens_a_and_b_and_one_whose_b_fails_opens_a_alone() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        let model = |name: &str| {
+            Box::new(LoadedLog::build(
+                dflog::Log::from_source(crate::model::testlog::bytes().into()),
+                name.into(),
+            ))
+        };
+        let pair = |b: Result<Opened, String>| {
+            let log = model("a.bin");
+            Job::run(
+                Kind::Open(Slot::A),
+                "a.bin".into(),
+                "Indexing a.bin".into(),
+                ctx.clone(),
+                move || {
+                    Ok(Done::Opened {
+                        path: Some("logs/a.bin".into()),
+                        log,
+                        b: Some(b),
+                    })
+                },
+            )
+        };
+        app.job = Some(pair(Ok(Opened {
+            path: Some("logs/b.bin".into()),
+            log: model("b.bin"),
+        })));
+        wait(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.log().unwrap().name, "a.bin");
+        assert_eq!(app.log_b().unwrap().name, "b.bin");
+        // A tops Open recent, B after it
+        assert_eq!(
+            app.settings.recent,
+            [PathBuf::from("logs/a.bin"), PathBuf::from("logs/b.bin")]
+        );
+
+        // B fails: A opens alone, the B before it goes with the A it was
+        // beside, and the error names B
+        app.job = Some(pair(Err("c.bin: not a log".into())));
+        wait(&mut app, &ctx);
+        assert_eq!(app.log().unwrap().name, "a.bin");
+        assert!(app.log_b().is_none());
+        assert_eq!(app.error.as_deref(), Some("B: c.bin: not a log"));
+    }
+
+    #[test]
+    fn b_and_the_items_that_open_a_wait_while_a_job_runs() {
+        use crate::picks::Picked;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let baseline = dir.path().join("baseline.bin");
+        std::fs::write(&baseline, crate::model::testlog::bytes()).unwrap();
+        compare(&mut app, &baseline);
+
+        // while a job runs, B neither opens nor closes
+        let release = hold_job(&mut app, &ctx, dir.path().join("held.csv"));
+        app.compare_path(&baseline, &ctx);
+        assert_eq!(app.job.as_ref().unwrap().label, "Writing held.csv");
+        assert_eq!(
+            app.notice.as_ref().map(|n| n.text.as_str()),
+            Some("Still busy: Writing held.csv\u{2026}")
+        );
+        app.close_b(&ctx);
+        assert!(app.log_b().is_some());
+        // and the menu's items that open a log, or close B, wait with it
+        let items = [
+            "Open\u{2026}",
+            "Compare with\u{2026}",
+            "Open demo log",
+            "Open demo pair",
+            "Open recent \u{23F5}",
+            "Close B",
+        ];
+        let enabled = |harness: &mut Harness<'_>| -> Vec<bool> {
+            harness.get_by_label("File").click();
+            harness.run_ok();
+            items
+                .iter()
+                .map(|item| !harness.get_by_label(item).accesskit_node().is_disabled())
+                .collect()
+        };
+        let mut harness = harness(&mut app);
+        harness.run_ok();
+        assert!(
+            harness
+                .get_by_label("\u{d7}")
+                .accesskit_node()
+                .is_disabled(),
+            "the row's close button waits"
+        );
+        let busy = enabled(&mut harness);
+        assert!(
+            busy.iter().all(|&on| !on),
+            "none while a job runs: {busy:?}"
+        );
+        drop(harness);
+        release.send(()).unwrap();
+        wait(&mut app, &ctx);
+        with_ui(&mut app, |harness| {
+            let idle = enabled(harness);
+            assert!(idle.iter().all(|&on| on), "all once it is done: {idle:?}");
+        });
+
+        // the row's button closes B, and so does the menu's item, which is
+        // there only while B is open
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("\u{d7}").click();
+            harness.run();
+        });
+        assert!(app.log_b().is_none());
+        compare(&mut app, &baseline);
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("File").click();
+            harness.run();
+            harness.get_by_label("Close B").click();
+            harness.run();
+        });
+        assert!(app.log_b().is_none());
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("File").click();
+            harness.run();
+            assert!(harness.query_by_label("Close B").is_none());
+        });
+
+        // a file being read holds B too, and says why
+        compare(&mut app, &baseline);
+        let (pick, tx) = app.picks.start(Slot::A);
+        tx.send(Picked::Chosen {
+            pick,
+            name: "next.bin".into(),
+        })
+        .unwrap();
+        frame(&mut app, &ctx);
+        assert_eq!(app.pair_busy(), Some("Wait for the file being read"));
+        app.close_b(&ctx);
+        assert!(app.log_b().is_some());
+        // and so does Swap
+        let a_name = app.log().unwrap().name.clone();
+        app.apply(PairAction::Swap, &ctx);
+        assert_eq!(app.log().unwrap().name, a_name);
+        assert_eq!(app.log_b().unwrap().name, "baseline.bin");
+    }
+
+    #[test]
+    fn b_arriving_while_playing_leaves_it_playing() {
+        let dir = tempfile::tempdir().unwrap();
+        let baseline = dir.path().join("baseline.bin");
+        std::fs::write(&baseline, crate::model::testlog::bytes()).unwrap();
+        let mut harness = player(long_flight(dir.path()));
+        harness.key_press(egui::Key::Space);
+        harness.step();
+        assert!(playing(&harness));
+        let ctx = harness.ctx.clone();
+        harness.state_mut().compare_path(&baseline, &ctx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while harness.state().job.is_some() {
+            assert!(std::time::Instant::now() < deadline, "B did not open");
+            harness.step();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(harness.state().log_b().unwrap().name, "baseline.bin");
+        let at = playhead(&harness);
+        harness.step();
+        assert!(playing(&harness), "B's arrival pauses nothing");
+        assert!(playhead(&harness) > at, "and the playhead goes on");
+    }
+
+    #[test]
+    fn ctrl_o_waits_while_a_job_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        // whether a frame with Ctrl+O pressed asks for the dialog
+        let pressed = |app: &mut AftermissionApp| {
+            let input = egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::O,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                }],
+                ..egui::RawInput::default()
+            };
+            let mut asks = false;
+            let mut output = ctx.run_ui(input, |ui| asks = app.open_key(ui.ctx()));
+            output.textures_delta.clear();
+            asks
+        };
+        let release = hold_job(&mut app, &ctx, dir.path().join("held.csv"));
+        assert!(!pressed(&mut app), "not while a job runs");
+        release.send(()).unwrap();
+        wait(&mut app, &ctx);
+        assert!(pressed(&mut app), "once it is done");
+    }
+
+    #[test]
+    fn a_picked_b_opens_beside_a_and_a_new_a_drops_one_being_read() {
+        use crate::picks::Picked;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = opened(dir.path());
+        let ctx = Context::default();
+        let (pick, tx) = app.picks.start(Slot::B);
+        tx.send(Picked::Chosen {
+            pick,
+            name: "baseline.bin".into(),
+        })
+        .unwrap();
+        with_busy_ui(&mut app, |harness| {
+            harness.get_by_label("Reading baseline.bin as B\u{2026}");
+        });
+        let bytes = crate::model::testlog::bytes();
+        tx.send(Picked::File {
+            pick,
+            name: "baseline.bin".into(),
+            bytes: bytes.clone(),
+        })
+        .unwrap();
+        frame(&mut app, &ctx);
+        let label = worker::indexing_label("baseline.bin", Some(bytes.len() as u64)) + " as B";
+        assert_eq!(app.running(), Some(label));
+        frames_until_idle(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.log().unwrap().name, "flight.bin");
+        assert_eq!(app.log_b().unwrap().name, "baseline.bin");
+        assert_eq!(app.settings.recent.len(), 1, "no path to offer again");
+
+        // a B that cannot be read, or a chooser refused, says it was B's
+        let (pick, tx) = app.picks.start(Slot::B);
+        tx.send(Picked::Chosen {
+            pick,
+            name: "photos".into(),
+        })
+        .unwrap();
+        pick_frame(
+            &mut app,
+            Picked::Unreadable {
+                pick,
+                name: "photos".into(),
+                dropped: false,
+            },
+        );
+        assert_eq!(
+            app.error.as_deref(),
+            Some("B: photos: the browser could not read it.")
+        );
+        let (pick, _) = app.picks.start(Slot::B);
+        pick_frame(&mut app, Picked::Refused { pick });
+        assert_eq!(
+            app.error.as_deref(),
+            Some("The browser did not open the file chooser for B. Try again.")
+        );
+        assert_eq!(app.log_b().unwrap().name, "baseline.bin");
+
+        // an A armed while a B is read drops the read, which lands nowhere
+        let (pick, tx) = app.picks.start(Slot::B);
+        tx.send(Picked::Chosen {
+            pick,
+            name: "other.bin".into(),
+        })
+        .unwrap();
+        frame(&mut app, &ctx);
+        assert_eq!(app.picks.reading(), Some(("other.bin", Slot::B)));
+        app.arm_demo(&ctx);
+        assert!(app.picks.reading().is_none());
+        tx.send(Picked::File {
+            pick,
+            name: "other.bin".into(),
+            bytes,
+        })
+        .unwrap();
+        frames_until_idle(&mut app, &ctx);
+        assert_eq!(app.log().unwrap().name, "demo.bin");
+        assert!(app.log_b().is_none());
+        assert!(app.running().is_none());
+
+        // and an A still being read, which the newer demo pair outdates
+        let (pick, tx) = app.picks.start(Slot::A);
+        tx.send(Picked::Chosen {
+            pick,
+            name: "flight.bin".into(),
+        })
+        .unwrap();
+        frame(&mut app, &ctx);
+        app.arm(Pending::Pair, &ctx);
+        assert!(app.picks.reading().is_none());
+        tx.send(Picked::File {
+            pick,
+            name: "flight.bin".into(),
+            bytes: crate::model::testlog::bytes(),
+        })
+        .unwrap();
+        frames_until_idle(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        assert!(app.running().is_none(), "the read opens nothing");
+        assert_eq!(app.log().unwrap().name, "demo.bin");
+        assert_eq!(app.log_b().unwrap().name, "demo2.bin");
+    }
+
+    #[test]
+    fn the_demo_pair_opens_from_the_menu_with_its_differences() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        app.settings.bottom_tab = BottomTab::Parameters;
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("File").click();
+            harness.run();
+            harness.get_by_label("Open demo pair").click();
+            harness.run_ok();
+        });
+        wait(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.log().unwrap().name, "demo.bin");
+        assert_eq!(app.log_b().unwrap().name, "demo2.bin");
+        assert!(app.settings.recent.is_empty(), "no path to offer again");
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("demo2.bin");
+            // the table narrows to the settings apart: the rate gains, the
+            // mission's length, and the survey speed B starts at and A
+            // ends at
+            harness.get_by_label("4 differ");
+            harness.get_by_label("Differences").click();
+            harness.run();
+            for name in ["ATC_RAT_PIT_P", "ATC_RAT_RLL_P", "MIS_TOTAL", "WPNAV_SPEED"] {
+                harness.get_by_label_contains(name);
+            }
+            assert!(harness.query_by_label_contains("FENCE_RADIUS").is_none());
+            // the speed ends at 1000 in both, marked as apart at boot
+            harness.get_by_label("1000 *");
+            // the learned values wait for their toggle
+            harness.get_by_label("In one log only (0)");
+            assert!(harness.query_by_label_contains("MOT_THST_HOVER").is_none());
+            assert!(harness.query_by_label_contains("BARO1_GND_PRESS").is_none());
+            harness.get_by_label("Learned values (2)").click();
+            harness.run();
+            harness.get_by_label_contains("MOT_THST_HOVER");
+            harness.get_by_label_contains("BARO1_GND_PRESS");
+            harness.get_by_label("6 differ");
+            // Differences off takes its additions with it, so the count
+            // is what the toggle shows when turned on again
+            harness.get_by_label("Differences").click();
+            harness.run();
+            assert!(harness.query_by_label("Learned values (2)").is_none());
+            harness.get_by_label("4 differ");
+            harness.get_by_label("Differences").click();
+            harness.run();
+            harness.get_by_label("Learned values (2)");
+            harness.get_by_label("4 differ");
+            assert!(harness.query_by_label_contains("MOT_THST_HOVER").is_none());
+        });
     }
 
     #[test]
@@ -2803,6 +4313,22 @@ mod tests {
         assert!(app.settings.recent.is_empty());
     }
 
+    #[test]
+    fn the_armed_demo_pair_shows_its_label_then_opens_both() {
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        // as the page's `?compare` asks
+        app.arm(Pending::Pair, &ctx);
+        assert_eq!(app.running().as_deref(), Some(demo::PAIR_LABEL));
+        frame(&mut app, &ctx);
+        assert!(app.armed.is_some() && app.job.is_none());
+        frames_until_idle(&mut app, &ctx);
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert_eq!(app.log().unwrap().name, demo::NAME);
+        assert_eq!(app.log_b().unwrap().name, demo::NAME_SECOND);
+    }
+
     /// Run one frame of the app on `ctx`, as the browser would between
     /// presented frames. A kittest harness runs frames until the window is
     /// still when it is built, so a count of frames goes through this
@@ -2831,7 +4357,7 @@ mod tests {
 
     /// Send `message` as a browser callback would and run one frame.
     fn pick_frame(app: &mut AftermissionApp, message: crate::picks::Picked) {
-        let (_, tx) = app.picks.start();
+        let (_, tx) = app.picks.start(Slot::A);
         tx.send(message).unwrap();
         frame(app, &Context::default());
     }
@@ -2841,7 +4367,7 @@ mod tests {
         use crate::picks::Picked;
         let mut app = AftermissionApp::default();
         app.settings.online_tiles = false;
-        let (pick, tx) = app.picks.start();
+        let (pick, tx) = app.picks.start(Slot::A);
         tx.send(Picked::Chosen {
             pick,
             name: "flight.bin".into(),
@@ -2867,7 +4393,7 @@ mod tests {
         // a second choice while the scan is armed is refused, as an open by
         // path is while a job runs; nothing runs on a thread yet, so the
         // refusal cannot race the scan
-        let (late, tx) = app.picks.start();
+        let (late, tx) = app.picks.start(Slot::A);
         tx.send(Picked::Chosen {
             pick: late,
             name: "other.bin".into(),
@@ -2900,7 +4426,7 @@ mod tests {
         use crate::picks::Picked;
         let mut app = AftermissionApp::default();
         app.settings.online_tiles = false;
-        let (pick, tx) = app.picks.start();
+        let (pick, tx) = app.picks.start(Slot::A);
         tx.send(Picked::Chosen {
             pick,
             name: "photos".into(),
@@ -2924,7 +4450,7 @@ mod tests {
         });
 
         // a chosen file that fails gets no advice about folders
-        let (pick, tx) = app.picks.start();
+        let (pick, tx) = app.picks.start(Slot::A);
         tx.send(Picked::Chosen {
             pick,
             name: "flight.bin".into(),
@@ -2946,8 +4472,8 @@ mod tests {
         // a refusal and a read that land together: the refusal shows, and
         // the next frame arms the read
         let ctx = Context::default();
-        let (reading, tx) = app.picks.start();
-        let (refused, _) = app.picks.start();
+        let (reading, tx) = app.picks.start(Slot::A);
+        let (refused, _) = app.picks.start(Slot::A);
         tx.send(Picked::Chosen {
             pick: reading,
             name: "flight.bin".into(),
@@ -2973,7 +4499,7 @@ mod tests {
         app.armed = None;
 
         app.error = None;
-        let (pick, _) = app.picks.start();
+        let (pick, _) = app.picks.start(Slot::A);
         pick_frame(&mut app, Picked::Canceled { pick });
         assert!(app.error.is_none() && app.armed.is_none() && app.job.is_none());
     }
@@ -2983,9 +4509,9 @@ mod tests {
         use crate::picks::Picked;
         let mut app = AftermissionApp::default();
         app.settings.online_tiles = false;
-        let (first, tx) = app.picks.start();
-        let (second, _) = app.picks.start();
-        let (third, _) = app.picks.start();
+        let (first, tx) = app.picks.start(Slot::A);
+        let (second, _) = app.picks.start(Slot::A);
+        let (third, _) = app.picks.start(Slot::A);
         for (pick, name) in [(first, "a.bin"), (second, "b.bin")] {
             tx.send(Picked::Chosen {
                 pick,
@@ -3359,11 +4885,7 @@ mod tests {
     #[test]
     #[ignore = "renders the README pictures; run on demand"]
     fn hero_shots() {
-        let out = std::env::var_os("HERO_DIR").map_or_else(
-            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/hero"),
-            PathBuf::from,
-        );
-        std::fs::create_dir_all(&out).unwrap();
+        let out = hero_dir();
         let ctx = Context::default();
         let mut app = AftermissionApp::default();
         app.settings.time_axis = TimeAxis::Utc;
@@ -3461,6 +4983,96 @@ mod tests {
         harness.state_mut().plot.seek(turn + 2.0);
         harness.run();
         shoot(&mut harness, &out, "survey-turn");
+    }
+
+    /// The README's picture of two logs compared, rendered from the demo
+    /// pair by the real UI, as [`hero_shots`] renders the others and into
+    /// the same folder: the pitch of both flights lined up at arming, B's
+    /// stronger wind leaning it further on the legs, over the parameters
+    /// that differ. The map stays closed, so nothing is downloaded:
+    /// `cargo test --release -p aftermission -- --ignored hero_shot_compare`
+    #[test]
+    #[ignore = "renders a README picture; run on demand"]
+    fn hero_shot_compare() {
+        use crate::model::{SeriesKey, nearest_within};
+
+        let out = hero_dir();
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        let settings = &mut app.settings;
+        settings.time_axis = TimeAxis::Utc;
+        settings.online_tiles = false;
+        settings.side_panel = false;
+        settings.show_map = false;
+        settings.bottom_tab = BottomTab::Parameters;
+        app.open_demo_pair(&ctx);
+        wait(&mut app, &ctx);
+        let pitch = SeriesKey {
+            type_name: "ATT".into(),
+            field: "Pitch".into(),
+            instance: None,
+        };
+        app.toggle_series(pitch.clone());
+        app.params_mut().show_differences();
+        // a moment on a leg flown east by both, each leaning into the wind
+        let (a, b) = (app.log().unwrap(), app.log_b().unwrap());
+        let (a_pitch, b_pitch) = (a.series(&pitch).unwrap(), b.series(&pitch).unwrap());
+        let offset = app.log_b.as_ref().unwrap().offset();
+        let moment = a_pitch
+            .xs
+            .iter()
+            .zip(&a_pitch.ys)
+            .find(|&(&x, &y)| {
+                x > 150.0
+                    && y > 6.0
+                    && nearest_within(&b_pitch.xs, x - offset).is_some_and(|i| b_pitch.ys[i] > 9.0)
+            })
+            .map(|(&x, _)| x)
+            .expect("the flights share an eastbound leg");
+        let mut harness = Harness::builder()
+            .with_pixels_per_point(1.0)
+            .with_max_steps(60)
+            .wgpu()
+            .build_ui_state(|ui, app: &mut AftermissionApp| app.show(ui), app);
+        window(&mut harness, 1440.0, 900.0);
+        drag_bottom_panel(&mut harness, -60.0);
+        PlotPanel::zoom_to(&harness.ctx, moment - 90.0..=moment + 90.0);
+        harness.event(egui::Event::PointerGone);
+        harness.state_mut().plot.seek(moment);
+        harness.run();
+        harness.get_by_label("4 differ");
+        shoot(&mut harness, &out, "compare");
+    }
+
+    /// A pair of logs for a check by hand of what only B logs: the test
+    /// log as `a.bin` and [`testlog::b_extra_bytes`] as `b.bin`, written
+    /// to `target/only-in-b` (or `$PAIR_DIR`), to open as A and compare
+    /// with as B, in the app or the page. Run on demand:
+    /// `cargo test -p aftermission -- --ignored write_only_in_b_pair`
+    ///
+    /// [`testlog::b_extra_bytes`]: crate::model::testlog::b_extra_bytes
+    #[test]
+    #[ignore = "writes a pair of logs for a check by hand; run on demand"]
+    fn write_only_in_b_pair() {
+        let out = std::env::var_os("PAIR_DIR").map_or_else(
+            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/only-in-b"),
+            PathBuf::from,
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("a.bin"), crate::model::testlog::bytes()).unwrap();
+        std::fs::write(out.join("b.bin"), crate::model::testlog::b_extra_bytes()).unwrap();
+        eprintln!("wrote a.bin and b.bin to {}", out.display());
+    }
+
+    /// Where the README's pictures go: `assets/hero/`, or `$HERO_DIR`,
+    /// made when missing.
+    fn hero_dir() -> PathBuf {
+        let out = std::env::var_os("HERO_DIR").map_or_else(
+            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/hero"),
+            PathBuf::from,
+        );
+        std::fs::create_dir_all(&out).unwrap();
+        out
     }
 
     /// The time of the demo's event reading `text`.

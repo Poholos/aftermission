@@ -1,8 +1,12 @@
 //! The plot: the chosen series against time, each on the left or the right
 //! axis, over the flight mode bands, with a readout of every series at the
-//! cursor, and the playhead that playback and every seek move.
+//! cursor, and the playhead that playback and every seek move. While a
+//! second log, B, is open, every series draws B's samples of the field
+//! too, lighter and moved onto A's clock, and the readout reads both.
 
+use std::fmt::Write as _;
 use std::ops::RangeInclusive;
+use std::sync::Arc;
 
 use egui::{Align2, Color32, Id, Pos2, Rect, Shape, Stroke, pos2};
 use egui_plot::{
@@ -10,7 +14,9 @@ use egui_plot::{
     PlotItem, PlotItemBase, PlotMemory, PlotPoint, PlotPoints, PlotTransform, Span,
 };
 
-use crate::model::{LoadedLog, ModeChange, Series, SeriesKey, extent, nearest_index};
+use crate::model::{
+    LoadedLog, ModeChange, Series, SeriesKey, extent, key_in, nearest_index, nearest_within,
+};
 use crate::settings::Settings;
 use crate::timefmt;
 
@@ -34,17 +40,45 @@ impl YAxis {
 #[derive(Debug)]
 pub struct Selected {
     pub key: SeriesKey,
-    /// `IMU[1].GyrX (rad/s)`
+    /// `IMU[1].GyrX (rad/s)`, as A names the field; as B names it for a
+    /// series for B's side alone.
     pub title: String,
     pub axis: YAxis,
     pub color: Color32,
     pub data: Series,
     /// The lowest and highest value, found once; None for an empty series.
     extent: Option<(f64, f64)>,
+    /// The field's unit in A.
+    unit: Option<String>,
+    /// B's samples of the field, on B's clock, while B is open; None where
+    /// B lacks it.
+    pub data_b: Option<Series>,
+    /// B's lowest and highest value over the samples the whole-flight
+    /// view draws; see [`PlotPanel::fit_b_extents`].
+    extent_b: Option<(f64, f64)>,
+    /// The window on B's clock `extent_b` was found over, by its bits;
+    /// None until it is found.
+    extent_b_over: Option<(u64, u64)>,
+    /// The field's unit in B.
+    unit_b: Option<String>,
+    /// Where B's samples are those of another instance, which stands for
+    /// A's: `B's GPS[0].Spd`.
+    b_note: Option<String>,
+    /// The key A's side was read by, which the side panel ticks: the
+    /// series' own, or after a swap that of the instance standing for it
+    /// in the new A (see [`key_in`]). None for a series for B's side
+    /// alone: picked from what only B logs, or kept by a swap whose new A
+    /// lacks the field.
+    a_key: Option<SeriesKey>,
+    /// The key B's side was read by, the mirror of `a_key`, which the side
+    /// panel's list of what only B logs ticks: set with `data_b` and
+    /// cleared with it. None while B is closed or lacks the field.
+    b_key: Option<SeriesKey>,
 }
 
 impl Selected {
     fn new(key: SeriesKey, title: String, axis: YAxis, color: Color32, data: Series) -> Self {
+        let a_key = Some(key.clone());
         Self {
             key,
             title,
@@ -52,23 +86,159 @@ impl Selected {
             color,
             extent: extent(data.ys.iter().copied()),
             data,
+            unit: None,
+            data_b: None,
+            extent_b: None,
+            extent_b_over: None,
+            unit_b: None,
+            b_note: None,
+            a_key,
+            b_key: None,
         }
+    }
+
+    /// Whether A lacks the field, and the series stands for B's side
+    /// alone, which it goes with.
+    fn only_b(&self) -> bool {
+        self.a_key.is_none()
     }
 
     fn replace_data(&mut self, data: Series) {
         self.extent = extent(data.ys.iter().copied());
         self.data = data;
     }
+
+    /// Take B's side of the series from `b`, by the check a new log's
+    /// series pass, so a type logged in several instances is never read
+    /// as one; see [`key_in`]. None clears it.
+    fn extract_b(&mut self, b: Option<&LoadedLog>) {
+        self.data_b = None;
+        self.extent_b = None;
+        self.extent_b_over = None;
+        self.unit_b = None;
+        self.b_note = None;
+        self.b_key = None;
+        let Some((b, key)) = b.and_then(|b| Some((b, key_in(b, &self.key)?))) else {
+            return;
+        };
+        let Ok(data) = b.series(&key) else {
+            return;
+        };
+        if key.instance != self.key.instance {
+            self.b_note = Some(format!("B's {}", key.label()));
+        }
+        self.unit_b = unit(b, &key);
+        self.extent_b = extent(data.ys.iter().copied());
+        self.data_b = Some(data);
+        // a series for B's side alone is named as this B names the field,
+        // as one picked from what only B logs is, whichever B it is now
+        if self.only_b() {
+            self.title = title(b, &key);
+        }
+        self.b_key = Some(key);
+    }
+
+    /// Find B's extent over its samples within `window`, on B's clock,
+    /// unless it was found over that window already.
+    fn fit_b_extent(&mut self, window: (f64, f64)) {
+        let over = (window.0.to_bits(), window.1.to_bits());
+        if self.extent_b_over == Some(over) {
+            return;
+        }
+        self.extent_b_over = Some(over);
+        self.extent_b = self.data_b.as_ref().and_then(|data| {
+            let (xs, ys) = (&data.xs, &data.ys);
+            let from = xs.partition_point(|x| *x < window.0);
+            let to = xs.partition_point(|x| *x <= window.1);
+            // where the line crosses an edge, the point drawn on it, as
+            // [`clip`] draws it, counts too: a sample just past an edge
+            // sizes the axis by what shows of the line to it
+            let crossing = |i: usize, x: f64| {
+                (i > 0 && i < xs.len() && xs[i - 1] < x && x < xs[i]).then(|| {
+                    ys[i - 1] + (ys[i] - ys[i - 1]) * (x - xs[i - 1]) / (xs[i] - xs[i - 1])
+                })
+            };
+            let edges = [crossing(from, window.0), crossing(to, window.1)];
+            extent(
+                ys.get(from..to)?
+                    .iter()
+                    .copied()
+                    .chain(edges.into_iter().flatten()),
+            )
+        });
+    }
+
+    /// Whether A and B give the field units that differ, so that their
+    /// values do not compare. A heading is in degrees as any angle is,
+    /// which firmware has logged under either unit.
+    fn units_differ(&self) -> bool {
+        fn kind(unit: &str) -> &str {
+            if unit == "degheading" { "deg" } else { unit }
+        }
+        matches!((&self.unit, &self.unit_b), (Some(a), Some(b)) if kind(a) != kind(b))
+    }
+
+    /// What the chip says on hover while B is open: that B lacks the
+    /// field, which instance of B's stands for A's, and a unit of B's that
+    /// is not A's, against which no difference is read.
+    fn b_hover(&self) -> Option<String> {
+        if self.only_b() {
+            return Some("not in A".to_string());
+        }
+        if self.data_b.is_none() {
+            return Some("not in B".to_string());
+        }
+        let unit = self
+            .unit_b
+            .as_deref()
+            .filter(|_| self.units_differ())
+            .map(|unit| format!("B logs it in {unit}: no \u{394} is read"));
+        match (self.b_note.clone(), unit) {
+            (Some(note), Some(unit)) => Some(format!("{note}; {unit}")),
+            (note, unit) => note.or(unit),
+        }
+    }
+
+    /// Whether the field is an angle in degrees, whose difference goes the
+    /// short way round: by A's unit, else B's.
+    fn is_angle(&self) -> bool {
+        matches!(
+            self.unit.as_deref().or(self.unit_b.as_deref()),
+            Some("deg" | "degheading")
+        )
+    }
+
+    /// The lowest and highest value of both sides.
+    fn extent_both(&self) -> Option<(f64, f64)> {
+        match (self.extent, self.extent_b) {
+            (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
+            (one, other) => one.or(other),
+        }
+    }
 }
 
-/// One series' sample nearest the cursor.
+/// One series' samples nearest the cursor: A's, and B's while B is open.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Readout {
     pub title: String,
     pub color: Color32,
-    /// Seconds since boot of the sample.
-    pub time: f64,
-    pub value: f64,
+    /// A's sample, its time since boot and its value. With B open, None
+    /// reads as a dash: a hidden line, or a cursor outside its samples.
+    pub a: Option<(f64, f64)>,
+    /// B's sample nearest the cursor less the offset, its time on B's
+    /// clock; None reads as a dash, and is all there is with no B open.
+    pub b: Option<(f64, f64)>,
+    /// A's value less B's, the short way round for an angle; None reads
+    /// as a dash.
+    pub difference: Option<f64>,
+}
+
+/// Log B as the plot holds it: the log, and the seconds that move its
+/// times onto A's clock.
+#[derive(Debug)]
+struct PlotB {
+    log: Arc<LoadedLog>,
+    offset: f64,
 }
 
 /// The plot's state: what is drawn, where the playhead is and what the
@@ -116,6 +286,15 @@ pub struct PlotPanel {
     /// A seek the events list has yet to bring into view: it may be on
     /// the other tab, or filtered empty, when the seek is made.
     follow: bool,
+    /// Log B while it is open, set through [`Self::set_b`].
+    b: Option<PlotB>,
+    /// B changed: the lines hidden for the B before are shown again on
+    /// the next frame, where the plot's memory is.
+    show_b_lines: bool,
+    /// A and B swapped: on the next frame, where the plot's memory is,
+    /// the hidden lines swap sides and a zoomed view moves by these
+    /// seconds onto the new A's clock.
+    swapped: Option<f64>,
 }
 
 /// The plot's id, fixed so its memory can be read back.
@@ -125,6 +304,14 @@ const PLOT_ID: &str = "aftermission_plot";
 fn line_id(key: &SeriesKey) -> Id {
     Id::new(key)
 }
+
+/// The id of a series' line of B's, which the legend hides by itself.
+fn line_id_b(key: &SeriesKey) -> Id {
+    Id::new((key, "B"))
+}
+
+/// How much of a series' color B's line keeps: half its opacity.
+const B_OPACITY: f32 = 0.5;
 
 /// Distinct hues for successive series.
 const PALETTE: [Color32; 10] = [
@@ -141,15 +328,22 @@ const PALETTE: [Color32; 10] = [
 ];
 
 impl PlotPanel {
+    /// Whether A's field `key` is on the plot: a series whose A side was
+    /// read by it, as after a swap one keyed by another instance's can be.
     #[must_use]
     pub fn is_selected(&self, key: &SeriesKey) -> bool {
-        self.selected.iter().any(|s| &s.key == key)
+        self.selected.iter().any(|s| s.a_key.as_ref() == Some(key))
     }
 
-    /// Add `key` to the plot, or take it off when it is on. A series that
-    /// cannot be extracted leaves its reason in `error`.
+    /// Add A's field `key` to the plot, or take it off when it is on, by
+    /// the rule [`Self::is_selected`] ticks it by. A series that cannot be
+    /// extracted leaves its reason in `error`.
     pub fn toggle(&mut self, key: SeriesKey, log: &LoadedLog) {
-        if let Some(index) = self.selected.iter().position(|s| s.key == key) {
+        if let Some(index) = self
+            .selected
+            .iter()
+            .position(|s| s.a_key.as_ref() == Some(&key))
+        {
             self.selected.remove(index);
             self.refresh_readout();
             return;
@@ -159,13 +353,70 @@ impl PlotPanel {
                 let color = PALETTE[self.next_color % PALETTE.len()];
                 self.next_color += 1;
                 let title = title(log, &key);
-                self.selected
-                    .push(Selected::new(key, title, YAxis::Left, color, data));
+                let unit = unit(log, &key);
+                let mut s = Selected::new(key, title, YAxis::Left, color, data);
+                s.unit = unit;
+                s.extract_b(self.b.as_ref().map(|b| &*b.log));
+                self.selected.push(s);
                 self.error = None;
                 self.refresh_readout();
             }
             Err(message) => self.error = Some(message),
         }
+    }
+
+    /// Whether B's field `key` is on the plot as a series for B's side
+    /// alone: one whose B side was read by `key`, so a series a swap left
+    /// in the other instance form of B's key ticks too. A compare per
+    /// series, as the side panel asks it for every checkbox of what only
+    /// B logs, every frame.
+    #[must_use]
+    pub fn is_selected_b(&self, key: &SeriesKey) -> bool {
+        self.selected
+            .iter()
+            .any(|s| s.only_b() && s.b_key.as_ref() == Some(key))
+    }
+
+    /// Add B's field `key`, one A lacks, to the plot as a series for B's
+    /// side alone, or take it off when it is on, by the rule
+    /// [`Self::is_selected_b`] ticks it by. It is read from the B the plot
+    /// holds, so it is read and ticked by the same B; without B, or where
+    /// B lacks it, nothing changes.
+    pub fn toggle_b(&mut self, key: SeriesKey) {
+        if let Some(index) = self
+            .selected
+            .iter()
+            .position(|s| s.only_b() && s.b_key.as_ref() == Some(&key))
+        {
+            self.selected.remove(index);
+            self.refresh_readout();
+            return;
+        }
+        let Some(b) = self.b.as_ref().map(|b| Arc::clone(&b.log)) else {
+            return;
+        };
+        let color = PALETTE[self.next_color % PALETTE.len()];
+        let title = title(&b, &key);
+        let mut s = Selected::new(key, title, YAxis::Left, color, Series::default());
+        // B's alone: no A side, so neither A's tree nor the CSV export
+        // takes it for one of A's
+        s.a_key = None;
+        s.extract_b(Some(&b));
+        if s.data_b.is_none() {
+            return;
+        }
+        self.next_color += 1;
+        self.selected.push(s);
+        self.error = None;
+        self.refresh_readout();
+    }
+
+    /// Whether any series on the plot has an A side, hidden through the
+    /// legend or not: what tells a plot of B's lines alone, which no CSV
+    /// export writes, from one whose A lines are hidden.
+    #[must_use]
+    pub fn has_a_series(&self) -> bool {
+        self.selected.iter().any(|s| !s.only_b())
     }
 
     pub fn remove(&mut self, index: usize) {
@@ -177,10 +428,88 @@ impl PlotPanel {
 
     /// The readout for the current series at the last cursor position.
     fn refresh_readout(&mut self) {
+        let offset = self.b.as_ref().map(|b| b.offset);
         self.readout = match self.cursor {
-            Some(cursor) => readout_at(&self.selected, cursor, &self.hidden),
+            Some(cursor) => readout_at(&self.selected, cursor, &self.hidden, offset),
             None => Vec::new(),
         };
+    }
+
+    /// Open log B beside A, moved onto A's clock by `offset` seconds, or
+    /// close it with None: B's side of every series is taken when the log
+    /// changes, and the readout reads again, so a new offset shows at once.
+    pub fn set_b(&mut self, b: Option<(Arc<LoadedLog>, f64)>) {
+        let same = match (&self.b, &b) {
+            (Some(old), Some((log, _))) => Arc::ptr_eq(&old.log, log),
+            (old, new) => old.is_none() && new.is_none(),
+        };
+        self.b = b.map(|(log, offset)| PlotB { log, offset });
+        if !same {
+            let b = self.b.as_ref().map(|b| &*b.log);
+            for s in &mut self.selected {
+                s.extract_b(b);
+            }
+            // a series A lacks, kept by a swap for B's side, goes with it
+            self.selected.retain(|s| !s.only_b() || s.data_b.is_some());
+            // B's lines keep their ids from one B to the next, and a pair
+            // is set up afresh
+            self.show_b_lines = true;
+            let shown: Vec<Id> = self.selected.iter().map(|s| line_id_b(&s.key)).collect();
+            self.hidden.retain(|id| !shown.contains(id));
+        }
+        self.refresh_readout();
+    }
+
+    /// Swap A and B under the series, as the pair's Swap does: `a` is
+    /// the new A, and `b`, moved onto its clock by `offset`, the new B.
+    /// Every series stays, A's side taken from `a`, or none where `a`
+    /// lacks the field, so that a second swap brings back what the first
+    /// took. The lines hidden through the legend swap sides, and the
+    /// playhead, the cursor and a zoomed view move by `offset` onto the
+    /// new A's clock, where the same moment is, the playhead kept within
+    /// the new A's range, and a zoomed view then panned onto it.
+    pub fn swap(&mut self, a: &LoadedLog, b: Arc<LoadedLog>, offset: f64) {
+        for s in &mut self.selected {
+            // A's side found as B's is, so the instance B drew a moment
+            // ago for this series is A's now; the series keeps its key
+            if let Some((Ok(data), key)) = key_in(a, &s.key).map(|key| (a.series(&key), key)) {
+                s.replace_data(data);
+                s.title = title(a, &key);
+                s.unit = unit(a, &key);
+                s.a_key = Some(key);
+            } else {
+                s.replace_data(Series::default());
+                s.unit = None;
+                s.a_key = None;
+            }
+            s.extract_b(Some(&b));
+        }
+        self.selected.retain(|s| !s.only_b() || s.data_b.is_some());
+        self.b = Some(PlotB { log: b, offset });
+        // the readout reads the swapped sides until the next frame reads
+        // the plot's memory, swapped the same way then
+        let mut hidden: Vec<Id> = self.hidden.iter().map(|id| self.other_side(*id)).collect();
+        hidden.sort_unstable_by_key(Id::value);
+        self.hidden = hidden;
+        let range = a.time_range();
+        let held = |time: f64| match &range {
+            Some(range) => time.clamp(*range.start(), *range.end()),
+            None => time,
+        };
+        let moved = self.playhead.map(|time| time + offset);
+        self.playhead = moved.map(held);
+        // a zoomed view moves by the offset alone, so a playhead held
+        // within the new A's range can be off it: the view pans to it
+        // then, as to a seek
+        self.pending_seek = moved
+            .filter(|time| range.as_ref().is_some_and(|range| !range.contains(time)))
+            .map(held);
+        self.cursor = self.cursor.map(|time| held(time + offset));
+        self.hover = None;
+        self.paged = None;
+        self.last_played = None;
+        self.swapped = Some(offset);
+        self.refresh_readout();
     }
 
     /// Take every series off; the next one picked takes the first color
@@ -231,15 +560,30 @@ impl PlotPanel {
 
     /// Re-extract every series from a newly opened log, dropping those it
     /// does not have, so a plot set up on one flight carries to the next.
-    /// The view resets to the whole of the new log.
+    /// A series is read by the key its A side was read by, the field on
+    /// screen and ticked, then by its own, and takes the key found: B goes,
+    /// as a new A closes it, and with it the reason the two differed. The
+    /// view resets to the whole of the new log.
     pub fn reload(&mut self, log: &LoadedLog) {
-        self.selected.retain_mut(|s| match log.series(&s.key) {
-            Ok(data) if log.has_series(&s.key) => {
-                s.replace_data(data);
-                s.title = title(log, &s.key);
-                true
-            }
-            _ => false,
+        self.b = None;
+        self.selected.retain_mut(|s| {
+            s.extract_b(None);
+            let found = [s.a_key.clone(), Some(s.key.clone())]
+                .into_iter()
+                .flatten()
+                .find_map(|key| match log.series(&key) {
+                    Ok(data) if log.has_series(&key) => Some((key, data)),
+                    _ => None,
+                });
+            let Some((key, data)) = found else {
+                return false;
+            };
+            s.replace_data(data);
+            s.title = title(log, &key);
+            s.unit = unit(log, &key);
+            s.key = key.clone();
+            s.a_key = Some(key);
+            true
         });
         self.readout.clear();
         self.playhead = None;
@@ -257,7 +601,7 @@ impl PlotPanel {
     pub fn showing(&self) -> impl Iterator<Item = &Selected> {
         self.selected
             .iter()
-            .filter(|s| !self.hidden.contains(&line_id(&s.key)))
+            .filter(|s| !s.only_b() && !self.hidden.contains(&line_id(&s.key)))
     }
 
     /// The time range in view while the plot is zoomed or panned; None
@@ -302,22 +646,37 @@ impl PlotPanel {
             .resizable(false)
             .show_separator_line(false)
             .show(ui, |ui| self.readout_bar(ui, log, settings));
-        let strip = settings.show_modes.then(|| mode_strip(ui));
+        // a second line for B's mode names while B is open, and has some
+        let lanes = if self.b_modes().is_some() { 2 } else { 1 };
+        let strip = settings.show_modes.then(|| mode_strip(ui, lanes));
         let plot_height = ui.available_height().max(120.0);
         self.plot(ui, log, settings, plot_height, playing, strip);
     }
 
     /// One chip per series: its color, name, axis and a way off the plot.
+    /// While B is open, a chip whose field B lacks says so on hover, one
+    /// whose B side is another instance names it, and one whose unit B
+    /// gives otherwise says so.
     fn series_bar(&mut self, ui: &mut egui::Ui) {
         if self.selected.is_empty() {
             ui.weak("Pick fields in the panel on the left to plot them.");
             return;
         }
+        let b_open = self.b.is_some();
         let mut remove = None;
         ui.horizontal_wrapped(|ui| {
             for (index, s) in self.selected.iter_mut().enumerate() {
                 ui.colored_label(s.color, "\u{25A0}");
-                ui.label(&s.title);
+                // a series for B's side alone is marked as B's, weaker,
+                // so it does not read as one of A's
+                let name = if s.only_b() {
+                    ui.weak(format!("B {}", s.title))
+                } else {
+                    ui.label(&s.title)
+                };
+                if b_open && let Some(text) = s.b_hover() {
+                    name.on_hover_text(text);
+                }
                 let axis = match s.axis {
                     YAxis::Left => "L",
                     YAxis::Right => "R",
@@ -329,11 +688,7 @@ impl PlotPanel {
                 {
                     s.axis = s.axis.flipped();
                 }
-                if ui
-                    .small_button("\u{2715}")
-                    .on_hover_text("Remove")
-                    .clicked()
-                {
+                if ui.small_button("\u{d7}").on_hover_text("Remove").clicked() {
                     remove = Some(index);
                 }
                 ui.add_space(8.0);
@@ -353,11 +708,18 @@ impl PlotPanel {
         playing: bool,
         strip: Option<Rect>,
     ) {
-        let map = AxisMap::new(&self.selected);
         // A reset rebuilds the plot's memory with nothing hidden and the
         // whole of the data in view.
         let reset = std::mem::take(&mut self.reset_view);
+        if std::mem::take(&mut self.show_b_lines) {
+            self.show_b_lines_in_memory(ui.ctx());
+        }
+        if let Some(offset) = self.swapped.take() {
+            self.swap_in_memory(ui.ctx(), offset);
+        }
         self.sync_hidden(ui.ctx(), reset);
+        self.fit_b_extents();
+        let map = AxisMap::new(&self.selected);
         let plot = new_plot(log, settings, map, height, playing, reset);
 
         let selected = &self.selected;
@@ -367,6 +729,7 @@ impl PlotPanel {
         let last_played = self.last_played;
         let seek = self.pending_seek.take();
         let range = log.time_range();
+        let b_offset = self.b.as_ref().map(|b| b.offset);
         let show_modes = settings.show_modes;
         let playhead_stroke = Stroke::new(1.5, ui.visuals().strong_text_color());
         let response = plot.show(ui, |plot_ui| {
@@ -422,28 +785,29 @@ impl PlotPanel {
                 paged = Some(page);
             }
             // With the bounds following the data, every point counts, so a
-            // reset zooms back out to the whole flight.
+            // reset zooms back out to the whole flight: A's, B's lines kept
+            // within it, or B's while no line of A's shows.
             let data_range = full_range(selected, hidden);
-            let x_range = match (auto_x, &data_range) {
-                (true, Some(range)) => range.clone(),
-                _ => visible.clone(),
+            let b_range = b_offset.and_then(|offset| full_range_b(selected, hidden, offset));
+            let (x_range, within_range) = match (auto_x, data_range, b_range) {
+                (true, Some(range), _) => (range, true),
+                (true, None, Some(range)) => (range, false),
+                _ => (visible.clone(), false),
             };
             let width = plot_ui.transform().frame().width();
 
             if show_modes {
                 mode_bands(plot_ui, log, &visible);
             }
+            let lines = Lines {
+                map,
+                range: &x_range,
+                width,
+                b_offset,
+                within_range,
+            };
             for s in selected {
-                let to_plot = |y: f64| match (s.axis, map) {
-                    (YAxis::Right, Some(m)) => m.to_left(y),
-                    _ => y,
-                };
-                let points = decimate(&s.data.xs, &s.data.ys, &x_range, width, to_plot);
-                plot_ui.line(
-                    Line::new(s.title.clone(), PlotPoints::Owned(points))
-                        .color(s.color)
-                        .id(line_id(&s.key)),
-                );
+                lines.draw(plot_ui, s);
             }
 
             time_marks(plot_ui, cursor, playhead, playhead_stroke);
@@ -455,12 +819,8 @@ impl PlotPanel {
             }
         });
 
-        // The mode names go in their own lane above the plot, where
-        // neither the legend nor the data covers them, painted rather than
-        // plot items, so they do not enter the bounds the plot fits its
-        // data in.
         if let Some(strip) = strip {
-            mode_labels(ui, log, &response.transform, strip);
+            self.mode_lanes(ui, log, &response.transform, strip);
         }
         let found = response.inner;
         self.hover = found.at;
@@ -474,18 +834,122 @@ impl PlotPanel {
         self.last_played = self.playhead.filter(|_| playing);
     }
 
+    /// The line on the other side of the one `id` names: B's line of the
+    /// series whose A line it is, or the reverse; `id` itself where it is
+    /// no line of a series on the plot. What a swap does to the hidden
+    /// lines, in the readout's set and in the plot's memory alike.
+    fn other_side(&self, id: Id) -> Id {
+        for s in &self.selected {
+            let (a, b) = (line_id(&s.key), line_id_b(&s.key));
+            if id == a {
+                return b;
+            }
+            if id == b {
+                return a;
+            }
+        }
+        id
+    }
+
+    /// Show the lines of B's the legend hid in the plot's memory, which
+    /// the legend reads its ticks from.
+    fn show_b_lines_in_memory(&self, ctx: &egui::Context) {
+        let id = Id::new(PLOT_ID);
+        let Some(mut memory) = PlotMemory::load(ctx, id) else {
+            return;
+        };
+        for s in &self.selected {
+            memory.hidden_items.remove(&line_id_b(&s.key));
+        }
+        memory.store(ctx, id);
+    }
+
+    /// Swap the sides of the lines hidden through the legend in the
+    /// plot's memory, and move a zoomed view by `offset` onto the new A's
+    /// clock; a view that follows the data fits the new A by itself.
+    fn swap_in_memory(&self, ctx: &egui::Context, offset: f64) {
+        let id = Id::new(PLOT_ID);
+        let Some(mut memory) = PlotMemory::load(ctx, id) else {
+            return;
+        };
+        let swapped = memory
+            .hidden_items
+            .drain()
+            .map(|id| self.other_side(id))
+            .collect();
+        memory.hidden_items = swapped;
+        if !memory.auto_bounds.x {
+            let bounds = memory.bounds();
+            let ([left, bottom], [right, top]) = (bounds.min(), bounds.max());
+            memory.set_bounds(PlotBounds::from_min_max(
+                [left + offset, bottom],
+                [right + offset, top],
+            ));
+        }
+        memory.store(ctx, id);
+    }
+
+    /// Fit B's side of each series' extent to what the whole-flight view
+    /// draws of it, as [`Lines::draw`] clips it: its samples within the
+    /// range of A's lines, moved onto B's clock, or all of them where A
+    /// has none. A value of B's never drawn then sizes no axis. Lines
+    /// hidden through the legend count as shown, as they do in
+    /// [`AxisMap`], so a click on the legend moves no other line.
+    fn fit_b_extents(&mut self) {
+        let Some(offset) = self.b.as_ref().map(|b| b.offset) else {
+            return;
+        };
+        let window = full_range(&self.selected, &[])
+            .map_or((f64::NEG_INFINITY, f64::INFINITY), |range| {
+                (range.start() - offset, range.end() - offset)
+            });
+        for s in &mut self.selected {
+            s.fit_b_extent(window);
+        }
+    }
+
+    /// B, while it is open and logs mode changes to name.
+    fn b_modes(&self) -> Option<&PlotB> {
+        self.b.as_ref().filter(|b| !b.log.modes.is_empty())
+    }
+
+    /// The mode names in their own lane above the plot, where neither the
+    /// legend nor the data covers them, painted rather than plot items, so
+    /// they do not enter the bounds the plot fits its data in; B's in a
+    /// lane under A's, the two sharing `strip`.
+    fn mode_lanes(&self, ui: &egui::Ui, log: &LoadedLog, transform: &PlotTransform, strip: Rect) {
+        let Some(b) = self.b_modes() else {
+            mode_labels(ui, log, 0.0, transform, strip, false);
+            return;
+        };
+        let (lane, lane_b) = strip.split_top_bottom_at_fraction(0.5);
+        mode_labels(ui, log, 0.0, transform, lane, false);
+        mode_labels(ui, &b.log, b.offset, transform, lane_b, true);
+    }
+
     /// Take the series hidden through the legend from the plot's memory,
     /// to leave them out of the readout too. On a `reset` frame the plot
     /// rebuilds its memory with nothing hidden, so the stored set no
-    /// longer holds.
+    /// longer holds. The id of a line no longer drawn, as of a series
+    /// taken off while hidden, is dropped from the memory: the plot drops
+    /// them only while its legend has an entry, and kept, it would hide
+    /// the line again when the series comes back.
     fn sync_hidden(&mut self, ctx: &egui::Context, reset: bool) {
-        let mut hidden: Vec<Id> = if reset {
-            Vec::new()
-        } else {
-            PlotMemory::load(ctx, Id::new(PLOT_ID))
-                .map(|memory| memory.hidden_items.into_iter().collect())
-                .unwrap_or_default()
-        };
+        let id = Id::new(PLOT_ID);
+        let mut hidden = Vec::new();
+        if !reset && let Some(mut memory) = PlotMemory::load(ctx, id) {
+            let lines: Vec<Id> = self
+                .selected
+                .iter()
+                .flat_map(|s| [line_id(&s.key), line_id_b(&s.key)])
+                .collect();
+            let before = memory.hidden_items.len();
+            memory.hidden_items.retain(|id| lines.contains(id));
+            hidden = memory.hidden_items.iter().copied().collect();
+            if hidden.len() != before {
+                memory.store(ctx, id);
+            }
+        }
         // sorted, so the same set always compares equal
         hidden.sort_unstable_by_key(Id::value);
         if hidden != self.hidden {
@@ -494,7 +958,9 @@ impl PlotPanel {
         }
     }
 
-    /// Time and value of every series at the cursor, or a hint.
+    /// Time and value of every series at the cursor, or a hint. While B
+    /// is open, B's value and the difference follow A's; no time of B's
+    /// shows, only how far off its sample lies.
     fn readout_bar(&self, ui: &mut egui::Ui, log: &LoadedLog, settings: &Settings) {
         ui.horizontal_wrapped(|ui| {
             let Some(cursor) = self.cursor else {
@@ -505,35 +971,158 @@ impl PlotPanel {
                 return;
             };
             ui.monospace(timefmt::stamp(log.wall_clock(settings.time_axis), cursor));
+            let b_at = self.b.as_ref().map(|b| cursor - b.offset);
             for r in &self.readout {
                 ui.colored_label(r.color, "\u{25A0}");
-                ui.label(format!(
-                    "{} = {}{}",
-                    r.title,
-                    egui_plot::format_number(r.value, 4),
-                    offset_note(r.time, cursor)
-                ));
+                ui.label(readout_text(r, cursor, b_at));
             }
         });
     }
 }
 
+/// What the readout says for one series at `cursor`: `ATT.Roll (deg) =
+/// 3.21`, and while B is open, read at `b_at` on B's clock, `B 2.87  Δ
+/// +0.34`, each side noting how far off its sample lies.
+fn readout_text(r: &Readout, cursor: f64, b_at: Option<f64>) -> String {
+    let side = |sample: Option<(f64, f64)>, at: f64| match sample {
+        Some((time, value)) => format!(
+            "{}{}",
+            egui_plot::format_number(value, 4),
+            offset_note(time, at)
+        ),
+        None => DASH.to_string(),
+    };
+    let mut text = format!("{} = {}", r.title, side(r.a, cursor));
+    if let Some(b_at) = b_at {
+        let difference = r.difference.map_or_else(
+            || DASH.to_string(),
+            |d| {
+                let sign = if d > 0.0 { "+" } else { "" };
+                format!("{sign}{}", egui_plot::format_number(d, 4))
+            },
+        );
+        let _ = write!(text, "  B {}  \u{394} {difference}", side(r.b, b_at));
+    }
+    text
+}
+
+/// What stands for a value the readout cannot read.
+const DASH: &str = "\u{2013}";
+
+/// How a frame draws each series' lines.
+struct Lines<'a> {
+    map: Option<AxisMap>,
+    /// The time the lines are thinned over, on A's clock.
+    range: &'a RangeInclusive<f64>,
+    /// The plot's width in points.
+    width: f32,
+    /// B's offset onto A's clock, while B is open.
+    b_offset: Option<f64>,
+    /// Whether B's line keeps within `range`, as it does while the bounds
+    /// follow the data.
+    within_range: bool,
+}
+
+impl Lines<'_> {
+    /// B's line first, under A's, lighter, then A's, none for a series A
+    /// lacks, so its legend has no entry that hides nothing. Where the
+    /// bounds follow the data, B is drawn within A's range alone, its
+    /// samples past the edges left out too, so no B far off, or with a
+    /// gap in its samples, widens the view A fills.
+    fn draw(&self, plot_ui: &mut egui_plot::PlotUi<'_>, s: &Selected) {
+        let to_plot = |y: f64| match (s.axis, self.map) {
+            (YAxis::Right, Some(m)) => m.to_left(y),
+            _ => y,
+        };
+        if let (Some(data), Some(offset)) = (&s.data_b, self.b_offset) {
+            let mut points =
+                decimate_moved(&data.xs, &data.ys, self.range, self.width, to_plot, offset);
+            if self.within_range {
+                points = clip(&points, self.range);
+            }
+            plot_ui.line(
+                Line::new(format!("{} (B)", s.title), PlotPoints::Owned(points))
+                    .color(s.color.gamma_multiply(B_OPACITY))
+                    .id(line_id_b(&s.key)),
+            );
+        }
+        if s.only_b() {
+            return;
+        }
+        let points = decimate(&s.data.xs, &s.data.ys, self.range, self.width, to_plot);
+        plot_ui.line(
+            Line::new(s.title.clone(), PlotPoints::Owned(points))
+                .color(s.color)
+                .id(line_id(&s.key)),
+        );
+    }
+}
+
 /// Every shown series' sample nearest to board time `cursor`; the series
-/// whose line ids are in `hidden` are left out.
-fn readout_at(selected: &[Selected], cursor: f64, hidden: &[Id]) -> Vec<Readout> {
+/// whose line ids are in `hidden` are left out. With B open, moved onto
+/// A's clock by `offset`, a series shows while either side does, B read
+/// at `cursor - offset`, and a side reads as a dash where its line is
+/// hidden, it has no data, or the time falls outside its samples; the
+/// difference too where A and B log the field in units that differ.
+fn readout_at(
+    selected: &[Selected],
+    cursor: f64,
+    hidden: &[Id],
+    offset: Option<f64>,
+) -> Vec<Readout> {
     selected
         .iter()
-        .filter(|s| !hidden.contains(&line_id(&s.key)))
         .filter_map(|s| {
-            let (time, value) = nearest(&s.data, cursor)?;
+            let shown = !hidden.contains(&line_id(&s.key));
+            let Some(offset) = offset else {
+                let a = nearest(&s.data, cursor).filter(|_| shown)?;
+                return Some(Readout {
+                    title: s.title.clone(),
+                    color: s.color,
+                    a: Some(a),
+                    b: None,
+                    difference: None,
+                });
+            };
+            let b_shown = s.data_b.is_some() && !hidden.contains(&line_id_b(&s.key));
+            if !shown && !b_shown {
+                return None;
+            }
+            let a = within(&s.data, cursor).filter(|_| shown);
+            let b = s
+                .data_b
+                .as_ref()
+                .and_then(|data| within(data, cursor - offset))
+                .filter(|_| b_shown);
+            let difference = a
+                .zip(b)
+                .filter(|_| !s.units_differ())
+                .map(|((_, a), (_, b))| difference(a, b, s.is_angle()));
             Some(Readout {
                 title: s.title.clone(),
                 color: s.color,
-                time,
-                value,
+                a,
+                b,
+                difference,
             })
         })
         .collect()
+}
+
+/// The sample of `series` nearest to `x`, when `x` lies within its
+/// samples.
+fn within(series: &Series, x: f64) -> Option<(f64, f64)> {
+    nearest_within(&series.xs, x).map(|i| (series.xs[i], series.ys[i]))
+}
+
+/// `a` less `b`, the short way round the circle for an angle in degrees:
+/// a yaw of 359 against 1 is -2, not 358.
+fn difference(a: f64, b: f64, angle: bool) -> f64 {
+    if !angle {
+        return a - b;
+    }
+    let d = (a - b).rem_euclid(360.0);
+    if d > 180.0 { d - 360.0 } else { d }
 }
 
 /// How far the sample shown lies from the cursor, when the readout's
@@ -550,30 +1139,53 @@ fn offset_note(sample_time: f64, cursor: f64) -> String {
 
 /// `IMU[1].GyrX (rad/s)`
 fn title(log: &LoadedLog, key: &SeriesKey) -> String {
-    let unit = log
-        .field_of(key)
-        .and_then(|f| f.unit.clone())
-        .filter(|u| !u.is_empty());
-    match unit {
+    match unit(log, key) {
         Some(unit) => format!("{} ({unit})", key.label()),
         None => key.label(),
     }
+}
+
+/// The unit `log` gives the field `key` names, when it gives one.
+fn unit(log: &LoadedLog, key: &SeriesKey) -> Option<String> {
+    log.field_of(key)
+        .and_then(|f| f.unit.clone())
+        .filter(|u| !u.is_empty())
 }
 
 /// The earliest to the latest sample over the series shown, those whose
 /// line ids are in `hidden` left out, as the plot leaves them out of the
 /// bounds it fits.
 fn full_range(selected: &[Selected], hidden: &[Id]) -> Option<RangeInclusive<f64>> {
-    let mut range: Option<(f64, f64)> = None;
-    for s in selected
+    span(selected, hidden, 0.0, |s| (line_id(&s.key), Some(&s.data)))
+}
+
+/// The earliest to the latest sample of B's lines shown, moved onto A's
+/// clock by `offset`.
+fn full_range_b(selected: &[Selected], hidden: &[Id], offset: f64) -> Option<RangeInclusive<f64>> {
+    span(selected, hidden, offset, |s| {
+        (line_id_b(&s.key), s.data_b.as_ref())
+    })
+}
+
+/// The earliest to the latest sample over one side of the series, the
+/// line id and the samples `side` gives of each, those whose id is in
+/// `hidden` or that have no samples left out, moved by `offset`.
+fn span(
+    selected: &[Selected],
+    hidden: &[Id],
+    offset: f64,
+    side: impl Fn(&Selected) -> (Id, Option<&Series>),
+) -> Option<RangeInclusive<f64>> {
+    selected
         .iter()
-        .filter(|s| !hidden.contains(&line_id(&s.key)))
-    {
-        if let (Some(&first), Some(&last)) = (s.data.xs.first(), s.data.xs.last()) {
-            range = Some(range.map_or((first, last), |(a, b)| (a.min(first), b.max(last))));
-        }
-    }
-    range.map(|(a, b)| a..=b)
+        .map(side)
+        .filter(|(id, _)| !hidden.contains(id))
+        .filter_map(|(_, data)| {
+            let xs = &data?.xs;
+            Some((*xs.first()? + offset, *xs.last()? + offset))
+        })
+        .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)))
+        .map(|(a, b)| a..=b)
 }
 
 /// Draws the right-axis series into the left axis's range, and labels the
@@ -588,12 +1200,15 @@ struct AxisMap {
 
 impl AxisMap {
     /// None when nothing is on the right axis, which then needs no mapping.
+    /// B's values count as A's do, so each axis covers both; a line hidden
+    /// through the legend counts too, on either side, so hiding one moves
+    /// no other.
     fn new(selected: &[Selected]) -> Option<AxisMap> {
         let extent = |axis: YAxis| {
             let range = selected
                 .iter()
                 .filter(|s| s.axis == axis)
-                .filter_map(|s| s.extent)
+                .filter_map(Selected::extent_both)
                 .reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
             range.map(|(a, b)| if a < b { (a, b) } else { (a - 1.0, b + 1.0) })
         };
@@ -686,6 +1301,51 @@ pub fn decimate(
     out
 }
 
+/// B's points for `range` on A's clock: B's samples thinned over the
+/// range moved back by `offset`, onto B's clock, and the points moved
+/// forward by it, so B is thinned where it shows and drawn on A's clock.
+pub fn decimate_moved(
+    xs: &[f64],
+    ys: &[f64],
+    range: &RangeInclusive<f64>,
+    width: f32,
+    map: impl Fn(f64) -> f64,
+    offset: f64,
+) -> Vec<PlotPoint> {
+    let back = range.start() - offset..=range.end() - offset;
+    let mut points = decimate(xs, ys, &back, width, map);
+    for p in &mut points {
+        p.x += offset;
+    }
+    points
+}
+
+/// `points`, in time order, cut to `range`: those within it, and where
+/// the line crosses an edge, a point on the edge, so a line runs to the
+/// edges, even one with no point inside, without a point beyond them.
+fn clip(points: &[PlotPoint], range: &RangeInclusive<f64>) -> Vec<PlotPoint> {
+    let (start, end) = (*range.start(), *range.end());
+    // the line from p to q where it reaches x, which lies between them
+    let at = |p: &PlotPoint, q: &PlotPoint, x: f64| {
+        PlotPoint::new(x, p.y + (q.y - p.y) * (x - p.x) / (q.x - p.x))
+    };
+    let mut out = Vec::with_capacity(points.len());
+    for (i, q) in points.iter().enumerate() {
+        if let Some(p) = i.checked_sub(1).map(|before| &points[before]) {
+            if p.x < start && q.x > start {
+                out.push(at(p, q, start));
+            }
+            if p.x < end && q.x > end {
+                out.push(at(p, q, end));
+            }
+        }
+        if range.contains(&q.x) {
+            out.push(*q);
+        }
+    }
+    out
+}
+
 /// The sample of `series` nearest in time to `x`.
 fn nearest(series: &Series, x: f64) -> Option<(f64, f64)> {
     nearest_index(&series.xs, x).map(|i| (series.xs[i], series.ys[i]))
@@ -747,11 +1407,8 @@ fn new_plot(
     reset: bool,
 ) -> Plot<'static> {
     let time_base = log.wall_clock(settings.time_axis);
-    let x_formatter = move |mark: GridMark, _: &RangeInclusive<f64>| match time_base {
-        Some(base) => {
-            timefmt::utc_time(base.wall_clock_unix_ms(mark.value * 1000.0), mark.step_size)
-        }
-        None => timefmt::boot_time(mark.value, mark.step_size),
+    let x_formatter = move |mark: GridMark, _: &RangeInclusive<f64>| {
+        timefmt::clock(time_base, mark.value, mark.step_size)
     };
     let mut plot = Plot::new(PLOT_ID)
         .id(Id::new(PLOT_ID))
@@ -912,28 +1569,32 @@ impl PlotItem for TimeMark {
     }
 }
 
-/// The lane above the plot that the flight modes' names go in, a line of
-/// small text high, taken from the top of `ui`'s room.
-fn mode_strip(ui: &mut egui::Ui) -> Rect {
+/// The lanes above the plot that the flight modes' names go in, `lanes`
+/// lines of small text high, taken from the top of `ui`'s room.
+fn mode_strip(ui: &mut egui::Ui, lanes: u8) -> Rect {
     let height = egui::TextStyle::Small.resolve(ui.style()).size + 4.0;
-    ui.allocate_space(egui::vec2(ui.available_width(), height))
+    ui.allocate_space(egui::vec2(ui.available_width(), height * f32::from(lanes)))
         .1
 }
 
-/// Where each visible band's mode name goes in `strip`, the lane above
-/// the plot's frame: over the band's start, or at the frame's left edge
-/// for a band that starts off it.
+/// Where each visible band's mode name goes in `strip`, a lane above the
+/// plot's frame: over the band's start, or at the frame's left edge for a
+/// band that starts off it. The log's times are moved onto the plot's
+/// clock by `offset`, B's by its own, A's by none.
 fn label_spots<'a>(
     log: &'a LoadedLog,
+    offset: f64,
     transform: &PlotTransform,
     strip: Rect,
 ) -> Vec<(Pos2, &'a ModeChange)> {
     let frame = transform.frame();
-    visible_bands(log, &transform.bounds().range_x())
+    let view = transform.bounds().range_x();
+    let back = view.start() - offset..=view.end() - offset;
+    visible_bands(log, &back)
         .into_iter()
         .map(|(mode, _)| {
             let x = transform
-                .position_from_point_x(mode.time)
+                .position_from_point_x(mode.time + offset)
                 .max(frame.left() + 2.0);
             (pos2(x + 2.0, strip.top() + 2.0), mode)
         })
@@ -941,19 +1602,29 @@ fn label_spots<'a>(
 }
 
 /// Each visible band's mode name in `strip`, clipped to the width of the
-/// plot's frame.
-fn mode_labels(ui: &egui::Ui, log: &LoadedLog, transform: &PlotTransform, strip: Rect) {
+/// plot's frame, the log's times moved by `offset`; with `ticks`, a short
+/// line at each change in view, as B's lane has in place of bands.
+fn mode_labels(
+    ui: &egui::Ui,
+    log: &LoadedLog,
+    offset: f64,
+    transform: &PlotTransform,
+    strip: Rect,
+    ticks: bool,
+) {
     let lane = Rect::from_x_y_ranges(transform.frame().x_range(), strip.y_range());
     let painter = ui.painter().with_clip_rect(lane);
     let font = egui::TextStyle::Small.resolve(ui.style());
-    for (at, mode) in label_spots(log, transform, strip) {
-        painter.text(
-            at,
-            Align2::LEFT_TOP,
-            &mode.name,
-            font.clone(),
-            mode_color(mode.number),
-        );
+    for (at, mode) in label_spots(log, offset, transform, strip) {
+        let color = mode_color(mode.number);
+        if ticks {
+            let x = transform.position_from_point_x(mode.time + offset);
+            painter.line_segment(
+                [pos2(x, strip.top() + 2.0), pos2(x, strip.bottom())],
+                Stroke::new(1.5, color),
+            );
+        }
+        painter.text(at, Align2::LEFT_TOP, &mode.name, font.clone(), color);
     }
 }
 
@@ -1187,17 +1858,19 @@ mod tests {
             },
         );
         let both = [dense, sparse];
-        let readout = readout_at(&both, 0.21, &[]);
+        let readout = readout_at(&both, 0.21, &[], None);
         assert_eq!(readout.len(), 2);
-        assert_eq!((readout[0].time, readout[0].value), (0.2, 3.0));
-        assert_eq!((readout[1].time, readout[1].value), (0.0, 10.0));
-        assert_eq!(offset_note(readout[0].time, 0.21), " (-0.010 s)");
-        assert_eq!(offset_note(readout[1].time, 0.21), " (-0.210 s)");
+        assert_eq!(readout[0].a, Some((0.2, 3.0)));
+        assert_eq!(readout[1].a, Some((0.0, 10.0)));
+        assert_eq!(readout[0].b, None);
+        assert_eq!(readout_text(&readout[0], 0.21, None), "a = 3 (-0.010 s)");
+        assert_eq!(offset_note(0.2, 0.21), " (-0.010 s)");
+        assert_eq!(offset_note(0.0, 0.21), " (-0.210 s)");
         assert_eq!(offset_note(0.2, 0.2002), "");
         assert_eq!(offset_note(1.5, 1.0), " (+0.500 s)");
 
         // a series hidden through the legend leaves the readout
-        let shown = readout_at(&both, 0.21, &[line_id(&key("b"))]);
+        let shown = readout_at(&both, 0.21, &[line_id(&key("b"))], None);
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].title, "a");
         // and from the range the cursor line is kept within
@@ -1238,7 +1911,7 @@ mod tests {
         assert_eq!(plot.pending_seek, Some(1.0));
         assert!(plot.follow);
         assert_eq!(plot.readout.len(), 2);
-        assert_eq!((plot.readout[1].time, plot.readout[1].value), (1.0, 20.0));
+        assert_eq!(plot.readout[1].a, Some((1.0, 20.0)));
 
         // playing moves them too, and leaves the view and the events list
         // to paging and following
@@ -1248,7 +1921,7 @@ mod tests {
         assert_eq!((plot.playhead, plot.cursor), (Some(0.21), Some(0.21)));
         assert_eq!(plot.pending_seek, None);
         assert!(!plot.follow);
-        assert_eq!((plot.readout[0].time, plot.readout[0].value), (0.2, 3.0));
+        assert_eq!(plot.readout[0].a, Some((0.2, 3.0)));
 
         // cleared, the plot keeps the playhead and puts the cursor on it
         plot.cursor = Some(0.5);
@@ -1676,16 +2349,805 @@ mod tests {
         let lane = frame.top() - bare.top();
         assert!(lane > 10.0, "the lane takes {lane}");
 
-        let transform = transform(&roll_plot(&log, &with));
+        let view = transform(&roll_plot(&log, &with));
         let strip = Rect::from_x_y_ranges(frame.x_range(), frame.top() - lane..=frame.top());
-        let spots = label_spots(&log, &transform, strip);
+        let spots = label_spots(&log, 0.0, &view, strip);
         let names: Vec<&str> = spots.iter().map(|(_, m)| m.name.as_str()).collect();
         // Stabilize began before the view, so it is named at its left edge
         assert_eq!(names, ["Stabilize", "Loiter"]);
         assert!(spots.iter().all(|(at, _)| at.y < frame.top()));
         assert!((spots[0].0.x - (frame.left() + 4.0)).abs() < 1e-3);
-        let loiter = transform.position_from_point_x(2.25) + 2.0;
+        let loiter = view.position_from_point_x(2.25) + 2.0;
         assert!((spots[1].0.x - loiter).abs() < 1e-3);
+
+        // B's names at their moved places, in a second lane, only with B
+        // open and the bands on: the same log 0.05 s later
+        let b_log = Arc::new(LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::bytes()),
+            "b.bin".into(),
+        ));
+        let spots = label_spots(&b_log, 0.05, &view, strip);
+        let moved = view.position_from_point_x(2.3) + 2.0;
+        assert!((spots[1].0.x - moved).abs() < 1e-3);
+        let two_lanes = |settings: &Settings| {
+            let mut harness = roll_plot(&log, settings);
+            harness
+                .state_mut()
+                .0
+                .set_b(Some((Arc::clone(&b_log), 0.05)));
+            harness.run();
+            *transform(&harness).frame()
+        };
+        // a line of small text more, without the spacing the first brings
+        let added = two_lanes(&with).top() - frame.top();
+        assert!(added > 10.0 && added < lane, "{added} against {lane}");
+        assert!((two_lanes(&without).top() - bare.top()).abs() < 1.0);
+        // and none for a B that logs no mode changes
+        let mut harness = roll_plot(&log, &with);
+        let b_without_modes = Arc::new(LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::b_bytes()),
+            "b.bin".into(),
+        ));
+        harness.state_mut().0.set_b(Some((b_without_modes, 0.0)));
+        harness.run();
+        assert!((transform(&harness).frame().top() - frame.top()).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_clipped_line_runs_to_the_edges() {
+        let p = |x: f64, y: f64| PlotPoint::new(x, y);
+        let xy = |points: Vec<PlotPoint>| -> Vec<(f64, f64)> {
+            points.iter().map(|q| (q.x, q.y)).collect()
+        };
+        // no point inside: the segment across the range still shows
+        assert_eq!(
+            xy(clip(&[p(0.0, 0.0), p(10.0, 10.0)], &(2.0..=4.0))),
+            [(2.0, 2.0), (4.0, 4.0)]
+        );
+        // points inside kept, the line ended on each edge it crosses
+        assert_eq!(
+            xy(clip(
+                &[p(0.0, 0.0), p(3.0, 6.0), p(5.0, 4.0), p(9.0, 0.0)],
+                &(1.0..=7.0)
+            )),
+            [(1.0, 2.0), (3.0, 6.0), (5.0, 4.0), (7.0, 2.0)]
+        );
+        // all on one side: nothing
+        assert!(clip(&[p(8.0, 1.0), p(9.0, 1.0)], &(1.0..=7.0)).is_empty());
+    }
+
+    fn roll() -> SeriesKey {
+        SeriesKey {
+            type_name: "ATT".into(),
+            field: "Roll".into(),
+            instance: None,
+        }
+    }
+
+    fn test_log() -> LoadedLog {
+        LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::bytes()),
+            "test.bin".into(),
+        )
+    }
+
+    fn b_log() -> Arc<LoadedLog> {
+        Arc::new(LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::b_bytes()),
+            "b.bin".into(),
+        ))
+    }
+
+    #[test]
+    fn a_series_takes_b_side_where_b_has_the_field() {
+        let a = test_log();
+        let b = b_log();
+        let key = |type_name: &str, field: &str, instance| SeriesKey {
+            type_name: type_name.into(),
+            field: field.into(),
+            instance,
+        };
+        let mut plot = PlotPanel::default();
+        plot.toggle(roll(), &a);
+        plot.toggle(key("ATT", "Pitch", None), &a);
+        plot.toggle(key("IMU", "GyrX", Some(0)), &a);
+        plot.toggle(key("IMU", "GyrX", Some(1)), &a);
+        assert!(plot.selected.iter().all(|s| s.data_b.is_none()), "no B yet");
+
+        // B has the roll, no pitch, and its one IMU stands for A's first
+        plot.set_b(Some((Arc::clone(&b), -8.0)));
+        let sides: Vec<(bool, Option<&str>)> = plot
+            .selected
+            .iter()
+            .map(|s| (s.data_b.is_some(), s.b_note.as_deref()))
+            .collect();
+        assert_eq!(
+            sides,
+            [
+                (true, None),
+                (false, None),
+                (true, Some("B's IMU.GyrX")),
+                (false, None)
+            ]
+        );
+        assert_eq!(
+            plot.selected[0].data_b.as_ref().unwrap().ys,
+            [5.0, 6.0, 7.0, 8.0, 9.0]
+        );
+
+        // a seek, as the map's, reads both, B at the cursor less the offset
+        plot.seek(2.1);
+        let r = &plot.readout[0];
+        assert_eq!((r.a, r.b), (Some((2.1, 1.5)), Some((10.1, 6.0))));
+        assert!((r.difference.unwrap() + 4.5).abs() < 1e-9);
+        // the pitch reads A alone, B's place a dash
+        assert!(plot.readout[1].a.is_some() && plot.readout[1].b.is_none());
+        // a new offset reads again at once, keeping the extracted sides
+        let data = plot.selected[0].data_b.as_ref().unwrap().xs.as_ptr();
+        plot.set_b(Some((Arc::clone(&b), -7.9)));
+        assert_eq!(plot.readout[0].b, Some((10.0, 5.0)));
+        assert_eq!(plot.selected[0].data_b.as_ref().unwrap().xs.as_ptr(), data);
+
+        // a series picked while B is open takes its side at once
+        plot.toggle(roll(), &a);
+        plot.toggle(roll(), &a);
+        assert!(plot.selected.last().unwrap().data_b.is_some());
+
+        // closed, B's sides go, and the readout reads A alone
+        plot.set_b(None);
+        assert!(plot.selected.iter().all(|s| s.data_b.is_none()));
+        assert!(plot.readout.iter().all(|r| r.b.is_none()));
+        // a new A closes B
+        plot.set_b(Some((Arc::clone(&b), -8.0)));
+        plot.reload(&a);
+        assert!(plot.b.is_none());
+        assert!(plot.selected.iter().all(|s| s.data_b.is_none()));
+
+        // the other way round: A logs the type as one instance, B as two
+        let mut swapped = PlotPanel::default();
+        swapped.toggle(key("IMU", "GyrX", None), &b);
+        swapped.set_b(Some((Arc::new(test_log()), 0.0)));
+        assert_eq!(
+            swapped.selected[0].b_note.as_deref(),
+            Some("B's IMU[0].GyrX")
+        );
+        assert_eq!(swapped.selected[0].data_b.as_ref().unwrap().ys[..1], [0.25]);
+    }
+
+    /// A selected series with `ys` on the left axis at 0, 1, 2 s, and B's
+    /// `ys_b` at the same times, in `unit`.
+    fn pair(field: &str, ys: [f64; 3], ys_b: [f64; 3], unit: &str) -> Selected {
+        let xs = vec![0.0, 1.0, 2.0];
+        let mut s = Selected::new(
+            SeriesKey {
+                type_name: "T".into(),
+                field: field.into(),
+                instance: None,
+            },
+            field.into(),
+            YAxis::Left,
+            Color32::WHITE,
+            Series {
+                xs: xs.clone(),
+                ys: ys.to_vec(),
+            },
+        );
+        s.unit = Some(unit.into());
+        s.extent_b = extent(ys_b);
+        s.data_b = Some(Series {
+            xs,
+            ys: ys_b.to_vec(),
+        });
+        s
+    }
+
+    #[test]
+    fn the_readout_reads_both_sides_and_their_difference() {
+        let alt = pair("alt", [10.0, 20.0, 30.0], [9.0, 18.0, 33.0], "m");
+        let both = [alt];
+        // B read 0.1 s before the cursor, on its own clock
+        let r = &readout_at(&both, 1.0, &[], Some(-0.1))[0];
+        assert_eq!(
+            (r.a, r.b, r.difference),
+            (Some((1.0, 20.0)), Some((1.0, 18.0)), Some(2.0))
+        );
+        assert_eq!(
+            readout_text(r, 1.0, Some(1.1)),
+            "alt = 20  B 18 (-0.100 s)  \u{394} +2"
+        );
+        // outside a side's samples, that side is a dash, and so is the
+        // difference; the places stay
+        let r = &readout_at(&both, 2.5, &[], Some(0.6))[0];
+        assert_eq!((r.a, r.b), (None, Some((2.0, 33.0))));
+        assert_eq!(
+            readout_text(r, 2.5, Some(1.9)),
+            "alt = \u{2013}  B 33 (+0.100 s)  \u{394} \u{2013}"
+        );
+        // a hidden line reads as a dash; with both hidden the row goes
+        let key = both[0].key.clone();
+        let r = &readout_at(&both, 1.0, &[line_id_b(&key)], Some(0.0))[0];
+        assert_eq!((r.a.is_some(), r.b, r.difference), (true, None, None));
+        let r = &readout_at(&both, 1.0, &[line_id(&key)], Some(0.0))[0];
+        assert_eq!((r.a, r.b.is_some()), (None, true));
+        assert!(readout_at(&both, 1.0, &[line_id(&key), line_id_b(&key)], Some(0.0)).is_empty());
+
+        // a heading goes the short way round; a rate does not
+        let yaw = [pair("yaw", [359.0; 3], [1.0; 3], "degheading")];
+        assert_eq!(
+            readout_at(&yaw, 1.0, &[], Some(0.0))[0].difference,
+            Some(-2.0)
+        );
+        let back = [pair("yaw", [1.0; 3], [359.0; 3], "deg")];
+        assert_eq!(
+            readout_at(&back, 1.0, &[], Some(0.0))[0].difference,
+            Some(2.0)
+        );
+        let rate = [pair("rate", [359.0; 3], [1.0; 3], "deg/s")];
+        assert_eq!(
+            readout_at(&rate, 1.0, &[], Some(0.0))[0].difference,
+            Some(358.0)
+        );
+
+        // no difference across units, and the chip says why
+        let mut alt = pair("alt", [10.0; 3], [900.0; 3], "m");
+        alt.unit_b = Some("cm".into());
+        assert_eq!(
+            alt.b_hover().as_deref(),
+            Some("B logs it in cm: no \u{394} is read")
+        );
+        let r = &readout_at(std::slice::from_ref(&alt), 1.0, &[], Some(0.0))[0];
+        assert_eq!(
+            (r.a, r.b, r.difference),
+            (Some((1.0, 10.0)), Some((1.0, 900.0)), None)
+        );
+        alt.unit_b = Some("m".into());
+        assert_eq!(alt.b_hover(), None);
+        // a heading is degrees, as an angle is
+        let mut yaw = [pair("yaw", [359.0; 3], [1.0; 3], "deg")];
+        yaw[0].unit_b = Some("degheading".into());
+        assert_eq!(
+            readout_at(&yaw, 1.0, &[], Some(0.0))[0].difference,
+            Some(-2.0)
+        );
+        alt.data_b = None;
+        assert_eq!(alt.b_hover().as_deref(), Some("not in B"));
+        assert!((difference(10.0, 190.0, true) - 180.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn b_is_thinned_where_it_shows_and_drawn_on_a_clock() {
+        let s = series(20_000);
+        // B's 10 s to 11 s drawn at 60 s to 61 s
+        let moved = decimate_moved(&s.xs, &s.ys, &(60.0..=61.0), 800.0, |y| y, 50.0);
+        let plain = decimate(&s.xs, &s.ys, &(10.0..=11.0), 800.0, |y| y);
+        assert_eq!(moved.len(), plain.len());
+        for (m, p) in moved.iter().zip(&plain) {
+            assert!((m.x - p.x - 50.0).abs() < 1e-9 && (m.y - p.y).abs() < 1e-12);
+        }
+        assert!(moved[0].x < 60.0 && moved.last().unwrap().x > 61.0);
+        // nowhere near: nothing
+        assert!(decimate_moved(&s.xs, &s.ys, &(0.0..=1.0), 800.0, |y| y, 7200.0).is_empty());
+    }
+
+    #[test]
+    fn a_swap_finds_a_side_as_b_side_is_found() {
+        let a = test_log();
+        let b = b_log();
+        let gyr = |instance| SeriesKey {
+            type_name: "IMU".into(),
+            field: "GyrX".into(),
+            instance,
+        };
+        // the title without its unit, which only the test log gives
+        let name = |s: &Selected| s.title.split(' ').next().unwrap().to_string();
+        let mut plot = PlotPanel::default();
+        plot.toggle(gyr(Some(0)), &a);
+        plot.toggle(gyr(Some(1)), &a);
+        // B's one IMU stands for A's first
+        plot.set_b(Some((Arc::clone(&b), -8.0)));
+        assert_eq!(plot.selected[0].b_note.as_deref(), Some("B's IMU.GyrX"));
+
+        // swapped, that IMU is A's side of the first, under its own name,
+        // and the second, which the new A lacks, is B's alone
+        plot.swap(&b, Arc::new(test_log()), 8.0);
+        let sides: Vec<(String, bool, bool)> = plot
+            .selected
+            .iter()
+            .map(|s| (name(s), s.only_b(), s.data_b.is_some()))
+            .collect();
+        assert_eq!(
+            sides,
+            [
+                ("IMU.GyrX".to_string(), false, true),
+                ("IMU[1].GyrX".to_string(), true, true)
+            ]
+        );
+        assert_eq!(plot.selected[0].data.ys, b.series(&gyr(None)).unwrap().ys);
+        assert_eq!(
+            plot.selected[0].key,
+            gyr(Some(0)),
+            "the series keeps its key"
+        );
+        // the side panel ticks the new A's field, and the second ticks none
+        assert!(plot.is_selected(&gyr(None)));
+        assert!(!plot.is_selected(&gyr(Some(0))) && !plot.is_selected(&gyr(Some(1))));
+
+        // and back, as it was
+        plot.swap(&a, Arc::clone(&b), -8.0);
+        let titles: Vec<String> = plot.selected.iter().map(name).collect();
+        assert_eq!(titles, ["IMU[0].GyrX", "IMU[1].GyrX"]);
+        assert!(plot.selected.iter().all(|s| !s.only_b()));
+        assert!(plot.is_selected(&gyr(Some(0))) && !plot.is_selected(&gyr(None)));
+
+        // swapped again, unticking the new A's field takes off the series
+        // already there rather than adding a second
+        plot.swap(&b, Arc::new(test_log()), 8.0);
+        plot.toggle(gyr(None), &b);
+        let keys: Vec<&SeriesKey> = plot.selected.iter().map(|s| &s.key).collect();
+        assert_eq!(keys, [&gyr(Some(1))]);
+        assert!(!plot.is_selected(&gyr(None)));
+    }
+
+    #[test]
+    fn a_field_only_b_has_plots_for_b_side_alone() {
+        let a = test_log();
+        let extra = Arc::new(LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::b_extra_bytes()),
+            "c.bin".into(),
+        ));
+        let gyr2 = SeriesKey {
+            type_name: "IMU".into(),
+            field: "GyrX".into(),
+            instance: Some(2),
+        };
+        let mut plot = PlotPanel::default();
+        // without B, nothing
+        plot.toggle_b(gyr2.clone());
+        assert!(plot.selected.is_empty());
+
+        plot.toggle(roll(), &a);
+        plot.set_b(Some((Arc::clone(&extra), -10.0)));
+        plot.toggle_b(gyr2.clone());
+        assert_eq!(plot.selected.len(), 2);
+        let s = &plot.selected[1];
+        assert!(s.only_b() && s.data.xs.is_empty());
+        assert_eq!(s.b_key.as_ref(), Some(&gyr2));
+        assert_eq!(
+            (s.unit.as_deref(), s.unit_b.as_deref()),
+            (None, Some("rad/s"))
+        );
+        assert_eq!(s.title, "IMU[2].GyrX (rad/s)");
+        assert_eq!(s.color, PALETTE[1], "the next color");
+        assert_eq!(s.b_hover().as_deref(), Some("not in A"));
+        // ticked as B's, not A's, and never written as one of A's
+        assert!(plot.is_selected_b(&gyr2) && !plot.is_selected(&gyr2));
+        assert_eq!(plot.showing().count(), 1);
+        assert!(plot.has_a_series());
+        // A's line hidden through the legend: still a series of A's
+        plot.hidden = vec![line_id(&roll())];
+        assert_eq!(plot.showing().count(), 0);
+        assert!(plot.has_a_series());
+        plot.hidden.clear();
+        // A's series off: B's line alone, which no export writes
+        plot.toggle(roll(), &a);
+        assert!(!plot.has_a_series());
+        // a second tick takes it off
+        plot.toggle_b(gyr2.clone());
+        assert!(plot.selected.is_empty() && !plot.is_selected_b(&gyr2));
+        // a field B lacks puts nothing on
+        plot.toggle_b(SeriesKey {
+            field: "AccX".into(),
+            ..gyr2.clone()
+        });
+        assert!(plot.selected.is_empty());
+
+        // B's key is kept with B's side, and goes with it
+        plot.toggle(roll(), &a);
+        assert_eq!(plot.selected[0].b_key.as_ref(), Some(&roll()));
+        plot.set_b(None);
+        assert_eq!(plot.selected[0].b_key, None);
+    }
+
+    #[test]
+    fn a_swap_left_series_ticks_by_b_key_in_its_other_instance_form() {
+        let one = Arc::new(LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::b_bytes()),
+            "one.bin".into(),
+        ));
+        let two = Arc::new(test_log());
+        let mut w = dflog::write::LogWriter::new();
+        w.define(6, "ATT", "Qc", &["TimeUS", "Roll"]).unwrap();
+        w.record(
+            "ATT",
+            &[
+                dflog::access::Value::U64(1_000_000),
+                dflog::access::Value::F64(1.0),
+            ],
+        )
+        .unwrap();
+        let no_imu = Arc::new(LoadedLog::build(
+            dflog::Log::from_bytes(&w.into_bytes()),
+            "none.bin".into(),
+        ));
+        let gyr = |instance| SeriesKey {
+            type_name: "IMU".into(),
+            field: "GyrX".into(),
+            instance,
+        };
+        // IMU.GyrX picked from a log of one IMU, the series keyed so
+        let mut plot = PlotPanel::default();
+        plot.toggle(gyr(None), &one);
+        // swapped with a log of two, then compared with one of none, and
+        // swapped again: B's alone, keyed IMU, B's side read as IMU[0]
+        plot.set_b(Some((Arc::clone(&two), 0.0)));
+        plot.swap(&two, Arc::clone(&one), 0.0);
+        plot.set_b(Some((Arc::clone(&no_imu), 0.0)));
+        plot.swap(&no_imu, Arc::clone(&two), 0.0);
+        let s = &plot.selected[0];
+        assert!(s.only_b());
+        assert_eq!(
+            (s.key.clone(), s.b_key.clone()),
+            (gyr(None), Some(gyr(Some(0))))
+        );
+        // and named as B names it
+        assert_eq!(s.title, "IMU[0].GyrX (rad/s)");
+        // B's list names it IMU[0]: ticked, and a tick takes it off rather
+        // than plotting it twice
+        assert!(plot.is_selected_b(&gyr(Some(0))) && !plot.is_selected_b(&gyr(None)));
+        plot.toggle_b(gyr(Some(0)));
+        assert!(plot.selected.is_empty());
+    }
+
+    #[test]
+    fn a_field_from_b_then_a_swap_is_a_s() {
+        let a = test_log();
+        let extra = Arc::new(LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::b_extra_bytes()),
+            "c.bin".into(),
+        ));
+        let vibe = SeriesKey {
+            type_name: "VIBE".into(),
+            field: "VibeX".into(),
+            instance: None,
+        };
+        let mut plot = PlotPanel::default();
+        plot.set_b(Some((Arc::clone(&extra), 0.0)));
+        plot.toggle_b(vibe.clone());
+        // swapped, the field is the new A's, which A's tree ticks
+        plot.swap(&extra, Arc::new(test_log()), 0.0);
+        assert!(!plot.selected[0].only_b());
+        assert!(plot.is_selected(&vibe) && !plot.is_selected_b(&vibe));
+        // swapped back, B's alone again
+        plot.swap(&a, Arc::clone(&extra), 0.0);
+        assert!(plot.selected[0].only_b() && plot.is_selected_b(&vibe));
+        // Close B drops it
+        plot.set_b(None);
+        assert!(plot.selected.is_empty());
+
+        // picked from B, then a new A that logs the field: A's
+        plot.set_b(Some((Arc::clone(&extra), 0.0)));
+        plot.toggle_b(vibe.clone());
+        let other = LoadedLog::build(
+            dflog::Log::from_bytes(&crate::model::testlog::b_extra_bytes()),
+            "d.bin".into(),
+        );
+        plot.reload(&other);
+        let s = &plot.selected[0];
+        assert!(!s.only_b() && !s.data.xs.is_empty());
+        assert_eq!(s.key, vibe);
+        assert!(plot.is_selected(&vibe));
+    }
+
+    #[test]
+    fn a_new_a_reads_a_swapped_series_by_the_field_it_shows() {
+        let a = test_log();
+        let b = b_log();
+        let gyr = |instance| SeriesKey {
+            type_name: "IMU".into(),
+            field: "GyrX".into(),
+            instance,
+        };
+        let mut plot = PlotPanel::default();
+        plot.toggle(gyr(Some(0)), &a);
+        plot.toggle(gyr(Some(1)), &a);
+        plot.set_b(Some((Arc::clone(&b), -8.0)));
+        plot.swap(&b, Arc::new(test_log()), 8.0);
+        assert!(plot.is_selected(&gyr(None)));
+
+        // another log of one IMU opened as A: the series showing its IMU
+        // stays, keyed as that log keys it; the one B alone had goes with B
+        plot.reload(&b_log());
+        let keys: Vec<&SeriesKey> = plot.selected.iter().map(|s| &s.key).collect();
+        assert_eq!(keys, [&gyr(None)]);
+        assert!(plot.is_selected(&gyr(None)));
+        assert!(plot.selected[0].data_b.is_none() && !plot.selected[0].only_b());
+
+        // and a log of two IMUs then reads it as one no more, as before
+        plot.reload(&a);
+        assert!(plot.selected.is_empty());
+    }
+
+    #[test]
+    fn a_swap_keeps_the_hidden_sides_and_the_moment_in_view() {
+        let log = test_log();
+        let settings = Settings::default();
+        let mut harness = roll_plot(&log, &settings);
+        let b = b_log();
+        harness.state_mut().0.set_b(Some((Arc::clone(&b), -8.0)));
+        harness.run();
+        // A's roll hidden, the view on 2 s to 3 s, the playhead at 2.1 s
+        let id = Id::new(PLOT_ID);
+        let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        memory.hidden_items.insert(line_id(&roll()));
+        memory.store(&harness.ctx, id);
+        PlotPanel::zoom_to(&harness.ctx, 2.0..=3.0);
+        harness.state_mut().0.seek(2.1);
+        harness.run();
+        assert_eq!(harness.state().0.hidden, [line_id(&roll())]);
+
+        // B the new A, and the test log B, 8 s on on its clock
+        harness.state_mut().0.swap(&b, Arc::new(test_log()), 8.0);
+        assert_eq!(harness.state().0.hidden, [line_id_b(&roll())]);
+        harness.run();
+        let memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        assert!(memory.hidden_items.contains(&line_id_b(&roll())));
+        assert!(!memory.hidden_items.contains(&line_id(&roll())));
+        assert_eq!(harness.state().0.hidden, [line_id_b(&roll())]);
+        let view = transform(&harness).bounds().range_x();
+        assert!(
+            (view.start() - 10.0).abs() < 1e-6 && (view.end() - 11.0).abs() < 1e-6,
+            "{view:?}"
+        );
+        let playhead = harness.state().0.playhead.unwrap();
+        assert!((playhead - 10.1).abs() < 1e-9, "{playhead}");
+
+        // swapped back with an offset that puts the moment past the new
+        // A's end: the playhead is held at the end, and the view, moved
+        // by the offset alone, pans onto it
+        let end = *log.time_range().unwrap().end();
+        harness.state_mut().0.swap(&log, Arc::clone(&b), 30.0);
+        harness.run();
+        let playhead = harness.state().0.playhead.unwrap();
+        assert!((playhead - end).abs() < 1e-9, "{playhead} at the end {end}");
+        let view = transform(&harness).bounds().range_x();
+        assert!(view.contains(&playhead), "{view:?} holds {playhead}");
+        // panned, not reset: still the second the zoom set up
+        assert!((view.end() - view.start() - 1.0).abs() < 1e-6, "{view:?}");
+    }
+
+    #[test]
+    fn a_swap_pans_a_zoomed_view_onto_a_playhead_the_clamp_held_back() {
+        let a = test_log();
+        let b = b_log();
+        let end = *a.time_range().unwrap().end();
+        let mut plot = PlotPanel::default();
+        plot.toggle(roll(), &a);
+        plot.set_b(Some((Arc::clone(&b), 0.0)));
+        // within the new A's range, the view moves with the playhead
+        plot.playhead = Some(1.0);
+        plot.swap(&a, Arc::clone(&b), 0.5);
+        assert_eq!((plot.playhead, plot.pending_seek), (Some(1.5), None));
+        // held back to the new A's end, the view pans there
+        plot.playhead = Some(end + 5.0);
+        plot.swap(&a, b, 0.0);
+        assert_eq!((plot.playhead, plot.pending_seek), (Some(end), Some(end)));
+    }
+
+    #[test]
+    fn b_s_extent_takes_in_the_points_drawn_on_the_edges() {
+        let mut s = pair("alt", [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], "m");
+        // B's samples at 9.9 s and 10.5 s, 0 and 1000, A's range to 10 s:
+        // the line is drawn to 10 s, up to about 167
+        s.data_b = Some(Series {
+            xs: vec![9.9, 10.5],
+            ys: vec![0.0, 1000.0],
+        });
+        s.fit_b_extent((0.0, 10.0));
+        let (low, high) = s.extent_b.unwrap();
+        assert!(low == 0.0 && (high - 1000.0 / 6.0).abs() < 1e-9, "{high}");
+        // a sample on the edge is drawn as it is, and no point beyond it
+        s.fit_b_extent((0.0, 10.5));
+        assert_eq!(s.extent_b, Some((0.0, 1000.0)));
+        s.fit_b_extent((0.0, 9.9));
+        assert_eq!(s.extent_b, Some((0.0, 0.0)));
+        // no sample inside: the line across the range alone
+        s.fit_b_extent((10.0, 10.2));
+        let (low, high) = s.extent_b.unwrap();
+        assert!((low - 1000.0 / 6.0).abs() < 1e-9 && (high - 500.0).abs() < 1e-9);
+        s.fit_b_extent((20.0, 30.0));
+        assert_eq!(s.extent_b, None);
+    }
+
+    #[test]
+    fn each_axis_covers_both_sides_as_drawn() {
+        let a = pair("a", [0.0, 5.0, 10.0], [-10.0, 0.0, 20.0], "m");
+        let mut b = pair("b", [100.0, 200.0, 300.0], [50.0, 100.0, 100.0], "m");
+        b.axis = YAxis::Right;
+        let both = [a, b];
+        let map = AxisMap::new(&both).unwrap();
+        assert_eq!((map.left, map.right), ((-10.0, 20.0), (50.0, 300.0)));
+
+        // B's samples the whole-flight view clips off size no axis: B 1 s
+        // later than A on A's clock, A's 0 s to 2 s are B's -1 s to 1 s
+        let mut plot = PlotPanel {
+            selected: both.into(),
+            b: Some(PlotB {
+                log: b_log(),
+                offset: 1.0,
+            }),
+            ..PlotPanel::default()
+        };
+        plot.fit_b_extents();
+        let map = AxisMap::new(&plot.selected).unwrap();
+        assert_eq!((map.left, map.right), ((-10.0, 10.0), (50.0, 300.0)));
+        assert_eq!(plot.selected[1].extent_b, Some((50.0, 100.0)));
+        // hiding lines through the legend changes nothing of it, on either
+        // side, so no other line moves
+        let hidden: Vec<Id> = plot
+            .selected
+            .iter()
+            .flat_map(|s| [line_id(&s.key), line_id_b(&s.key)])
+            .collect();
+        plot.hidden = hidden;
+        plot.fit_b_extents();
+        assert_eq!(plot.selected[1].extent_b, Some((50.0, 100.0)));
+        assert_eq!(AxisMap::new(&plot.selected).unwrap(), map);
+        // where A has no samples, all of B counts
+        for s in &mut plot.selected {
+            s.replace_data(Series::default());
+        }
+        plot.fit_b_extents();
+        assert_eq!(plot.selected[0].extent_b, Some((-10.0, 20.0)));
+    }
+
+    #[test]
+    fn the_legend_hides_b_line_alone_and_b_never_widens_the_whole_flight_view() {
+        let log = test_log();
+        let settings = Settings::default();
+        let mut harness = roll_plot(&log, &settings);
+        let alone = transform(&harness).bounds().range_x();
+
+        // B lined up over A, with a sample past a gap far after A's end:
+        // the view stays A's
+        harness.state_mut().0.set_b(Some((b_log(), -8.0)));
+        harness.run();
+        assert_eq!(transform(&harness).bounds().range_x(), alone);
+        // and B flying two hours after A draws nothing in it
+        harness.state_mut().0.set_b(Some((b_log(), 7200.0)));
+        harness.run();
+        assert_eq!(transform(&harness).bounds().range_x(), alone);
+
+        // B's entry in the legend hides B's line alone
+        harness.state_mut().0.set_b(Some((b_log(), -8.0)));
+        harness.run();
+        let frame = *transform(&harness).frame();
+        let entry = harness
+            .get_all_by_label("ATT.Roll (deg) (B)")
+            .map(|node| node.rect().center())
+            .find(|center| frame.contains(*center))
+            .expect("the legend names B's line");
+        click_at(&mut harness, entry);
+        assert_eq!(harness.state().0.hidden, [line_id_b(&roll())]);
+        assert_eq!(harness.state().0.showing().count(), 1, "A's stays");
+        harness.state_mut().0.seek(2.1);
+        let r = &harness.state().0.readout[0];
+        assert!(r.a.is_some() && r.b.is_none());
+    }
+
+    #[test]
+    fn with_no_line_of_a_shown_the_whole_flight_view_fits_b() {
+        let log = test_log();
+        let settings = Settings::default();
+        let mut harness = roll_plot(&log, &settings);
+        harness.state_mut().0.set_b(Some((b_log(), -8.0)));
+        let id = Id::new(PLOT_ID);
+        let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        memory.hidden_items.insert(line_id(&roll()));
+        memory.store(&harness.ctx, id);
+        harness.run();
+        // B's roll, 10.0 s to 20 s on its clock, 2.0 s to 12 s on A's
+        let view = transform(&harness).bounds().range_x();
+        assert!(*view.start() < 2.0 && *view.end() > 12.0, "{view:?}");
+        assert!(*view.end() < 13.0, "the view settles on B: {view:?}");
+        harness.run();
+        assert_eq!(transform(&harness).bounds().range_x(), view);
+    }
+
+    #[test]
+    fn a_new_b_starts_with_its_lines_shown() {
+        let log = test_log();
+        let settings = Settings::default();
+        let mut harness = roll_plot(&log, &settings);
+        let first = b_log();
+        harness
+            .state_mut()
+            .0
+            .set_b(Some((Arc::clone(&first), -8.0)));
+        harness.run();
+        let id = Id::new(PLOT_ID);
+        let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        memory.hidden_items.insert(line_id_b(&roll()));
+        memory.store(&harness.ctx, id);
+        harness.run();
+        assert_eq!(harness.state().0.hidden, [line_id_b(&roll())]);
+        // a new offset for the same B keeps what the legend hid
+        harness
+            .state_mut()
+            .0
+            .set_b(Some((Arc::clone(&first), -7.0)));
+        harness.run();
+        assert_eq!(harness.state().0.hidden, [line_id_b(&roll())]);
+        // another B, or the same log opened again, starts afresh, and so
+        // does the readout
+        harness.state_mut().0.set_b(Some((b_log(), -8.0)));
+        harness.state_mut().0.seek(2.1);
+        assert!(harness.state().0.readout[0].b.is_some());
+        harness.run();
+        assert!(harness.state().0.hidden.is_empty());
+        let memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        assert!(memory.hidden_items.is_empty());
+
+        // B's line hidden and its series taken off, the legend is empty
+        // and forgets nothing: the line's id goes from the memory all the
+        // same, so the series picked again starts with B's line shown
+        let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        memory.hidden_items.insert(line_id_b(&roll()));
+        memory.store(&harness.ctx, id);
+        harness.run();
+        assert_eq!(harness.state().0.hidden, [line_id_b(&roll())]);
+        harness.state_mut().0.remove(0);
+        harness.run();
+        let memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        assert!(memory.hidden_items.is_empty());
+        harness.state_mut().0.toggle(roll(), &log);
+        harness.state_mut().0.seek(2.1);
+        harness.run();
+        assert!(harness.state().0.hidden.is_empty());
+        assert!(harness.state().0.readout[0].b.is_some());
+    }
+
+    #[test]
+    fn a_chip_says_what_b_has_of_it() {
+        let log = test_log();
+        let settings = Settings::default();
+        let mut harness = roll_plot(&log, &settings);
+        for key in [
+            SeriesKey {
+                type_name: "ATT".into(),
+                field: "Pitch".into(),
+                instance: None,
+            },
+            SeriesKey {
+                type_name: "IMU".into(),
+                field: "GyrX".into(),
+                instance: Some(0),
+            },
+        ] {
+            harness.state_mut().0.toggle(key, &log);
+        }
+        harness.state_mut().0.set_b(Some((b_log(), -8.0)));
+        harness.run();
+        let frame = *transform(&harness).frame();
+        let chip = |harness: &egui_kittest::Harness<'_, (PlotPanel, bool)>, title: &str| {
+            harness
+                .get_all_by_label(title)
+                .map(|node| node.rect().center())
+                .find(|center| !frame.contains(*center))
+                .expect("the series has a chip above the plot")
+        };
+        for (title, hover) in [
+            ("ATT.Pitch (deg)", "not in B"),
+            ("IMU[0].GyrX (rad/s)", "B's IMU.GyrX"),
+        ] {
+            harness.hover_at(chip(&harness, title));
+            harness.run_steps(20);
+            harness.get_by_label(hover);
+        }
+        // the roll, which B has as A does, says nothing
+        harness.hover_at(chip(&harness, "ATT.Roll (deg)"));
+        harness.run_steps(20);
+        assert!(harness.query_by_label("not in B").is_none());
+        assert!(harness.query_by_label_contains("B's ").is_none());
     }
 
     #[test]

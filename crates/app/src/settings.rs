@@ -1,7 +1,8 @@
 //! Preferences that survive a restart: theme, time axis, mode bands, which
 //! panels are open and what the bottom one shows, map tiles, the playback
-//! speed, recent files and the export folder. Stored through eframe's
-//! key-value storage, a file next to the app's config on native.
+//! speed, how a second log lines up with the first, recent files and the
+//! export folder. Stored through eframe's key-value storage, a file next
+//! to the app's config on native.
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,34 @@ pub enum TimeAxis {
     Boot,
     /// UTC through the first GPS fix; boot time when the log has none.
     Utc,
+}
+
+/// How log B lines up with A on the time axis: the ways worked out
+/// from the logs. An offset set by hand lasts only while the pair is
+/// open, and is not one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Align {
+    /// Each log's arming at the same moment.
+    #[default]
+    Arming,
+    /// Each log's earliest time at the same moment.
+    Start,
+    /// The same moment on the wall clock, through the logs' GPS time.
+    Utc,
+}
+
+impl Align {
+    pub const ALL: [Align; 3] = [Align::Arming, Align::Start, Align::Utc];
+
+    /// What the alignment's box says.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Align::Arming => "At arming",
+            Align::Start => "At the start",
+            Align::Utc => "By UTC",
+        }
+    }
 }
 
 /// What the bottom panel lists.
@@ -59,6 +88,8 @@ pub struct Settings {
     pub speed: Speed,
     /// The map keeps the vehicle in view, until moved by hand.
     pub follow_map: bool,
+    /// How a second log lines up with the first.
+    pub align: Align,
     /// Most recent first.
     pub recent: Vec<PathBuf>,
     /// Where the last export went, for the next save dialog to open in.
@@ -78,6 +109,7 @@ impl Default for Settings {
             online_tiles: true,
             speed: Speed::default(),
             follow_map: true,
+            align: Align::default(),
             recent: Vec::new(),
             export_dir: None,
         }
@@ -120,6 +152,7 @@ mod tests {
             show_modes: false,
             speed: Speed::default().faster(),
             follow_map: false,
+            align: Align::Utc,
             ..Settings::default()
         };
         settings.remember(Path::new("flight.bin"));
@@ -137,6 +170,7 @@ mod tests {
         assert_eq!(partial.bottom_tab, BottomTab::Events);
         assert_eq!(partial.speed, Speed::default());
         assert!(partial.follow_map);
+        assert_eq!(partial.align, Align::Arming);
         assert!(partial.recent.is_empty());
         assert_eq!(partial.export_dir, None);
 

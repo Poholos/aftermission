@@ -6,6 +6,7 @@
 // is built from this file too and would print nothing.
 #![cfg_attr(all(not(debug_assertions), not(test)), windows_subsystem = "windows")]
 
+mod align;
 mod app;
 mod codes;
 mod csv;
@@ -103,12 +104,12 @@ fn main() {
         if query_has(&search, "webgl") {
             force_webgl(&mut options);
         }
-        let open_demo = query_has(&search, "demo");
+        let startup = startup(&search);
         if let Err(err) = eframe::WebRunner::new()
             .start(
                 canvas,
                 options,
-                Box::new(move |cc| Ok(Box::new(app::AftermissionApp::new(cc, open_demo)))),
+                Box::new(move |cc| Ok(Box::new(app::AftermissionApp::new(cc, startup)))),
             )
             .await
         {
@@ -133,6 +134,19 @@ fn query_has(search: &str, key: &str) -> bool {
         .trim_start_matches('?')
         .split('&')
         .any(|pair| pair.split('=').next() == Some(key))
+}
+
+/// What the page opens as it starts: the demo pair for `?compare`,
+/// which wins over `?demo`, the demo for `?demo`, else nothing.
+#[cfg(any(target_arch = "wasm32", test))]
+fn startup(search: &str) -> app::Startup {
+    if query_has(search, "compare") {
+        app::Startup::Pair
+    } else if query_has(search, "demo") {
+        app::Startup::Demo
+    } else {
+        app::Startup::Nothing
+    }
 }
 
 /// Leave WebGPU out of the backends wgpu may pick, so it starts on
@@ -183,7 +197,7 @@ mod web_log {
 
 #[cfg(test)]
 mod tests {
-    use super::{icon, query_has};
+    use super::{app::Startup, icon, query_has, startup};
 
     #[test]
     fn the_window_icon_is_the_painted_png() {
@@ -206,5 +220,17 @@ mod tests {
         assert!(!query_has("?nowebgl", "webgl"));
         assert!(!query_has("?demonstration", "demo"));
         assert!(!query_has("?webgl", "demo"));
+    }
+
+    #[test]
+    fn the_address_opens_the_demo_or_the_pair() {
+        assert_eq!(startup(""), Startup::Nothing);
+        assert_eq!(startup("?webgl"), Startup::Nothing);
+        assert_eq!(startup("?demo"), Startup::Demo);
+        assert_eq!(startup("?compare"), Startup::Pair);
+        // the pair wins, whatever the order
+        assert_eq!(startup("?demo&compare"), Startup::Pair);
+        assert_eq!(startup("?compare&demo"), Startup::Pair);
+        assert_eq!(startup("?comparison"), Startup::Nothing);
     }
 }

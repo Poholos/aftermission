@@ -1,27 +1,32 @@
 //! The map: the vehicle's track over OpenStreetMap tiles, with the plot's
 //! cursor marked on it by an arrow along the vehicle's heading, and a
 //! view that can follow it. Hovering the track reads a point's time; a
-//! click seeks the plot to it.
+//! click seeks the plot to it. While a second log, B, is open, its track
+//! draws under A's, lighter, with a marker of its own.
 
 use dflog::time::TimeBase;
-use egui::{Color32, Pos2, Rect, Stroke};
+use egui::{Color32, Painter, Pos2, Rect, Stroke};
 use walkers::sources::OpenStreetMap;
 use walkers::{HttpOptions, HttpTiles, Map, MapMemory, Position, Projector, Tiles, lat_lon};
 
-use crate::model::{Bounds, LoadedLog, Track};
+use crate::model::{Bounds, LoadedLog, Track, nearest_within};
+use crate::settings::TimeAxis;
 use crate::timefmt;
+use crate::worker::Slot;
 
 /// The map's state between frames.
 pub struct MapPanel {
     /// The tile downloader, while tiles are wanted.
     tiles: Option<HttpTiles>,
     memory: MapMemory,
-    /// Fit the view to the track on the next frame: set when a log opens,
+    /// Fit the view to the tracks on the next frame: set when a log opens,
     /// and by the Fit button.
     fit_pending: bool,
-    /// The track on screen for the view it was projected in, so a still
+    /// A's track on screen for the view it was projected in, so a still
     /// map costs nothing per frame.
     projected: Option<ProjectedTrack>,
+    /// B's, the same way.
+    projected_b: Option<ProjectedTrack>,
     /// The zoom and center Follow last left the view at: a view that
     /// differs from it by the next frame was moved by hand.
     followed: Option<(f64, Position)>,
@@ -34,13 +39,17 @@ impl Default for MapPanel {
             memory: MapMemory::default(),
             fit_pending: true,
             projected: None,
+            projected_b: None,
             followed: None,
         }
     }
 }
 
-/// The track's points on screen, with the view they hold for.
+/// A track's points on screen, with the log and the view they hold for.
 struct ProjectedTrack {
+    /// The log whose track it is, by its id: another log's track under
+    /// an unchanged view is projected afresh.
+    log: u64,
     zoom: f64,
     center: Position,
     rect: Rect,
@@ -55,13 +64,16 @@ impl std::fmt::Debug for MapPanel {
             .field("memory", &self.memory)
             .field("fit_pending", &self.fit_pending)
             .field("projected", &self.projected.is_some())
+            .field("projected_b", &self.projected_b.is_some())
             .field("followed", &self.followed)
             .finish()
     }
 }
 
-/// The track's line.
+/// A's track line.
 const TRACK_COLOR: Color32 = Color32::from_rgb(255, 140, 40);
+/// B's, a lighter orange, as B's lines on the plot are lighter than A's.
+const TRACK_COLOR_B: Color32 = Color32::from_rgb(255, 205, 150);
 /// Drawn under a white ring, so it reads on light tiles as on the plain
 /// dark background.
 const HALO: Stroke = Stroke {
@@ -75,51 +87,79 @@ const HIT_DISTANCE: f32 = 12.0;
 /// side a fitted track keeps clear, so the whole track in view stays.
 const FOLLOW_REACH: f32 = 0.45;
 
+/// A track on the map this frame: whose it is, and the clock its hover
+/// labels read through.
+#[derive(Clone, Copy)]
+struct Shown<'a> {
+    slot: Slot,
+    log: &'a LoadedLog,
+    clock: Option<TimeBase>,
+}
+
+impl Shown<'_> {
+    fn track(&self) -> &Track {
+        &self.log.track
+    }
+}
+
 impl MapPanel {
     /// A new log is on: show the whole of its track.
     pub fn reload(&mut self) {
         self.fit_pending = true;
         self.projected = None;
+        self.projected_b = None;
+    }
+
+    /// Fit the view to the tracks on the next frame, as B's arrival and
+    /// its closing do.
+    pub fn refit(&mut self) {
+        self.fit_pending = true;
+    }
+
+    /// Whether the next frame fits the view to the tracks; for tests.
+    #[cfg(test)]
+    pub(crate) fn fits(&self) -> bool {
+        self.fit_pending
     }
 
     /// The map of `log`'s track with the point nearest `cursor` marked,
-    /// by an arrow along the vehicle's heading where the log gives one;
-    /// hover labels read through `clock` as the readout does. With
-    /// `online`, tiles are downloaded from OpenStreetMap; without, the
-    /// track draws on a plain background. With `follow`, the map centers
-    /// on the marker when it nears the view's edge, and a drag, scroll or
-    /// zoom of the map by hand turns `follow` off. Returns the time of a
-    /// track point clicked, to seek to.
+    /// by an arrow along the vehicle's heading where the log gives one,
+    /// and with `b` open, B's track under it, moved onto A's clock by its
+    /// offset, with a ring at B's point at the cursor, where B's track
+    /// reaches. Hover labels read each log's time through its own clock,
+    /// as `axis` chooses. With `online`, tiles are downloaded from
+    /// OpenStreetMap; without, the tracks draw on a plain background. With
+    /// `follow`, the map centers on the marker, A's or B's when only B has
+    /// a track, when it nears the view's edge, and a drag, scroll or zoom
+    /// of the map by hand turns `follow` off. Returns the time of a track
+    /// point clicked, on its own log's clock, with whose it is, to seek to.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "what the map shows each frame, each from another owner"
+    )]
     pub fn show(
         &mut self,
         ui: &mut egui::Ui,
         log: &LoadedLog,
+        b: Option<(&LoadedLog, f64)>,
         cursor: Option<f64>,
-        clock: Option<TimeBase>,
+        axis: TimeAxis,
         online: bool,
         follow: &mut bool,
-    ) -> Option<f64> {
-        let track = &log.track;
-        let Some(bounds) = track.bounds() else {
-            ui.centered_and_justified(|ui| {
-                ui.weak("No position in this log: no POS records, and no GPS records with a fix.");
-            });
-            return None;
+    ) -> Option<(Slot, f64)> {
+        let a = Shown {
+            slot: Slot::A,
+            log,
+            clock: log.wall_clock(axis),
         };
-        ui.horizontal(|ui| {
-            ui.weak(format!(
-                "Track from {} ({} points)",
-                track.source,
-                track.len()
-            ));
-            if ui
-                .small_button("Fit")
-                .on_hover_text("Show the whole track")
-                .clicked()
-            {
-                self.fit_pending = true;
-            }
+        let shown_b = b.map(|(b, _)| Shown {
+            slot: Slot::B,
+            log: b,
+            clock: b.wall_clock(axis),
         });
+        let track = a.track();
+        let track_b = b.map(|(b, _)| &b.track).filter(|t| !t.is_empty());
+        let bounds = self.header(ui, track, track_b, b.is_some())?;
         self.sync_tiles(ui.ctx(), online);
 
         let center = center(bounds);
@@ -137,9 +177,13 @@ impl MapPanel {
             index: i,
             heading: cursor.and_then(|t| log.heading_at(t)),
         });
+        // B's point at the cursor, on B's clock, only where B's track is
+        let marker_b = b
+            .zip(track_b)
+            .and_then(|((_, offset), t)| within(t, cursor? - offset));
         let attribution = self.tiles.as_ref().map(Tiles::attribution);
         let tiles = self.tiles.as_mut().map(|t| t as &mut dyn Tiles);
-        let projected = &mut self.projected;
+        let (projected, projected_b) = (&mut self.projected, &mut self.projected_b);
         let response = Map::new(tiles, &mut self.memory, center).show(
             ui,
             |ui, response, projector, memory| {
@@ -148,16 +192,42 @@ impl MapPanel {
                     memory.detached().unwrap_or(center),
                     response.rect,
                 );
-                let points = project(projected, view, track, projector);
-                let seek = draw_track(ui, response, projector, track, points, marker, clock);
-                let marker_at = marker.map(|m| screen(projector, track, m.index));
+                let painter = ui.painter().with_clip_rect(response.rect);
+                let points_b = shown_b.filter(|_| track_b.is_some()).map(|b| {
+                    (
+                        b,
+                        project(projected_b, view, b.log.id, b.track(), projector),
+                    )
+                });
+                let points = project(projected, view, log.id, track, projector);
+                if let Some((b, points)) = &points_b {
+                    draw_line(&painter, points, TRACK_COLOR_B, false);
+                    if let Some(i) = marker_b {
+                        ring(&painter, screen(projector, b.track(), i), TRACK_COLOR_B);
+                    }
+                }
+                draw_line(&painter, points, TRACK_COLOR, true);
+                if let Some(m) = marker {
+                    draw_marker(&painter, screen(projector, track, m.index), m.heading);
+                }
+                // A's track first under the pointer, then B's
+                let mut candidates = vec![(a, points)];
+                candidates.extend(points_b);
+                let seek = hover(ui, response, &painter, &candidates);
+                // Follow keeps A's marker in view, or B's without A's track
+                let followed = match (marker, marker_b) {
+                    (Some(m), _) => Some((track, m.index)),
+                    (None, Some(i)) if track.is_empty() => track_b.map(|t| (t, i)),
+                    _ => None,
+                };
+                let marker_at = followed.map(|(t, i)| (position(t, i), screen(projector, t, i)));
                 (seek, marker_at)
             },
         );
         let (seek, marker_at) = response.inner;
         let rect = response.response.rect;
         if *follow {
-            if self.follow(center, rect, marker.zip(marker_at), track, follow) {
+            if self.follow(center, rect, marker_at, follow) {
                 // drawn where it was: the next frame shows it centered
                 ui.ctx().request_repaint();
             }
@@ -165,23 +235,52 @@ impl MapPanel {
             self.followed = None;
         }
         if let Some(attribution) = attribution {
-            let text = format!("\u{a9} {}", attribution.text);
-            let size = egui::vec2(11.0 + 6.0 * text.len() as f32, 16.0);
-            let rect = egui::Rect::from_min_size(
-                response.response.rect.right_bottom() - size - egui::vec2(4.0, 4.0),
-                size,
-            );
-            ui.painter()
-                .rect_filled(rect, 3.0, ui.visuals().window_fill.gamma_multiply(0.85));
-            ui.put(
-                rect,
-                egui::Hyperlink::from_label_and_url(
-                    egui::RichText::new(text).small(),
-                    attribution.url,
-                ),
-            );
+            credit(ui, rect, &attribution);
         }
         seek
+    }
+
+    /// The line above the map, what each track came from and the Fit
+    /// button, and the bounds that take in the tracks; or, with none to
+    /// draw, the reason why, and None.
+    fn header(
+        &mut self,
+        ui: &mut egui::Ui,
+        track: &Track,
+        track_b: Option<&Track>,
+        b_open: bool,
+    ) -> Option<Bounds> {
+        let Some(bounds) = union(track.bounds(), track_b.and_then(Track::bounds)) else {
+            let text = if b_open {
+                "No position in either log: no POS records, and no GPS records with a fix."
+            } else {
+                "No position in this log: no POS records, and no GPS records with a fix."
+            };
+            ui.centered_and_justified(|ui| {
+                ui.weak(text);
+            });
+            return None;
+        };
+        ui.horizontal(|ui| {
+            if !track.is_empty() {
+                ui.weak(format!(
+                    "Track from {} ({} points)",
+                    track.source,
+                    track.len()
+                ));
+            }
+            if let Some(t) = track_b {
+                ui.weak(format!("B from {} ({} points)", t.source, t.len()));
+            }
+            if ui
+                .small_button("Fit")
+                .on_hover_text("Show the whole of the tracks")
+                .clicked()
+            {
+                self.fit_pending = true;
+            }
+        });
+        Some(bounds)
     }
 
     /// The zoom and center the map shows.
@@ -192,13 +291,13 @@ impl MapPanel {
     /// Keep the marker in view: center the map on it once it is past
     /// [`FOLLOW_REACH`] of the view in `rect` from the middle, keeping the
     /// zoom. A view that moved since Follow last left it was moved by
-    /// hand, and turns `follow` off instead. Whether the map moved.
+    /// hand, and turns `follow` off instead. `marker` is where the marker
+    /// is, on the map and on screen. Whether the map moved.
     fn follow(
         &mut self,
         center: Position,
         rect: Rect,
-        marker: Option<(Marker, Pos2)>,
-        track: &Track,
+        marker: Option<(Position, Pos2)>,
         follow: &mut bool,
     ) -> bool {
         if self
@@ -211,9 +310,8 @@ impl MapPanel {
         }
         let reach = rect.shrink2(rect.size() * (0.5 - FOLLOW_REACH));
         let away = marker.filter(|(_, at)| !reach.contains(*at));
-        if let Some((m, _)) = away {
-            self.memory
-                .center_at(lat_lon(track.lats[m.index], track.lons[m.index]));
+        if let Some((position, _)) = away {
+            self.memory.center_at(position);
         }
         self.followed = Some(self.view(center));
         away.is_some()
@@ -265,12 +363,45 @@ fn http_options() -> HttpOptions {
     HttpOptions::default()
 }
 
+/// The tiles' attribution in the bottom right corner of the map in
+/// `rect`, a link to its page.
+fn credit(ui: &mut egui::Ui, rect: Rect, attribution: &walkers::sources::Attribution) {
+    let text = format!("\u{a9} {}", attribution.text);
+    let size = egui::vec2(11.0 + 6.0 * text.len() as f32, 16.0);
+    let rect = egui::Rect::from_min_size(rect.right_bottom() - size - egui::vec2(4.0, 4.0), size);
+    ui.painter()
+        .rect_filled(rect, 3.0, ui.visuals().window_fill.gamma_multiply(0.85));
+    ui.put(
+        rect,
+        egui::Hyperlink::from_label_and_url(egui::RichText::new(text).small(), attribution.url),
+    );
+}
+
 /// The middle of `bounds`.
 fn center(bounds: Bounds) -> Position {
     lat_lon(
         f64::midpoint(bounds.south, bounds.north),
         f64::midpoint(bounds.west, bounds.east),
     )
+}
+
+/// The bounds that take in both, or either alone.
+fn union(a: Option<Bounds>, b: Option<Bounds>) -> Option<Bounds> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(Bounds {
+            south: a.south.min(b.south),
+            west: a.west.min(b.west),
+            north: a.north.max(b.north),
+            east: a.east.max(b.east),
+        }),
+        (one, other) => one.or(other),
+    }
+}
+
+/// The point of `track` nearest `time`, when `time` lies within the
+/// track's times.
+fn within(track: &Track, time: f64) -> Option<usize> {
+    nearest_within(&track.times, time)
 }
 
 /// The zoom level that fits `bounds` into a view of `size` points with a
@@ -293,21 +424,24 @@ fn fit_zoom(bounds: Bounds, size: egui::Vec2) -> f64 {
         .clamp(2.0, 18.0)
 }
 
-/// The track's points on screen for the view `(zoom, center, rect)`,
-/// reprojected only when the view has changed since the last frame.
+/// `track`'s points on screen for the view `(zoom, center, rect)`,
+/// reprojected only when the view or the log, `log`, has changed since
+/// the last frame.
 fn project<'a>(
     cache: &'a mut Option<ProjectedTrack>,
     (zoom, center, rect): (f64, Position, Rect),
+    log: u64,
     track: &Track,
     projector: &Projector,
 ) -> &'a [(usize, Pos2)] {
-    let stale = cache
-        .as_ref()
-        .is_none_or(|c| c.zoom.to_bits() != zoom.to_bits() || c.center != center || c.rect != rect);
+    let stale = cache.as_ref().is_none_or(|c| {
+        c.log != log || c.zoom.to_bits() != zoom.to_bits() || c.center != center || c.rect != rect
+    });
     if stale {
         *cache = None;
     }
     let held = cache.get_or_insert_with(|| ProjectedTrack {
+        log,
         zoom,
         center,
         rect,
@@ -316,11 +450,14 @@ fn project<'a>(
     &held.points
 }
 
+/// Track point `i` on the map.
+fn position(track: &Track, i: usize) -> Position {
+    lat_lon(track.lats[i], track.lons[i])
+}
+
 /// Track point `i` on screen.
 fn screen(projector: &Projector, track: &Track, i: usize) -> Pos2 {
-    projector
-        .project(lat_lon(track.lats[i], track.lons[i]))
-        .to_pos2()
+    projector.project(position(track, i)).to_pos2()
 }
 
 /// The track point the cursor is at, and the vehicle's heading there.
@@ -331,70 +468,71 @@ struct Marker {
     heading: Option<f64>,
 }
 
-/// The track as a line through `points`, its start and end, the
-/// `marker`'s point marked, and the point under the pointer labeled with
-/// its time. Returns the time of a point clicked.
-fn draw_track(
-    ui: &egui::Ui,
-    response: &egui::Response,
-    projector: &Projector,
-    track: &Track,
-    points: &[(usize, Pos2)],
-    marker: Option<Marker>,
-    clock: Option<TimeBase>,
-) -> Option<f64> {
-    let rect = response.rect;
-    let painter = ui.painter().with_clip_rect(rect);
-
+/// A track as a line through `points` in `color`, with its start and end
+/// marked when `ends`.
+fn draw_line(painter: &Painter, points: &[(usize, Pos2)], color: Color32, ends: bool) {
     painter.add(egui::Shape::line(
         points.iter().map(|&(_, p)| p).collect(),
-        Stroke::new(2.5, TRACK_COLOR),
+        Stroke::new(2.5, color),
     ));
-    if let (Some(&(_, first)), Some(&(_, last))) = (points.first(), points.last()) {
+    if ends && let (Some(&(_, first)), Some(&(_, last))) = (points.first(), points.last()) {
         painter.circle_filled(first, 4.0, Color32::from_rgb(70, 200, 90));
         painter.circle_filled(last, 4.0, Color32::from_rgb(235, 70, 70));
     }
-    if let Some(m) = marker {
-        let at = screen(projector, track, m.index);
-        if let Some(heading) = m.heading {
-            // the notch makes it concave: a halo around the outline, and
-            // the two halves filled
-            let [tip, left, notch, right] = arrow(at, heading);
-            painter.add(egui::Shape::closed_line(
-                vec![tip, left, notch, right],
-                HALO,
-            ));
-            for half in [[tip, left, notch], [tip, notch, right]] {
-                painter.add(egui::Shape::convex_polygon(
-                    half.to_vec(),
-                    Color32::WHITE,
-                    Stroke::NONE,
-                ));
-            }
-        } else {
-            painter.circle_stroke(at, 6.0, HALO);
-            painter.circle(
-                at,
-                6.0,
-                Color32::from_white_alpha(60),
-                Stroke::new(2.0, Color32::WHITE),
-            );
-        }
-    }
+}
 
-    let hover = response.hover_pos()?;
-    let (i, at, _) = points
-        .iter()
-        .map(|&(i, p)| (i, p, p.distance(hover)))
-        .min_by(|a, b| a.2.total_cmp(&b.2))
-        .filter(|hit| hit.2 <= HIT_DISTANCE)?;
+/// The marker at `at`: an arrow along `heading`, or a white ring without
+/// one.
+fn draw_marker(painter: &Painter, at: Pos2, heading: Option<f64>) {
+    let Some(heading) = heading else {
+        ring(painter, at, Color32::WHITE);
+        return;
+    };
+    // the notch makes it concave: a halo around the outline, and the two
+    // halves filled
+    let [tip, left, notch, right] = arrow(at, heading);
+    painter.add(egui::Shape::closed_line(
+        vec![tip, left, notch, right],
+        HALO,
+    ));
+    for half in [[tip, left, notch], [tip, notch, right]] {
+        painter.add(egui::Shape::convex_polygon(
+            half.to_vec(),
+            Color32::WHITE,
+            Stroke::NONE,
+        ));
+    }
+}
+
+/// A ring at `at` in `color`, over a halo.
+fn ring(painter: &Painter, at: Pos2, color: Color32) {
+    painter.circle_stroke(at, 6.0, HALO);
+    painter.circle(at, 6.0, color.gamma_multiply(0.25), Stroke::new(2.0, color));
+}
+
+/// The point under the pointer, of the first of `tracks` with one within
+/// reach, marked and labeled with its time on its own log's clock and its
+/// altitude, a point of B's named B's. Returns whose it is and its time,
+/// on its log's clock, when it is clicked.
+fn hover(
+    ui: &egui::Ui,
+    response: &egui::Response,
+    painter: &Painter,
+    tracks: &[(Shown<'_>, &[(usize, Pos2)])],
+) -> Option<(Slot, f64)> {
+    let hovered = response.hover_pos()?;
+    let (shown, i, at) = tracks.iter().find_map(|(shown, points)| {
+        points
+            .iter()
+            .map(|&(i, p)| (i, p, p.distance(hovered)))
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .filter(|hit| hit.2 <= HIT_DISTANCE)
+            .map(|(i, p, _)| (*shown, i, p))
+    })?;
+    let track = shown.track();
     painter.circle_stroke(at, 5.0, HALO);
     painter.circle_stroke(at, 5.0, Stroke::new(1.5, Color32::WHITE));
-    let time = timefmt::stamp(clock, track.times[i]);
-    let text = match track.alts[i] {
-        alt if alt.is_finite() => format!("{time}, {alt:.1} m"),
-        _ => time,
-    };
+    let text = point_label(shown, i);
     let font = egui::TextStyle::Small.resolve(ui.style());
     let galley = painter.layout_no_wrap(text, font, ui.visuals().text_color());
     let pos = at + egui::vec2(10.0, -10.0 - galley.size().y);
@@ -404,7 +542,19 @@ fn draw_track(
         ui.visuals().window_fill.gamma_multiply(0.9),
     );
     painter.galley(pos, galley, ui.visuals().text_color());
-    response.clicked().then(|| track.times[i])
+    response.clicked().then(|| (shown.slot, track.times[i]))
+}
+
+/// What a hovered point of `shown`'s track says: its time on its own
+/// log's clock and its altitude, a point of B's named B's.
+fn point_label(shown: Shown<'_>, i: usize) -> String {
+    let track = shown.track();
+    let time = timefmt::stamp(shown.clock, track.times[i]);
+    let whose = shown.slot.prefix();
+    match track.alts[i] {
+        alt if alt.is_finite() => format!("{whose}{time}, {alt:.1} m"),
+        _ => format!("{whose}{time}"),
+    }
 }
 
 /// Whether two views, zoom and center, are the same but for the rounding
@@ -453,6 +603,7 @@ fn thin(track: &Track, screen: impl Fn(usize) -> Pos2) -> Vec<(usize, Pos2)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::kittest::Queryable as _;
 
     #[test]
     fn the_view_fits_the_track_and_thins_it_to_pixels() {
@@ -557,9 +708,15 @@ mod tests {
             .with_size(egui::vec2(600.0, 400.0))
             .build_ui_state(
                 |ui, bench: &mut Bench| {
-                    bench
-                        .map
-                        .show(ui, &log, bench.cursor, None, false, &mut bench.follow);
+                    bench.map.show(
+                        ui,
+                        &log,
+                        None,
+                        bench.cursor,
+                        TimeAxis::Boot,
+                        false,
+                        &mut bench.follow,
+                    );
                 },
                 bench,
             );
@@ -608,5 +765,250 @@ mod tests {
         harness.state_mut().map.fit_pending = true;
         harness.run();
         assert!(harness.state().follow);
+    }
+
+    /// A log whose track is `POS` points at `(seconds, latitude,
+    /// longitude)`.
+    fn track_log(points: &[(f64, f64, f64)]) -> LoadedLog {
+        use dflog::access::Value;
+        let mut w = dflog::write::LogWriter::new();
+        w.define(
+            9,
+            "POS",
+            "QLLfff",
+            &["TimeUS", "Lat", "Lng", "Alt", "RelHomeAlt", "RelOriginAlt"],
+        )
+        .unwrap();
+        w.define(2, "EV", "QB", &["TimeUS", "Id"]).unwrap();
+        w.record("EV", &[Value::U64(500_000), Value::U64(25)])
+            .unwrap();
+        for &(t, lat, lon) in points {
+            w.record(
+                "POS",
+                &[
+                    Value::U64((t * 1e6).round() as u64),
+                    Value::F64(lat),
+                    Value::F64(lon),
+                    Value::F64(500.0),
+                    Value::F64(10.0),
+                    Value::F64(10.0),
+                ],
+            )
+            .unwrap();
+        }
+        LoadedLog::build(dflog::Log::from_bytes(&w.into_bytes()), "t.bin".into())
+    }
+
+    /// A's three points going north-east from 47 N 8 E, a second apart
+    /// from 1 s.
+    fn a_log() -> LoadedLog {
+        track_log(&[(1.0, 47.0, 8.0), (2.0, 47.001, 8.001), (3.0, 47.002, 8.002)])
+    }
+
+    /// B's three points 0.01 degrees north of A's, from 10 s; its first
+    /// on A's last.
+    fn b_log() -> LoadedLog {
+        track_log(&[
+            (10.0, 47.002, 8.002),
+            (11.0, 47.011, 8.001),
+            (12.0, 47.012, 8.002),
+        ])
+    }
+
+    /// The map with a pair on it, and what it answered.
+    struct Pair {
+        map: MapPanel,
+        a: LoadedLog,
+        b: Option<(LoadedLog, f64)>,
+        cursor: Option<f64>,
+        follow: bool,
+        seek: Option<(Slot, f64)>,
+    }
+
+    fn pair_harness(pair: Pair) -> egui_kittest::Harness<'static, Pair> {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(600.0, 400.0))
+            .build_ui_state(
+                |ui, pair: &mut Pair| {
+                    let b = pair.b.as_ref().map(|(b, offset)| (b, *offset));
+                    let seek = pair.map.show(
+                        ui,
+                        &pair.a,
+                        b,
+                        pair.cursor,
+                        TimeAxis::Boot,
+                        false,
+                        &mut pair.follow,
+                    );
+                    if seek.is_some() {
+                        pair.seek = seek;
+                    }
+                },
+                pair,
+            );
+        harness.run();
+        harness
+    }
+
+    /// Press and let go on track point `i` of the kept points, A's or
+    /// B's, as it was last drawn.
+    fn click_point(harness: &mut egui_kittest::Harness<'_, Pair>, slot: Slot, i: usize) {
+        let map = &harness.state().map;
+        let kept = match slot {
+            Slot::A => &map.projected,
+            Slot::B => &map.projected_b,
+        };
+        let at = kept
+            .as_ref()
+            .expect("the track has been drawn")
+            .points
+            .iter()
+            .find(|&&(index, _)| index == i)
+            .expect("the point is among those kept")
+            .1;
+        harness.hover_at(at);
+        harness.run();
+        for pressed in [true, false] {
+            harness.event(egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        harness.run();
+    }
+
+    #[test]
+    fn two_tracks_share_the_view_and_either_draws_alone() {
+        let pair = Pair {
+            map: MapPanel::default(),
+            a: a_log(),
+            b: Some((b_log(), -8.0)),
+            cursor: None,
+            follow: false,
+            seek: None,
+        };
+        let mut harness = pair_harness(pair);
+        harness.get_by_label("Track from POS (3 points)");
+        harness.get_by_label("B from POS (3 points)");
+        // Fit, and the first view, take in both
+        let fitted = harness.state().map.memory.detached().unwrap();
+        assert!((fitted.y() - 47.006).abs() < 1e-9, "{fitted:?}");
+        let zoom = harness.state().map.memory.zoom();
+        assert!(
+            zoom < fit_zoom(a_log().track.bounds().unwrap(), egui::vec2(600.0, 380.0)),
+            "{zoom}"
+        );
+
+        // B's alone, where A has no track
+        harness.state_mut().a = track_log(&[]);
+        harness.state_mut().map.reload();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("Track from POS (3 points)")
+                .is_none()
+        );
+        harness.get_by_label("B from POS (3 points)");
+        // and neither
+        harness.state_mut().b = Some((track_log(&[]), 0.0));
+        harness.run();
+        harness.get_by_label_contains("No position in either log");
+        harness.state_mut().b = None;
+        harness.run();
+        harness.get_by_label_contains("No position in this log");
+    }
+
+    #[test]
+    fn a_click_on_either_track_seeks_by_its_own_clock_and_a_first() {
+        let pair = Pair {
+            map: MapPanel::default(),
+            a: a_log(),
+            b: Some((b_log(), -8.0)),
+            cursor: None,
+            follow: false,
+            seek: None,
+        };
+        let mut harness = pair_harness(pair);
+        // a point of B's alone: its time on B's clock, B's
+        click_point(&mut harness, Slot::B, 2);
+        assert_eq!(harness.state().seek, Some((Slot::B, 12.0)));
+        // A's last point, where B's first lies too: A's comes first
+        click_point(&mut harness, Slot::A, 2);
+        assert_eq!(harness.state().seek, Some((Slot::A, 3.0)));
+
+        // a second B inside A's bounds, under the same view: its points
+        // are projected afresh and a click reads its own times
+        let other = track_log(&[(20.0, 47.0005, 8.0015), (21.0, 47.0015, 8.0005)]);
+        let id = other.id;
+        harness.state_mut().b = Some((other, 0.0));
+        harness.run();
+        assert_eq!(harness.state().map.projected_b.as_ref().unwrap().log, id);
+        click_point(&mut harness, Slot::B, 1);
+        assert_eq!(harness.state().seek, Some((Slot::B, 21.0)));
+    }
+
+    #[test]
+    fn a_hovered_point_reads_on_its_own_log_clock() {
+        use crate::demo::{self, Flight};
+
+        fn shown(slot: Slot, log: &LoadedLog) -> Shown<'_> {
+            Shown {
+                slot,
+                log,
+                clock: log.wall_clock(TimeAxis::Utc),
+            }
+        }
+
+        let flight = |f: Flight| {
+            LoadedLog::build(
+                dflog::Log::from_source(demo::bytes(f).into()),
+                f.name().into(),
+            )
+        };
+        let (a, b) = (flight(Flight::A), flight(Flight::B));
+        // each log's first point after its origin, at 22 s since its boot:
+        // A's at 14:30:22, B's two hours later on B's own clock
+        assert!(point_label(shown(Slot::A, &a), 0).starts_with("2026-05-14 14:30:22.0"));
+        assert!(point_label(shown(Slot::B, &b), 0).starts_with("B 2026-05-14 16:30:22.0"));
+        assert!(point_label(shown(Slot::B, &b), 0).ends_with(", 306.0 m"));
+    }
+
+    #[test]
+    fn b_marker_is_where_b_track_reaches_and_follow_takes_it_alone() {
+        let track = b_log().track;
+        // on B's clock: inside its track, a point; outside, none
+        assert_eq!(within(&track, 11.2), Some(1));
+        assert_eq!(within(&track, 9.9), None);
+        assert_eq!(within(&track, 12.1), None);
+
+        // with no track of A's, Follow keeps B's marker in view
+        let pair = Pair {
+            map: MapPanel::default(),
+            a: track_log(&[]),
+            b: Some((b_log(), -8.0)),
+            cursor: Some(2.0),
+            follow: true,
+            seek: None,
+        };
+        let mut harness = pair_harness(pair);
+        let point = |i: usize| lat_lon(track.lats[i], track.lons[i]);
+        // zoomed in on B's first point, as by hand: Follow lets go
+        let memory = &mut harness.state_mut().map.memory;
+        memory.center_at(point(0));
+        memory.set_zoom(21.0).unwrap();
+        harness.run();
+        assert!(!harness.state().follow);
+        // on again, the cursor at 4 s is B's 12 s, its last point
+        harness.state_mut().follow = true;
+        harness.state_mut().cursor = Some(4.0);
+        harness.run();
+        let map = &harness.state().map;
+        let center = map.memory.detached().unwrap();
+        assert!(same_view(
+            (map.memory.zoom(), center),
+            (map.memory.zoom(), point(2))
+        ));
     }
 }

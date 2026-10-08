@@ -10,16 +10,27 @@
 //! later is dropped. Opening or canceling a chooser changes nothing, so a
 //! read still running when a second chooser is canceled opens as it
 //! would have.
+//!
+//! A pick carries the slot its log opens into, A or B, to its outcome.
 
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
-/// A message from a pick or a drop, tagged with its number.
+use crate::worker::Slot;
+
+/// A pick or a drop: its number, and the slot its log opens into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pick {
+    pub number: u64,
+    pub slot: Slot,
+}
+
+/// A message from a pick or a drop, tagged with it.
 pub enum Picked {
     /// The file is known; its bytes follow.
-    Chosen { pick: u64, name: String },
+    Chosen { pick: Pick, name: String },
     /// The file, read.
     File {
-        pick: u64,
+        pick: Pick,
         name: String,
         bytes: Vec<u8>,
     },
@@ -27,45 +38,54 @@ pub enum Picked {
     /// usual case, an entry with no file behind it; a chosen file fails
     /// when it has gone before the browser read it.
     Unreadable {
-        pick: u64,
+        pick: Pick,
         name: String,
         dropped: bool,
     },
     /// The chooser closed without a choice.
-    Canceled { pick: u64 },
+    Canceled { pick: Pick },
     /// The browser would not open the chooser.
-    Refused { pick: u64 },
+    Refused { pick: Pick },
 }
 
 /// The bytes are left out: a log runs to megabytes.
 impl std::fmt::Debug for Picked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Picked::Chosen { pick, name } => write!(f, "Chosen({pick}, {name:?})"),
+            Picked::Chosen { pick, name } => write!(f, "Chosen({pick:?}, {name:?})"),
             Picked::File { pick, name, bytes } => {
-                write!(f, "File({pick}, {name:?}, {} bytes)", bytes.len())
+                write!(f, "File({pick:?}, {name:?}, {} bytes)", bytes.len())
             }
             Picked::Unreadable {
                 pick,
                 name,
                 dropped,
-            } => write!(f, "Unreadable({pick}, {name:?}, dropped: {dropped})"),
-            Picked::Canceled { pick } => write!(f, "Canceled({pick})"),
-            Picked::Refused { pick } => write!(f, "Refused({pick})"),
+            } => write!(f, "Unreadable({pick:?}, {name:?}, dropped: {dropped})"),
+            Picked::Canceled { pick } => write!(f, "Canceled({pick:?})"),
+            Picked::Refused { pick } => write!(f, "Refused({pick:?})"),
         }
     }
 }
 
-/// What the app acts on, once the rule above has been applied.
+/// What the app acts on, once the rule above has been applied, with the
+/// slot the pick was for.
 #[derive(Debug)]
 pub enum Outcome {
     /// The newest choice, read: open it.
-    File { name: String, bytes: Vec<u8> },
+    File {
+        name: String,
+        bytes: Vec<u8>,
+        slot: Slot,
+    },
     /// The newest choice could not be read; `dropped` when it came by a
     /// drop rather than the chooser.
-    Unreadable { name: String, dropped: bool },
+    Unreadable {
+        name: String,
+        dropped: bool,
+        slot: Slot,
+    },
     /// The browser would not open the chooser.
-    Refused,
+    Refused { slot: Slot },
 }
 
 /// The app's end of the channel, the pick counter, and the choice it
@@ -76,7 +96,7 @@ pub struct Picks {
     /// The number the next pick takes.
     next: u64,
     /// The newest pick that has chosen a file, until its outcome lands.
-    chosen: Option<(u64, String)>,
+    chosen: Option<(Pick, String)>,
 }
 
 impl std::fmt::Debug for Picks {
@@ -101,17 +121,31 @@ impl Default for Picks {
 }
 
 impl Picks {
-    /// Number a new pick or drop and give it the sender its messages go
-    /// through.
-    pub fn start(&mut self) -> (u64, Sender<Picked>) {
-        let pick = self.next;
+    /// Number a new pick or drop for `slot` and give it the sender its
+    /// messages go through.
+    pub fn start(&mut self, slot: Slot) -> (Pick, Sender<Picked>) {
+        let pick = Pick {
+            number: self.next,
+            slot,
+        };
         self.next += 1;
         (pick, self.tx.clone())
     }
 
-    /// The name of the choice being read, for the status line.
-    pub fn reading(&self) -> Option<&str> {
-        self.chosen.as_ref().map(|(_, name)| name.as_str())
+    /// The name of the choice being read and its slot, for the status
+    /// line.
+    pub fn reading(&self) -> Option<(&str, Slot)> {
+        self.chosen
+            .as_ref()
+            .map(|(pick, name)| (name.as_str(), pick.slot))
+    }
+
+    /// Drop the read in progress: its outcome, when it lands, counts for
+    /// nothing. A log that opens as A without a pick, the demo or the
+    /// pair, is a newer choice than any file still being read, and a B
+    /// being read would land beside it, which it does not belong with.
+    pub fn drop_reading(&mut self) {
+        self.chosen = None;
     }
 
     /// Apply the messages that have arrived and return the first outcome
@@ -130,7 +164,11 @@ impl Picks {
                 Picked::Chosen { pick, name } => self.chosen = Some((pick, name)),
                 Picked::File { pick, name, bytes } if self.is_current(pick) => {
                     self.chosen = None;
-                    return Some(Outcome::File { name, bytes });
+                    return Some(Outcome::File {
+                        name,
+                        bytes,
+                        slot: pick.slot,
+                    });
                 }
                 Picked::Unreadable {
                     pick,
@@ -138,18 +176,25 @@ impl Picks {
                     dropped,
                 } if self.is_current(pick) => {
                     self.chosen = None;
-                    return Some(Outcome::Unreadable { name, dropped });
+                    return Some(Outcome::Unreadable {
+                        name,
+                        dropped,
+                        slot: pick.slot,
+                    });
                 }
                 Picked::File { pick, .. } | Picked::Unreadable { pick, .. } => {
-                    tracing::debug!(pick, "a read finished after a newer choice; dropped");
+                    tracing::debug!(
+                        pick = pick.number,
+                        "a read finished after a newer choice or a new A; dropped"
+                    );
                 }
                 Picked::Canceled { .. } => {}
-                Picked::Refused { .. } => return Some(Outcome::Refused),
+                Picked::Refused { pick } => return Some(Outcome::Refused { slot: pick.slot }),
             }
         }
     }
 
-    fn is_current(&self, pick: u64) -> bool {
+    fn is_current(&self, pick: Pick) -> bool {
         self.chosen
             .as_ref()
             .is_some_and(|(current, _)| *current == pick)
@@ -167,7 +212,7 @@ mod web {
     use eframe::wasm_bindgen::JsCast as _;
     use eframe::wasm_bindgen::closure::Closure;
 
-    use super::Picked;
+    use super::{Pick, Picked};
 
     /// Show the browser's file chooser for one `.bin` and read the file
     /// chosen. The input element is made for this pick alone and never
@@ -175,7 +220,7 @@ mod web {
     /// done with it. A click the browser would refuse is followed by
     /// nothing, so the activation is checked first and the pick refused
     /// rather than left waiting.
-    pub fn pick_file(pick: u64, tx: &Sender<Picked>, ctx: &egui::Context) {
+    pub fn pick_file(pick: Pick, tx: &Sender<Picked>, ctx: &egui::Context) {
         let Some(input) = file_input() else {
             tracing::warn!("no document to pick a file with");
             let _ = tx.send(Picked::Refused { pick });
@@ -225,7 +270,7 @@ mod web {
     /// Read a file dropped on the page: its name at once, its bytes when
     /// the browser has them.
     pub fn read_dropped(
-        pick: u64,
+        pick: Pick,
         handle: egui::DroppedFileHandle,
         tx: Sender<Picked>,
         ctx: egui::Context,
@@ -257,7 +302,7 @@ mod web {
 
     /// Read a chosen file: its name at once, its bytes when the browser
     /// has them.
-    fn read_file(pick: u64, file: web_sys::File, tx: Sender<Picked>, ctx: egui::Context) {
+    fn read_file(pick: Pick, file: web_sys::File, tx: Sender<Picked>, ctx: egui::Context) {
         let name = file.name();
         let _ = tx.send(Picked::Chosen {
             pick,
@@ -316,7 +361,7 @@ mod web {
 mod tests {
     use super::*;
 
-    fn file(pick: u64, name: &str) -> Picked {
+    fn file(pick: Pick, name: &str) -> Picked {
         Picked::File {
             pick,
             name: name.to_string(),
@@ -324,7 +369,7 @@ mod tests {
         }
     }
 
-    fn chosen(pick: u64, name: &str) -> Picked {
+    fn chosen(pick: Pick, name: &str) -> Picked {
         Picked::Chosen {
             pick,
             name: name.to_string(),
@@ -334,10 +379,10 @@ mod tests {
     #[test]
     fn the_newest_choice_wins_and_a_cancel_changes_nothing() {
         let mut picks = Picks::default();
-        let (first, tx) = picks.start();
-        let (second, _) = picks.start();
-        let (third, _) = picks.start();
-        assert_eq!((first, second, third), (1, 2, 3));
+        let (first, tx) = picks.start(Slot::A);
+        let (second, _) = picks.start(Slot::A);
+        let (third, _) = picks.start(Slot::A);
+        assert_eq!((first.number, second.number, third.number), (1, 2, 3));
 
         tx.send(chosen(first, "a.bin")).unwrap();
         tx.send(chosen(second, "b.bin")).unwrap();
@@ -346,20 +391,21 @@ mod tests {
         assert!(picks.poll().is_none());
         assert_eq!(
             picks.reading(),
-            Some("b.bin"),
+            Some(("b.bin", Slot::A)),
             "the second read is waited on"
         );
 
         // the older read lands first and is dropped
         tx.send(file(first, "a.bin")).unwrap();
         assert!(picks.poll().is_none());
-        assert_eq!(picks.reading(), Some("b.bin"));
+        assert_eq!(picks.reading(), Some(("b.bin", Slot::A)));
 
         tx.send(file(second, "b.bin")).unwrap();
         match picks.poll() {
-            Some(Outcome::File { name, bytes }) => {
+            Some(Outcome::File { name, bytes, slot }) => {
                 assert_eq!(name, "b.bin");
                 assert_eq!(bytes, [1, 2, 3]);
+                assert_eq!(slot, Slot::A);
             }
             other => panic!("{other:?}"),
         }
@@ -367,10 +413,66 @@ mod tests {
     }
 
     #[test]
+    fn the_slot_reaches_the_outcome() {
+        let mut picks = Picks::default();
+        let (pick, tx) = picks.start(Slot::B);
+        tx.send(chosen(pick, "baseline.bin")).unwrap();
+        assert!(picks.poll().is_none());
+        assert_eq!(picks.reading(), Some(("baseline.bin", Slot::B)));
+        tx.send(file(pick, "baseline.bin")).unwrap();
+        assert!(matches!(
+            picks.poll(),
+            Some(Outcome::File { slot: Slot::B, .. })
+        ));
+
+        let (pick, tx) = picks.start(Slot::B);
+        tx.send(chosen(pick, "photos")).unwrap();
+        tx.send(Picked::Unreadable {
+            pick,
+            name: "photos".into(),
+            dropped: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            picks.poll(),
+            Some(Outcome::Unreadable { slot: Slot::B, .. })
+        ));
+        let (pick, tx) = picks.start(Slot::B);
+        tx.send(Picked::Refused { pick }).unwrap();
+        assert!(matches!(
+            picks.poll(),
+            Some(Outcome::Refused { slot: Slot::B })
+        ));
+    }
+
+    #[test]
+    fn a_new_a_drops_a_b_read_in_progress() {
+        // a newer pick for A wins over B's read, as any newer choice does
+        let mut picks = Picks::default();
+        let (b, tx) = picks.start(Slot::B);
+        let (a, _) = picks.start(Slot::A);
+        tx.send(chosen(b, "baseline.bin")).unwrap();
+        tx.send(chosen(a, "flight.bin")).unwrap();
+        tx.send(file(b, "baseline.bin")).unwrap();
+        assert!(picks.poll().is_none(), "B's read is dropped");
+        assert_eq!(picks.reading(), Some(("flight.bin", Slot::A)));
+
+        // an A that opens without a pick, as the demo does, drops it too
+        let mut picks = Picks::default();
+        let (b, tx) = picks.start(Slot::B);
+        tx.send(chosen(b, "baseline.bin")).unwrap();
+        assert!(picks.poll().is_none());
+        picks.drop_reading();
+        assert_eq!(picks.reading(), None);
+        tx.send(file(b, "baseline.bin")).unwrap();
+        assert!(picks.poll().is_none(), "its bytes count for nothing");
+    }
+
+    #[test]
     fn a_failed_read_is_reported_for_the_current_choice_only() {
         let mut picks = Picks::default();
-        let (first, tx) = picks.start();
-        let (second, _) = picks.start();
+        let (first, tx) = picks.start(Slot::A);
+        let (second, _) = picks.start(Slot::A);
         tx.send(chosen(first, "a.bin")).unwrap();
         tx.send(chosen(second, "b.bin")).unwrap();
         tx.send(Picked::Unreadable {
@@ -388,7 +490,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             picks.poll(),
-            Some(Outcome::Unreadable { name, dropped: true }) if name == "b.bin"
+            Some(Outcome::Unreadable { name, dropped: true, .. }) if name == "b.bin"
         ));
         assert_eq!(picks.reading(), None);
     }
@@ -396,12 +498,12 @@ mod tests {
     #[test]
     fn a_refusal_is_reported_and_leaves_a_read_alone() {
         let mut picks = Picks::default();
-        let (first, tx) = picks.start();
-        let (second, _) = picks.start();
+        let (first, tx) = picks.start(Slot::A);
+        let (second, _) = picks.start(Slot::A);
         tx.send(chosen(first, "a.bin")).unwrap();
         tx.send(Picked::Refused { pick: second }).unwrap();
-        assert!(matches!(picks.poll(), Some(Outcome::Refused)));
-        assert_eq!(picks.reading(), Some("a.bin"));
+        assert!(matches!(picks.poll(), Some(Outcome::Refused { .. })));
+        assert_eq!(picks.reading(), Some(("a.bin", Slot::A)));
         tx.send(file(first, "a.bin")).unwrap();
         assert!(matches!(picks.poll(), Some(Outcome::File { .. })));
     }

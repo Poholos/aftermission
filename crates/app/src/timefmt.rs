@@ -76,6 +76,16 @@ pub fn utc_time(unix_ms: f64, step_seconds: f64) -> String {
     format!("{hours:02}:{minutes:02}:{secs:0width$.places$}")
 }
 
+/// A board time on the clock `base` gives, UTC through it, else since
+/// boot, with as many decimals as marks `step` apart need.
+#[must_use]
+pub fn clock(base: Option<TimeBase>, seconds: f64, step: f64) -> String {
+    match base {
+        Some(base) => utc_time(base.wall_clock_unix_ms(seconds * 1000.0), step),
+        None => boot_time(seconds, step),
+    }
+}
+
 /// A moment at millisecond resolution: the UTC date and time through
 /// `base`, or the boot clock without one.
 #[must_use]
