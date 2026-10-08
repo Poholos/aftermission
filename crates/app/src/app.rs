@@ -5064,6 +5064,166 @@ mod tests {
         eprintln!("wrote a.bin and b.bin to {}", out.display());
     }
 
+    /// The plot's frame cost, the bench the frame-cost work is judged by:
+    /// ten series played at 5x, each frame's `run_ui` and tessellation
+    /// timed over 300 frames, the median and p95 printed, and what the
+    /// thinning of the lines takes of it measured apart, as ten thinnings
+    /// of every line afresh. The cases: the demo alone and as a pair, a
+    /// synthetic 30-minute 400 Hz log alone and against a second, each
+    /// with the whole flight in view and with a minute. Run on demand, in
+    /// release, which is what counts:
+    /// `cargo test --release -p aftermission -- --ignored frame_cost --nocapture`
+    /// With `FRAME_COST_DIR` set, the synthetic pair is written there as
+    /// `long.bin` and `long2.bin`, to load in the page.
+    #[test]
+    #[ignore = "measures the frame cost; run on demand"]
+    fn frame_cost() {
+        let demo_keys = [
+            ("ATT", "Roll", None),
+            ("ATT", "DesRoll", None),
+            ("ATT", "Pitch", None),
+            ("ATT", "Yaw", None),
+            ("IMU", "GyrX", Some(0)),
+            ("IMU", "GyrY", Some(0)),
+            ("IMU", "AccZ", Some(0)),
+            ("IMU", "AccZ", Some(1)),
+            ("CTUN", "Alt", None),
+            ("GPS", "Spd", None),
+        ];
+        let ctx = Context::default();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        app.open_demo(&ctx);
+        wait(&mut app, &ctx);
+        ten_series(&mut app, &demo_keys);
+        measure_frames(&mut app, "demo, whole flight", None);
+        // the series carry over to the pair
+        app.open_demo_pair(&ctx);
+        wait(&mut app, &ctx);
+        assert!(app.log_b().is_some(), "{:?}", app.error);
+        assert_eq!(app.plot.selected.len(), 10);
+        measure_frames(&mut app, "demo pair, whole flight", None);
+
+        let dir = std::env::var_os("FRAME_COST_DIR").map_or_else(
+            || std::env::temp_dir().join("aftermission-frame-cost"),
+            PathBuf::from,
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        let (long, long2) = (dir.join("long.bin"), dir.join("long2.bin"));
+        std::fs::write(&long, synthetic_log(0.0, 1.0)).unwrap();
+        std::fs::write(&long2, synthetic_log(0.3, 1.1)).unwrap();
+        println!(
+            "synthetic pair in {}: {} MB each",
+            dir.display(),
+            std::fs::metadata(&long).unwrap().len() / 1_000_000
+        );
+        let fields = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+        let syn_keys: Vec<(&str, &str, Option<i64>)> =
+            fields.iter().map(|f| ("SYN", *f, None)).collect();
+        let mut app = AftermissionApp::default();
+        app.settings.online_tiles = false;
+        reopen(&mut app, &long);
+        ten_series(&mut app, &syn_keys);
+        measure_frames(&mut app, "synthetic, whole flight", None);
+        measure_frames(&mut app, "synthetic, a minute in view", Some(600.0..=660.0));
+        app.open_pair(&long, &long2, &ctx);
+        wait(&mut app, &ctx);
+        assert!(app.log_b().is_some(), "{:?}", app.error);
+        assert_eq!(app.plot.selected.len(), 10);
+        measure_frames(&mut app, "synthetic pair, whole flight", None);
+        measure_frames(
+            &mut app,
+            "synthetic pair, a minute in view",
+            Some(600.0..=660.0),
+        );
+    }
+
+    /// One frame of the app at 1400 by 900 points, the clock at `i`
+    /// sixtieths of a second, timed in milliseconds through tessellation.
+    fn timed_frame(ctx: &Context, app: &mut AftermissionApp, i: usize) -> f64 {
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let input = egui::RawInput {
+            screen_rect: Some(rect),
+            time: Some(i as f64 / 60.0),
+            ..Default::default()
+        };
+        let start = std::time::Instant::now();
+        let mut output = ctx.run_ui(input, |ui| app.show(ui));
+        output.textures_delta.clear();
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        start.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// Play 300 frames of `app` after 30 to settle, the view zoomed to
+    /// `zoom` when given and the playhead put at its start, with ten more
+    /// frames for the zoom itself to settle (the values fit the view anew
+    /// and their labels resize the plot); at 5x the playhead stays in a
+    /// minute's view, so a zoomed case times a still view, no page turn.
+    /// Prints the frame times and what one thinning of every line takes.
+    fn measure_frames(app: &mut AftermissionApp, label: &str, zoom: Option<RangeInclusive<f64>>) {
+        let ctx = Context::default();
+        for i in 0..30 {
+            timed_frame(&ctx, app, i);
+        }
+        if let Some(range) = zoom {
+            PlotPanel::zoom_to(&ctx, range.clone());
+            app.plot.seek(*range.start() + 1.0);
+            for i in 30..40 {
+                timed_frame(&ctx, app, i);
+            }
+        }
+        app.toggle_playback();
+        assert!(app.playback.is_playing());
+        let mut times: Vec<f64> = (40..340).map(|i| timed_frame(&ctx, app, i)).collect();
+        app.playback.pause();
+        times.sort_by(f64::total_cmp);
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            std::hint::black_box(app.plot.thin_all(&ctx));
+        }
+        let thinning = start.elapsed().as_secs_f64() * 100.0;
+        println!(
+            "{label}: median {:.2} ms, p95 {:.2} ms, max {:.2} ms; thinning {thinning:.2} ms",
+            times[times.len() / 2],
+            times[times.len() * 95 / 100],
+            times[times.len() - 1]
+        );
+    }
+
+    /// Thirty minutes of ten fields at 400 Hz as the bytes of a log, slow
+    /// waves, each shifted by `shift` and scaled by `scale` so that two
+    /// such logs differ.
+    fn synthetic_log(shift: f64, scale: f64) -> Vec<u8> {
+        use dflog::access::Value;
+        use dflog::write::LogWriter;
+
+        let mut w = LogWriter::new();
+        let labels = ["TimeUS", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
+        w.define(1, "SYN", "Qffffffffff", &labels).unwrap();
+        for n in 0..(400u64 * 1800) {
+            let t = n as f64 / 400.0;
+            let mut values = vec![Value::U64(1_000_000 + n * 2500)];
+            for k in 0..10 {
+                let value = (t * (0.1 + f64::from(k) * 0.05) + shift).sin() * scale;
+                values.push(Value::F64(value));
+            }
+            w.record("SYN", &values).unwrap();
+        }
+        w.into_bytes()
+    }
+
+    /// Put the ten series `keys` name on the plot.
+    fn ten_series(app: &mut AftermissionApp, keys: &[(&str, &str, Option<i64>)]) {
+        for (type_name, field, instance) in keys {
+            app.toggle_series(crate::model::SeriesKey {
+                type_name: (*type_name).into(),
+                field: (*field).into(),
+                instance: *instance,
+            });
+        }
+        assert_eq!(app.plot.selected.len(), 10, "{:?}", app.plot.error);
+    }
+
     /// Where the README's pictures go: `assets/hero/`, or `$HERO_DIR`,
     /// made when missing.
     fn hero_dir() -> PathBuf {

@@ -74,6 +74,17 @@ pub struct Selected {
     /// panel's list of what only B logs ticks: set with `data_b` and
     /// cleared with it. None while B is closed or lacks the field.
     b_key: Option<SeriesKey>,
+    /// A's line as a frame last thinned it, and what for, given again to
+    /// a frame that asks for the same; None until a frame thins it, and
+    /// cleared with `data`. See [`Thinning`].
+    thinned: Option<Thinning>,
+    /// B's line's, cleared with `data_b`.
+    thinned_b: Option<Thinning>,
+    /// The blocks of `data`, built with it, so a view spanning many
+    /// samples a pixel is thinned by the block; see [`Summary`].
+    summary: Summary,
+    /// The blocks of `data_b`, built with it.
+    summary_b: Option<Summary>,
 }
 
 impl Selected {
@@ -85,6 +96,7 @@ impl Selected {
             axis,
             color,
             extent: extent(data.ys.iter().copied()),
+            summary: Summary::new(&data.ys),
             data,
             unit: None,
             data_b: None,
@@ -94,6 +106,9 @@ impl Selected {
             b_note: None,
             a_key,
             b_key: None,
+            thinned: None,
+            thinned_b: None,
+            summary_b: None,
         }
     }
 
@@ -105,7 +120,9 @@ impl Selected {
 
     fn replace_data(&mut self, data: Series) {
         self.extent = extent(data.ys.iter().copied());
+        self.summary = Summary::new(&data.ys);
         self.data = data;
+        self.thinned = None;
     }
 
     /// Take B's side of the series from `b`, by the check a new log's
@@ -113,6 +130,8 @@ impl Selected {
     /// as one; see [`key_in`]. None clears it.
     fn extract_b(&mut self, b: Option<&LoadedLog>) {
         self.data_b = None;
+        self.summary_b = None;
+        self.thinned_b = None;
         self.extent_b = None;
         self.extent_b_over = None;
         self.unit_b = None;
@@ -129,6 +148,7 @@ impl Selected {
         }
         self.unit_b = unit(b, &key);
         self.extent_b = extent(data.ys.iter().copied());
+        self.summary_b = Some(Summary::new(&data.ys));
         self.data_b = Some(data);
         // a series for B's side alone is named as this B names the field,
         // as one picked from what only B logs is, whichever B it is now
@@ -295,6 +315,9 @@ pub struct PlotPanel {
     /// the hidden lines swap sides and a zoomed view moves by these
     /// seconds onto the new A's clock.
     swapped: Option<f64>,
+    /// Lines thinned afresh since the plot was made, a statistic the
+    /// tests read: a frame whose view holds adds none.
+    misses: usize,
 }
 
 /// The plot's id, fixed so its memory can be read back.
@@ -635,6 +658,42 @@ impl PlotPanel {
         memory.store(ctx, id);
     }
 
+    /// Thin every line afresh, hidden ones too, over the range and the
+    /// width the plot's memory holds, and give the points' count: what a
+    /// frame that has nothing kept pays to thin, for the frame-cost bench
+    /// (`frame_cost` in the app's tests). Nothing while the plot has not
+    /// drawn.
+    #[cfg(test)]
+    pub(crate) fn thin_all(&self, ctx: &egui::Context) -> usize {
+        let Some(memory) = PlotMemory::load(ctx, Id::new(PLOT_ID)) else {
+            return 0;
+        };
+        let transform = memory.transform();
+        let visible = transform.bounds().range_x();
+        let b_offset = self.b.as_ref().map(|b| b.offset);
+        let (range, within_range) = lines_range(
+            &self.selected,
+            &self.hidden,
+            b_offset,
+            memory.auto_bounds.x,
+            &visible,
+        );
+        let lines = Lines {
+            map: AxisMap::new(&self.selected),
+            range: &range,
+            width: transform.frame().width(),
+            b_offset,
+            within_range,
+        };
+        self.selected
+            .iter()
+            .map(|s| {
+                let Thinned { b, a } = lines.thin(s);
+                b.map_or(0, |points| points.len()) + a.map_or(0, |points| points.len())
+            })
+            .sum()
+    }
+
     /// The series chips, the lane of flight mode names, the plot and the
     /// cursor readout. The readout takes a panel at the bottom sized to its
     /// lines, and the plot the rest. While `playing`, the pointer leaves
@@ -722,7 +781,7 @@ impl PlotPanel {
         let map = AxisMap::new(&self.selected);
         let plot = new_plot(log, settings, map, height, playing, reset);
 
-        let selected = &self.selected;
+        let selected = &mut self.selected;
         let hidden = &self.hidden;
         let (playhead, cursor, last_hover) = (self.playhead, self.cursor, self.hover);
         let paged = self.paged.clone();
@@ -784,16 +843,7 @@ impl PlotPanel {
                 visible = page.clone();
                 paged = Some(page);
             }
-            // With the bounds following the data, every point counts, so a
-            // reset zooms back out to the whole flight: A's, B's lines kept
-            // within it, or B's while no line of A's shows.
-            let data_range = full_range(selected, hidden);
-            let b_range = b_offset.and_then(|offset| full_range_b(selected, hidden, offset));
-            let (x_range, within_range) = match (auto_x, data_range, b_range) {
-                (true, Some(range), _) => (range, true),
-                (true, None, Some(range)) => (range, false),
-                _ => (visible.clone(), false),
-            };
+            let (x_range, within_range) = lines_range(selected, hidden, b_offset, auto_x, &visible);
             let width = plot_ui.transform().frame().width();
 
             if show_modes {
@@ -806,9 +856,7 @@ impl PlotPanel {
                 b_offset,
                 within_range,
             };
-            for s in selected {
-                lines.draw(plot_ui, s);
-            }
+            let misses = lines.draw_all(plot_ui, selected, hidden);
 
             time_marks(plot_ui, cursor, playhead, playhead_stroke);
             Found {
@@ -816,6 +864,7 @@ impl PlotPanel {
                 click,
                 cursor,
                 paged,
+                misses,
             }
         });
 
@@ -823,6 +872,7 @@ impl PlotPanel {
             self.mode_lanes(ui, log, &response.transform, strip);
         }
         let found = response.inner;
+        self.misses += found.misses;
         self.hover = found.at;
         self.paged = found.paged;
         if let Some(time) = found.click {
@@ -890,7 +940,7 @@ impl PlotPanel {
     }
 
     /// Fit B's side of each series' extent to what the whole-flight view
-    /// draws of it, as [`Lines::draw`] clips it: its samples within the
+    /// draws of it, as [`Lines::thin_b`] clips it: its samples within the
     /// range of A's lines, moved onto B's clock, or all of them where A
     /// has none. A value of B's never drawn then sizes no axis. Lines
     /// hidden through the legend count as shown, as they do in
@@ -1023,38 +1073,216 @@ struct Lines<'a> {
     within_range: bool,
 }
 
+/// A series' lines thinned for a frame: B's, on A's clock, and A's;
+/// None for a side the series lacks.
+#[cfg(test)]
+struct Thinned {
+    b: Option<Vec<PlotPoint>>,
+    a: Option<Vec<PlotPoint>>,
+}
+
+/// What a line hidden through the legend is drawn with: one point, so the
+/// plot keeps the line, and its legend entry, while it hides it.
+const HIDDEN_STAND_IN: &[PlotPoint] = &[PlotPoint { x: 0.0, y: 0.0 }];
+
+/// A line's points as a frame last thinned them, kept on the series with
+/// what they were thinned for, so the next frame asking for the same is
+/// given them again instead of walking every sample in view.
+#[derive(Debug)]
+struct Thinning {
+    key: ThinKey,
+    points: Vec<PlotPoint>,
+}
+
+/// What a line's points were thinned for: anything else that changes them
+/// (a new log, a new B, a reload, a swap) replaces the series' data and
+/// clears the entry with it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ThinKey {
+    /// The range's two ends, by their bits.
+    range: (u64, u64),
+    /// The plot's width, by its bits.
+    width: u32,
+    /// The axis map, for a series on the right axis, whose points it maps
+    /// into the left axis; None for one on the left, which owes the map
+    /// nothing, so a flip changes the key and a right-axis series coming
+    /// or going leaves a left-axis line's alone.
+    map: Option<AxisMap>,
+    /// For B's line: the offset onto A's clock, by its bits, and whether
+    /// the line is kept within the range.
+    b: Option<(u64, bool)>,
+}
+
 impl Lines<'_> {
-    /// B's line first, under A's, lighter, then A's, none for a series A
-    /// lacks, so its legend has no entry that hides nothing. Where the
-    /// bounds follow the data, B is drawn within A's range alone, its
-    /// samples past the edges left out too, so no B far off, or with a
-    /// gap in its samples, widens the view A fills.
-    fn draw(&self, plot_ui: &mut egui_plot::PlotUi<'_>, s: &Selected) {
-        let to_plot = |y: f64| match (s.axis, self.map) {
+    /// What this frame thins a side of `s` for.
+    fn key(&self, s: &Selected, b_side: bool) -> ThinKey {
+        ThinKey {
+            range: (self.range.start().to_bits(), self.range.end().to_bits()),
+            width: self.width.to_bits(),
+            map: self.map.filter(|_| s.axis == YAxis::Right),
+            b: b_side.then(|| (self.b_offset.map_or(0, f64::to_bits), self.within_range)),
+        }
+    }
+
+    /// Thin both sides of `s` afresh, as a frame that has nothing kept
+    /// does; what the bench measures.
+    #[cfg(test)]
+    fn thin(&self, s: &Selected) -> Thinned {
+        Thinned {
+            b: self.thin_b(s),
+            a: self.thin_a(s),
+        }
+    }
+
+    /// A's line of `s` thinned, None for a series A lacks.
+    fn thin_a(&self, s: &Selected) -> Option<Vec<PlotPoint>> {
+        (!s.only_b()).then(|| {
+            decimate_with(
+                &s.data.xs,
+                &s.data.ys,
+                Some(&s.summary),
+                self.range,
+                self.width,
+                |y| self.to_plot(s, y),
+            )
+        })
+    }
+
+    /// B's line of `s` thinned and moved onto A's clock, None while B is
+    /// closed or lacks the field. Where the bounds follow the data, B is
+    /// kept within A's range alone, its samples past the edges left out
+    /// too, so no B far off, or with a gap in its samples, widens the view
+    /// A fills.
+    fn thin_b(&self, s: &Selected) -> Option<Vec<PlotPoint>> {
+        let (data, offset) = s.data_b.as_ref().zip(self.b_offset)?;
+        let to_plot = |y| self.to_plot(s, y);
+        let points = decimate_moved(
+            &data.xs,
+            &data.ys,
+            s.summary_b.as_ref(),
+            self.range,
+            self.width,
+            to_plot,
+            offset,
+        );
+        Some(if self.within_range {
+            clip(&points, self.range)
+        } else {
+            points
+        })
+    }
+
+    /// A value of `s` where the plot draws it: as it is, or mapped into
+    /// the left axis for a series on the right one.
+    fn to_plot(&self, s: &Selected, y: f64) -> f64 {
+        match (s.axis, self.map) {
             (YAxis::Right, Some(m)) => m.to_left(y),
             _ => y,
-        };
-        if let (Some(data), Some(offset)) = (&s.data_b, self.b_offset) {
-            let mut points =
-                decimate_moved(&data.xs, &data.ys, self.range, self.width, to_plot, offset);
-            if self.within_range {
-                points = clip(&points, self.range);
+        }
+    }
+
+    /// Thin the sides of `s` that no frame thinned for this range, width
+    /// and map yet, and keep them on `s`; a line in `hidden` is left as
+    /// it is, since nothing of it is drawn. The count of lines thinned.
+    fn refresh(&self, s: &mut Selected, hidden: &[Id]) -> usize {
+        let mut misses = 0;
+        let key = self.key(s, false);
+        if !hidden.contains(&line_id(&s.key))
+            && s.thinned.as_ref().is_none_or(|t| t.key != key)
+            && let Some(points) = self.thin_a(s)
+        {
+            s.thinned = Some(Thinning { key, points });
+            misses += 1;
+        }
+        let key = self.key(s, true);
+        if !hidden.contains(&line_id_b(&s.key))
+            && s.thinned_b.as_ref().is_none_or(|t| t.key != key)
+            && let Some(points) = self.thin_b(s)
+        {
+            s.thinned_b = Some(Thinning { key, points });
+            misses += 1;
+        }
+        misses
+    }
+
+    /// Every series' lines: thinned where no frame thinned them for this
+    /// view yet, then lent to the plot, so a frame whose view holds walks
+    /// no samples and copies nothing. The count of lines thinned afresh.
+    fn draw_all<'p>(
+        &self,
+        plot_ui: &mut egui_plot::PlotUi<'p>,
+        selected: &'p mut [Selected],
+        hidden: &[Id],
+    ) -> usize {
+        let mut misses = 0;
+        for s in selected.iter_mut() {
+            misses += self.refresh(s, hidden);
+        }
+        let selected: &'p [Selected] = selected;
+        for s in selected {
+            self.draw(plot_ui, s, hidden);
+        }
+        misses
+    }
+
+    /// B's line first, under A's, lighter, then A's, none for a series A
+    /// lacks, so its legend has no entry that hides nothing. The points
+    /// are those [`Self::refresh`] kept, lent to the plot. A line in
+    /// `hidden` is given [`HIDDEN_STAND_IN`] instead: the plot drops it by
+    /// its id before it sizes the view or draws, so its points never
+    /// matter, but a line with none it drops at once (`PlotUi::line`),
+    /// and with it the legend entry that would show the line again.
+    fn draw<'p>(&self, plot_ui: &mut egui_plot::PlotUi<'p>, s: &'p Selected, hidden: &[Id]) {
+        let points = |entry: &'p Option<Thinning>, id: Id| -> &'p [PlotPoint] {
+            if hidden.contains(&id) {
+                HIDDEN_STAND_IN
+            } else {
+                entry.as_ref().map_or(&[], |t| t.points.as_slice())
             }
+        };
+        if s.data_b.is_some() && self.b_offset.is_some() {
+            let id = line_id_b(&s.key);
             plot_ui.line(
-                Line::new(format!("{} (B)", s.title), PlotPoints::Owned(points))
-                    .color(s.color.gamma_multiply(B_OPACITY))
-                    .id(line_id_b(&s.key)),
+                Line::new(
+                    format!("{} (B)", s.title),
+                    PlotPoints::Borrowed(points(&s.thinned_b, id)),
+                )
+                .color(s.color.gamma_multiply(B_OPACITY))
+                .id(id),
             );
         }
-        if s.only_b() {
-            return;
-        }
-        let points = decimate(&s.data.xs, &s.data.ys, self.range, self.width, to_plot);
-        plot_ui.line(
-            Line::new(s.title.clone(), PlotPoints::Owned(points))
+        if !s.only_b() {
+            let id = line_id(&s.key);
+            plot_ui.line(
+                Line::new(
+                    s.title.clone(),
+                    PlotPoints::Borrowed(points(&s.thinned, id)),
+                )
                 .color(s.color)
-                .id(line_id(&s.key)),
-        );
+                .id(id),
+            );
+        }
+    }
+}
+
+/// The range the lines are thinned over, on A's clock, and whether B's
+/// are kept within it. With the bounds following the data (`auto_x`),
+/// every point counts, so a reset zooms back out to the whole flight:
+/// A's, B's lines kept within it, or B's while no line of A's shows;
+/// otherwise the view, `visible`.
+fn lines_range(
+    selected: &[Selected],
+    hidden: &[Id],
+    b_offset: Option<f64>,
+    auto_x: bool,
+    visible: &RangeInclusive<f64>,
+) -> (RangeInclusive<f64>, bool) {
+    let data_range = full_range(selected, hidden);
+    let b_range = b_offset.and_then(|offset| full_range_b(selected, hidden, offset));
+    match (auto_x, data_range, b_range) {
+        (true, Some(range), _) => (range, true),
+        (true, None, Some(range)) => (range, false),
+        _ => (visible.clone(), false),
     }
 }
 
@@ -1238,13 +1466,30 @@ impl AxisMap {
     }
 }
 
-/// The points of a series within `range`, with one sample before and one
-/// after it so the line runs off both edges, thinned to about two per pixel
-/// of `width`: each bucket keeps its lowest and highest sample, in time
-/// order, so no spike is lost. `xs` must be non-decreasing.
+/// [`decimate_with`] over every sample, with no summary: the plain walk
+/// the tests hold the blocks to.
+#[cfg(test)]
 pub fn decimate(
     xs: &[f64],
     ys: &[f64],
+    range: &RangeInclusive<f64>,
+    width: f32,
+    map: impl Fn(f64) -> f64,
+) -> Vec<PlotPoint> {
+    decimate_with(xs, ys, None, range, width, map)
+}
+
+/// The points of a series within `range`, with one sample before and one
+/// after it so the line runs off both edges, thinned to about two per pixel
+/// of `width`: each bucket keeps its lowest and highest sample, in time
+/// order, so no spike is lost. `xs` must be non-decreasing. With a
+/// `summary`, each bucket is read as the blocks it holds whole and the
+/// few samples around them (see [`extremes`]), the same points to the
+/// bit, at a cost that follows the width rather than the samples in view.
+pub fn decimate_with(
+    xs: &[f64],
+    ys: &[f64],
+    summary: Option<&Summary>,
     range: &RangeInclusive<f64>,
     width: f32,
     map: impl Fn(f64) -> f64,
@@ -1269,25 +1514,49 @@ pub fn decimate(
         return vec![point(lo), point(hi - 1)];
     }
 
-    let mut out = Vec::with_capacity(2 * buckets);
-    let mut i = lo;
-    for bucket in 0..buckets {
-        let last = bucket + 1 == buckets;
-        let edge = x0 + span * (bucket + 1) as f64 / buckets as f64;
-        let start = i;
-        let (mut min_i, mut max_i) = (i, i);
-        while i < hi && (last || xs[i] <= edge) {
-            if ys[i] < ys[min_i] {
-                min_i = i;
-            }
-            if ys[i] > ys[max_i] {
-                max_i = i;
-            }
-            i += 1;
-        }
-        if i == start {
+    let mut ends = bucket_ends(&xs[lo..hi], buckets);
+    for end in &mut ends {
+        *end += lo;
+    }
+    bucket_points(xs, ys, lo, &ends, summary, map)
+}
+
+/// Where each of `buckets` equal spans of time over `xs` ends, as an index
+/// one past its last sample; the last ends at `xs.len()`, taking the rest.
+/// A sample on an edge belongs to the bucket before it.
+fn bucket_ends(xs: &[f64], buckets: usize) -> Vec<usize> {
+    let x0 = xs[0];
+    let span = xs[xs.len() - 1] - x0;
+    let mut ends: Vec<usize> = (1..buckets)
+        .map(|bucket| {
+            let edge = x0 + span * bucket as f64 / buckets as f64;
+            xs.partition_point(|x| *x <= edge)
+        })
+        .collect();
+    ends.push(xs.len());
+    ends
+}
+
+/// The points of the buckets `lo..ends[0]`, `ends[0]..ends[1]` and so on:
+/// each bucket's lowest and highest sample, in time order, an empty bucket
+/// giving none; the extremes read through `summary` where there is one.
+fn bucket_points(
+    xs: &[f64],
+    ys: &[f64],
+    lo: usize,
+    ends: &[usize],
+    summary: Option<&Summary>,
+    map: impl Fn(f64) -> f64,
+) -> Vec<PlotPoint> {
+    let point = |i: usize| PlotPoint::new(xs[i], map(ys[i]));
+    let mut out = Vec::with_capacity(2 * ends.len());
+    let mut start = lo;
+    for &end in ends {
+        let found = extremes(ys, start, end, summary);
+        start = end;
+        let Some((min_i, max_i)) = found else {
             continue;
-        }
+        };
         let (first, second) = if min_i <= max_i {
             (min_i, max_i)
         } else {
@@ -1301,19 +1570,149 @@ pub fn decimate(
     out
 }
 
+/// The index of the lowest and of the highest of `ys[start..end]`, the
+/// first of each where values tie; None for an empty span. With a
+/// `summary`, the span is read as the largest blocks that fit it, aligned
+/// to their size, from the smallest up and down again as a segment tree
+/// is read, and sample by sample only before the first block and after
+/// the last, so a span of thousands of samples costs a few dozen reads.
+/// A tie still goes to the first sample: the blocks are met in order,
+/// each holds the first of its own ties, and the comparisons are strict.
+fn extremes(
+    ys: &[f64],
+    start: usize,
+    end: usize,
+    summary: Option<&Summary>,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut consider = |i: usize| {
+        if let Some((min_i, max_i)) = &mut best {
+            if ys[i] < ys[*min_i] {
+                *min_i = i;
+            }
+            if ys[i] > ys[*max_i] {
+                *max_i = i;
+            }
+        } else {
+            best = Some((i, i));
+        }
+    };
+    let Some(summary) = summary.filter(|s| !s.levels.is_empty()) else {
+        (start..end).for_each(consider);
+        return best;
+    };
+    let mut i = start;
+    while i < end && !i.is_multiple_of(Summary::BASE) {
+        consider(i);
+        i += 1;
+    }
+    while i + Summary::BASE <= end {
+        let (level, block) = summary.largest_block_at(i, end);
+        let [min_i, max_i] = summary.levels[level][i / block];
+        consider(min_i as usize);
+        consider(max_i as usize);
+        i += block;
+    }
+    (i..end).for_each(consider);
+    best
+}
+
+/// The lowest and highest sample of each block of a series, by index, in
+/// levels of [`Summary::BASE`], twice that, and so on up: a thinning
+/// whose buckets span many samples reads the blocks a bucket holds whole
+/// instead of every sample, so its cost follows the plot's width. About
+/// a quarter of the samples in indices.
+#[derive(Debug, Default)]
+pub struct Summary {
+    /// Level `i` has blocks of `BASE << i` samples, the last one short;
+    /// each block's lowest sample's index and highest sample's index,
+    /// the first of each where values tie, in block order.
+    levels: Vec<Vec<[u32; 2]>>,
+}
+
+impl Summary {
+    /// Samples a block on the first level.
+    const BASE: usize = 16;
+
+    /// The blocks of `ys`, a linear pass.
+    #[must_use]
+    pub fn new(ys: &[f64]) -> Summary {
+        let lower = |a: u32, b: u32| {
+            if ys[b as usize] < ys[a as usize] {
+                b
+            } else {
+                a
+            }
+        };
+        let higher = |a: u32, b: u32| {
+            if ys[b as usize] > ys[a as usize] {
+                b
+            } else {
+                a
+            }
+        };
+        let mut levels = Vec::new();
+        let mut level: Vec<[u32; 2]> = ys
+            .chunks(Self::BASE)
+            .enumerate()
+            .map(|(block, chunk)| {
+                let first = (block * Self::BASE) as u32;
+                (first + 1..first + chunk.len() as u32).fold([first, first], |[min_i, max_i], i| {
+                    [lower(min_i, i), higher(max_i, i)]
+                })
+            })
+            .collect();
+        while level.len() > 1 {
+            let next = level
+                .chunks(2)
+                .map(|pair| match pair {
+                    [a, b] => [lower(a[0], b[0]), higher(a[1], b[1])],
+                    _ => pair[0],
+                })
+                .collect();
+            levels.push(level);
+            level = next;
+        }
+        if !level.is_empty() {
+            levels.push(level);
+        }
+        Summary { levels }
+    }
+
+    /// The level with the largest block that starts at sample `i`, a
+    /// multiple of [`Self::BASE`], and ends by `end`, and that block's
+    /// size. A block of `BASE << level` starts at `i` while `level` is at
+    /// most the trailing zeros of `i / BASE`, and ends by `end` while
+    /// `1 << level` is at most `(end - i) / BASE`, so the level is the
+    /// smaller of the two bounds, and of the top one. The first level's
+    /// where `end` is under a block past `i`, or the summary has no
+    /// level, which [`extremes`] rules out before it asks.
+    fn largest_block_at(&self, i: usize, end: usize) -> (usize, usize) {
+        let aligned = (i / Self::BASE).trailing_zeros() as usize;
+        let room = end
+            .checked_sub(i)
+            .and_then(|room| (room / Self::BASE).checked_ilog2())
+            .map_or(0, |room| room as usize);
+        let top = self.levels.len().saturating_sub(1);
+        let level = aligned.min(room).min(top);
+        (level, Self::BASE << level)
+    }
+}
+
 /// B's points for `range` on A's clock: B's samples thinned over the
 /// range moved back by `offset`, onto B's clock, and the points moved
 /// forward by it, so B is thinned where it shows and drawn on A's clock.
 pub fn decimate_moved(
     xs: &[f64],
     ys: &[f64],
+    summary: Option<&Summary>,
     range: &RangeInclusive<f64>,
     width: f32,
     map: impl Fn(f64) -> f64,
     offset: f64,
 ) -> Vec<PlotPoint> {
     let back = range.start() - offset..=range.end() - offset;
-    let mut points = decimate(xs, ys, &back, width, map);
+    let mut points = decimate_with(xs, ys, summary, &back, width, map);
     for p in &mut points {
         p.x += offset;
     }
@@ -1443,6 +1842,8 @@ struct Found {
     cursor: Option<f64>,
     /// The view paging last set, this frame's when it paged.
     paged: Option<RangeInclusive<f64>>,
+    /// How many lines the frame thinned afresh.
+    misses: usize,
 }
 
 /// Where paging moves a zoomed view of `view` for the playhead at `time`,
@@ -2393,6 +2794,384 @@ mod tests {
         assert!((transform(&harness).frame().top() - frame.top()).abs() < 1.0);
     }
 
+    /// The points a frame keeps are those a fresh thinning over its range
+    /// and width gives, and frames whose view holds thin nothing again.
+    #[test]
+    fn a_hit_gives_the_points_a_fresh_thinning_gives() {
+        let log = test_log();
+        let settings = Settings::default();
+        let mut harness = roll_plot(&log, &settings);
+        harness.state_mut().0.set_b(Some((b_log(), -8.0)));
+        harness.run();
+        let misses = harness.state().0.misses;
+        assert!(misses >= 2, "both lines were thinned: {misses}");
+        harness.step();
+        harness.step();
+        assert_eq!(harness.state().0.misses, misses, "the view holds");
+
+        let width = transform(&harness).frame().width();
+        let plot = &harness.state().0;
+        let range = full_range(&plot.selected, &[]).unwrap();
+        let s = &plot.selected[0];
+        let fresh_a = decimate(&s.data.xs, &s.data.ys, &range, width, |y| y);
+        assert_eq!(s.thinned.as_ref().unwrap().points, fresh_a);
+        let b = s.data_b.as_ref().unwrap();
+        let fresh_b = clip(
+            &decimate_moved(&b.xs, &b.ys, None, &range, width, |y| y, -8.0),
+            &range,
+        );
+        assert_eq!(s.thinned_b.as_ref().unwrap().points, fresh_b);
+        assert_eq!(plot.thin_all(&harness.ctx), fresh_a.len() + fresh_b.len());
+    }
+
+    /// Every part of the key misses on its own, and only the lines it
+    /// concerns: a left-axis line owes the axis map nothing, and B's
+    /// offset and clipping are B's alone.
+    #[test]
+    fn each_part_of_the_key_misses_alone() {
+        fn lines(
+            map: Option<AxisMap>,
+            range: &RangeInclusive<f64>,
+            width: f32,
+            offset: f64,
+            within: bool,
+        ) -> Lines<'_> {
+            Lines {
+                map,
+                range,
+                width,
+                b_offset: Some(offset),
+                within_range: within,
+            }
+        }
+
+        let mut s = pair("Roll", [0.0, 1.0, 0.0], [1.0, 2.0, 1.0], "deg");
+        let full = 0.0..=2.0;
+        let map = Some(AxisMap {
+            left: (0.0, 1.0),
+            right: (0.0, 2.0),
+            two_sided: true,
+        });
+        let other_map = Some(AxisMap {
+            left: (0.0, 1.0),
+            right: (0.0, 4.0),
+            two_sided: true,
+        });
+        let same = lines(None, &full, 100.0, 0.5, true);
+        assert_eq!(same.refresh(&mut s, &[]), 2, "nothing kept yet");
+        assert_eq!(same.refresh(&mut s, &[]), 0, "the same frame again");
+        assert_eq!(
+            lines(None, &full, 101.0, 0.5, true).refresh(&mut s, &[]),
+            2,
+            "the width"
+        );
+        assert_eq!(
+            lines(None, &(0.0..=1.5), 101.0, 0.5, true).refresh(&mut s, &[]),
+            2,
+            "the range"
+        );
+        // the map is nothing to a left-axis line
+        assert_eq!(
+            lines(map, &(0.0..=1.5), 101.0, 0.5, true).refresh(&mut s, &[]),
+            0
+        );
+        s.axis = YAxis::Right;
+        assert_eq!(
+            lines(map, &(0.0..=1.5), 101.0, 0.5, true).refresh(&mut s, &[]),
+            2,
+            "the axis"
+        );
+        assert_eq!(
+            lines(other_map, &(0.0..=1.5), 101.0, 0.5, true).refresh(&mut s, &[]),
+            2,
+            "the map"
+        );
+        assert_eq!(
+            lines(other_map, &(0.0..=1.5), 101.0, 0.6, true).refresh(&mut s, &[]),
+            1,
+            "B's offset"
+        );
+        assert_eq!(
+            lines(other_map, &(0.0..=1.5), 101.0, 0.6, false).refresh(&mut s, &[]),
+            1,
+            "B's clip"
+        );
+        // a hidden line is left as it is
+        let a = line_id(&s.key);
+        assert_eq!(
+            lines(other_map, &full, 101.0, 0.6, false).refresh(&mut s, &[a]),
+            1,
+            "B alone"
+        );
+        assert_eq!(
+            lines(other_map, &full, 101.0, 0.6, false).refresh(&mut s, &[]),
+            1,
+            "then A"
+        );
+    }
+
+    #[test]
+    fn a_reload_a_new_b_and_a_swap_clear_the_entries() {
+        let log = test_log();
+        let b = b_log();
+        let mut plot = PlotPanel::default();
+        plot.toggle(roll(), &log);
+        plot.set_b(Some((Arc::clone(&b), -8.0)));
+        let full = 0.0..=20.0;
+        let lines = Lines {
+            map: None,
+            range: &full,
+            width: 100.0,
+            b_offset: Some(-8.0),
+            within_range: true,
+        };
+        let kept = |plot: &PlotPanel| {
+            let s = &plot.selected[0];
+            (s.thinned.is_some(), s.thinned_b.is_some())
+        };
+        assert_eq!(lines.refresh(&mut plot.selected[0], &[]), 2);
+        assert_eq!(kept(&plot), (true, true));
+        plot.set_b(Some((b_log(), -8.0)));
+        assert_eq!(kept(&plot), (true, false), "a new B clears B's");
+        lines.refresh(&mut plot.selected[0], &[]);
+        plot.swap(&b, Arc::new(test_log()), 8.0);
+        assert_eq!(kept(&plot), (false, false), "a swap clears both");
+        lines.refresh(&mut plot.selected[0], &[]);
+        plot.reload(&log);
+        assert_eq!(kept(&plot), (false, false), "a reload clears both");
+    }
+
+    /// The bounds of a zoomed view come back from the plot's memory as they
+    /// were set, so a still view hits, and only a move thins again. A zoom
+    /// takes a few frames to settle: the values fit the view anew, their
+    /// labels can widen or narrow the plot, and the lines are thinned to
+    /// the width of the frame before.
+    #[test]
+    fn a_still_zoomed_view_thins_nothing_again() {
+        let log = test_log();
+        let settings = Settings::default();
+        let mut harness = roll_plot(&log, &settings);
+        let misses = harness.state().0.misses;
+        PlotPanel::zoom_to(&harness.ctx, 2.2..=2.6);
+        harness.run_steps(3);
+        let zoomed = harness.state().0.misses;
+        assert!(zoomed > misses, "the new view was thinned");
+        harness.step();
+        harness.step();
+        assert_eq!(harness.state().0.misses, zoomed, "the view holds");
+        PlotPanel::zoom_to(&harness.ctx, 2.3..=2.7);
+        harness.step();
+        assert!(harness.state().0.misses > zoomed, "a pan thins again");
+    }
+
+    /// A line hidden through the legend is not thinned when the view
+    /// moves, and its entry stays in the legend to show it again.
+    #[test]
+    fn a_hidden_line_is_not_thinned_and_its_legend_entry_stays() {
+        let log = test_log();
+        let settings = Settings::default();
+        let mut harness = roll_plot(&log, &settings);
+        harness.state_mut().0.set_b(Some((b_log(), -8.0)));
+        harness.run();
+        let id = Id::new(PLOT_ID);
+        let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        memory.hidden_items.insert(line_id(&roll()));
+        memory.store(&harness.ctx, id);
+        harness.run();
+        assert_eq!(harness.state().0.hidden, [line_id(&roll())]);
+        // with nothing kept for it either, as after a swap
+        harness.state_mut().0.selected[0].thinned = None;
+        let misses = harness.state().0.misses;
+        PlotPanel::zoom_to(&harness.ctx, 2.2..=2.6);
+        harness.step();
+        assert_eq!(harness.state().0.misses, misses + 1, "B's line alone");
+        assert!(harness.state().0.selected[0].thinned.is_none());
+        harness.step();
+        assert_eq!(harness.state().0.hidden, [line_id(&roll())], "still hidden");
+        let frame = *transform(&harness).frame();
+        assert!(
+            harness
+                .get_all_by_label("ATT.Roll (deg)")
+                .any(|node| frame.contains(node.rect().center())),
+            "the legend still names the hidden line"
+        );
+        // shown again, it is thinned for the view it missed
+        let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
+        memory.hidden_items.clear();
+        memory.store(&harness.ctx, id);
+        harness.step();
+        assert_eq!(harness.state().0.misses, misses + 2);
+        assert!(harness.state().0.hidden.is_empty());
+    }
+
+    /// Numbers in `0..1` from a fixed seed.
+    fn random(seed: u64) -> impl FnMut() -> f64 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as f64 / f64::from(1u32 << 31)
+        }
+    }
+
+    /// Samples at a jittered rate with random values and a spike every so
+    /// often; with `sparse_half`, the second half a hundred times sparser,
+    /// as a field logged at 400 Hz then 4 Hz is.
+    fn jittered(n: usize, seed: u64, sparse_half: bool) -> Series {
+        let mut next = random(seed);
+        let mut x = 0.0;
+        let mut xs = Vec::with_capacity(n);
+        let mut ys = Vec::with_capacity(n);
+        for i in 0..n {
+            let step = if sparse_half && i >= n / 2 {
+                100.0
+            } else {
+                1.0
+            };
+            x += (0.5 + next()) * step;
+            xs.push(x);
+            let spike = if i % 997 == 0 { 50.0 } else { 1.0 };
+            ys.push((next() * 2.0 - 1.0) * spike);
+        }
+        Series { xs, ys }
+    }
+
+    /// Read through the blocks, a thinning gives the plain walk's points
+    /// to the bit, whatever the view, the width or the rate: the same
+    /// buckets, each bucket's extremes exact, ties to the first.
+    #[test]
+    fn the_blocks_give_the_walk_s_points_to_the_bit() {
+        let identity = |y| y;
+        for s in [jittered(50_000, 7, false), jittered(50_000, 11, true)] {
+            let summary = Summary::new(&s.ys);
+            let n = s.xs.len();
+            let last = *s.xs.last().unwrap();
+            let mut next = random(3);
+            let mut read_by_blocks = 0;
+            for _ in 0..60 {
+                let (a, b) = (next() * last, next() * last);
+                let range = a.min(b)..=a.max(b);
+                let width = 1.0 + (next() * 400.0).floor() as f32;
+                let plain = decimate(&s.xs, &s.ys, &range, width, identity);
+                let summed = decimate_with(&s.xs, &s.ys, Some(&summary), &range, width, identity);
+                assert_eq!(summed, plain, "{range:?} at {width}");
+                // thinned at all: more samples in range than points kept
+                let in_range = s.xs.partition_point(|x| x <= range.end())
+                    - s.xs.partition_point(|x| x < range.start());
+                if in_range > 2 * (width as usize) + 2 {
+                    read_by_blocks += 1;
+                    assert!(summed.len() <= 2 * (width as usize) + 2);
+                }
+            }
+            assert!(read_by_blocks >= 50, "{read_by_blocks} views were thinned");
+            // spans with partial blocks at either end, over the buckets
+            // themselves
+            for (lo, hi) in [(0, n), (37, n - 51), (1000, 9000), (5, 20), (16, 48)] {
+                for buckets in [1, 7, 50, 156, 2000] {
+                    let mut ends = bucket_ends(&s.xs[lo..hi], buckets);
+                    for end in &mut ends {
+                        *end += lo;
+                    }
+                    assert_eq!(*ends.last().unwrap(), hi);
+                    let by_blocks =
+                        bucket_points(&s.xs, &s.ys, lo, &ends, Some(&summary), identity);
+                    let by_walk = bucket_points(&s.xs, &s.ys, lo, &ends, None, identity);
+                    assert_eq!(by_blocks, by_walk, "lo {lo} hi {hi} buckets {buckets}");
+                }
+            }
+        }
+        // ties go to the first sample, across blocks and the samples
+        // around them alike
+        let flat = [2.0; 40];
+        let summary = Summary::new(&flat);
+        assert_eq!(extremes(&flat, 3, 40, Some(&summary)), Some((3, 3)));
+        assert_eq!(extremes(&flat, 16, 40, Some(&summary)), Some((16, 16)));
+        assert_eq!(extremes(&flat, 0, 40, Some(&summary)), Some((0, 0)));
+        let mut ys = vec![0.0; 100];
+        ys[20] = 5.0;
+        ys[50] = -1.0;
+        ys[70] = -1.0;
+        ys[90] = 5.0;
+        assert_eq!(
+            extremes(&ys, 0, 100, Some(&Summary::new(&ys))),
+            Some((50, 20))
+        );
+        assert_eq!(
+            extremes(&ys, 60, 100, Some(&Summary::new(&ys))),
+            Some((70, 90))
+        );
+        assert_eq!(extremes(&ys, 7, 7, Some(&Summary::new(&ys))), None);
+    }
+
+    /// The blocks hold the first lowest and first highest of their samples,
+    /// level over level, the last block of each short; and a span is read
+    /// by the largest aligned blocks that fit it.
+    #[test]
+    fn the_summary_s_levels_and_the_blocks_read() {
+        let mut ys = vec![0.0; 40];
+        ys[5] = -3.0;
+        ys[9] = 7.0;
+        ys[20] = -3.0;
+        ys[30] = 9.0;
+        ys[39] = -4.0;
+        let summary = Summary::new(&ys);
+        assert_eq!(summary.levels.len(), 3);
+        assert_eq!(summary.levels[0], [[5, 9], [20, 30], [39, 32]]);
+        assert_eq!(summary.levels[1], [[5, 30], [39, 32]], "the first of a tie");
+        assert_eq!(summary.levels[2], [[39, 30]]);
+        // at 0 with room for 64: the top level; at 0 with room for 40:
+        // 32; at 16: 16, as 32 does not align there; at 32: 16
+        assert_eq!(summary.largest_block_at(0, 64), (2, 64));
+        assert_eq!(summary.largest_block_at(0, 40), (1, 32));
+        assert_eq!(summary.largest_block_at(16, 40), (0, 16));
+        assert_eq!(summary.largest_block_at(32, 48), (0, 16));
+        // the same choice as trying every level from the top down
+        let long = Summary::new(&vec![0.0; 5000]);
+        let top = long.levels.len() - 1;
+        for i in (0..5000_usize).step_by(16) {
+            for end in i + 16..=5000 {
+                let block = |level: &usize| Summary::BASE << level;
+                let tried = (1..=top)
+                    .rev()
+                    .find(|level| i.is_multiple_of(block(level)) && i + block(level) <= end)
+                    .unwrap_or(0);
+                assert_eq!(
+                    long.largest_block_at(i, end),
+                    (tried, block(&tried)),
+                    "{i} {end}"
+                );
+            }
+        }
+        // nothing to read: the first level, no panic
+        assert_eq!(summary.largest_block_at(32, 40), (0, 16));
+        assert_eq!(Summary::new(&[]).largest_block_at(0, 64), (0, 16));
+        assert!(Summary::new(&[]).levels.is_empty());
+        assert_eq!(Summary::new(&[1.0]).levels, [[[0, 0]]]);
+    }
+
+    /// A series carries the blocks of each side, built with the side.
+    #[test]
+    fn a_series_summarizes_both_sides_as_they_are_set() {
+        let log = test_log();
+        let mut plot = PlotPanel::default();
+        plot.toggle(roll(), &log);
+        let s = &plot.selected[0];
+        assert_eq!(s.summary.levels[0].len(), s.data.ys.len().div_ceil(16));
+        assert!(s.summary_b.is_none());
+        plot.set_b(Some((b_log(), -8.0)));
+        let s = &plot.selected[0];
+        let b = s.data_b.as_ref().unwrap();
+        assert_eq!(
+            s.summary_b.as_ref().unwrap().levels[0].len(),
+            b.ys.len().div_ceil(16)
+        );
+        plot.reload(&log);
+        let s = &plot.selected[0];
+        assert!(s.summary_b.is_none());
+        assert_eq!(s.summary.levels[0].len(), s.data.ys.len().div_ceil(16));
+    }
+
     #[test]
     fn a_clipped_line_runs_to_the_edges() {
         let p = |x: f64, y: f64| PlotPoint::new(x, y);
@@ -2534,6 +3313,7 @@ mod tests {
         );
         s.unit = Some(unit.into());
         s.extent_b = extent(ys_b);
+        s.summary_b = Some(Summary::new(&ys_b));
         s.data_b = Some(Series {
             xs,
             ys: ys_b.to_vec(),
@@ -2618,7 +3398,7 @@ mod tests {
     fn b_is_thinned_where_it_shows_and_drawn_on_a_clock() {
         let s = series(20_000);
         // B's 10 s to 11 s drawn at 60 s to 61 s
-        let moved = decimate_moved(&s.xs, &s.ys, &(60.0..=61.0), 800.0, |y| y, 50.0);
+        let moved = decimate_moved(&s.xs, &s.ys, None, &(60.0..=61.0), 800.0, |y| y, 50.0);
         let plain = decimate(&s.xs, &s.ys, &(10.0..=11.0), 800.0, |y| y);
         assert_eq!(moved.len(), plain.len());
         for (m, p) in moved.iter().zip(&plain) {
@@ -2626,7 +3406,7 @@ mod tests {
         }
         assert!(moved[0].x < 60.0 && moved.last().unwrap().x > 61.0);
         // nowhere near: nothing
-        assert!(decimate_moved(&s.xs, &s.ys, &(0.0..=1.0), 800.0, |y| y, 7200.0).is_empty());
+        assert!(decimate_moved(&s.xs, &s.ys, None, &(0.0..=1.0), 800.0, |y| y, 7200.0).is_empty());
     }
 
     #[test]
