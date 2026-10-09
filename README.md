@@ -35,7 +35,7 @@ contributors.
 
 | | |
 |---|---|
-| ![The ground speed over the flight above the parameter table, filtered to WPNAV, with WPNAV_SPEED unfolded to its change](assets/hero/parameters.png) | ![The plot alone, zoomed on one turn of the survey: roll against desired roll with the legend and the readout](assets/hero/survey-turn.png) |
+| ![The ground speed over the flight above the parameter table, filtered to WP_, with WP_SPD unfolded to its change](assets/hero/parameters.png) | ![The plot alone, zoomed on one turn of the survey: roll against desired roll with the legend and the readout](assets/hero/survey-turn.png) |
 | The speed parameter unfolded to its history; a click on its change put the cursor there, where the ground speed rises from 8 to 10 m/s. | One turn of the survey zoomed in: the roll the controller asked for against the roll flown, read out at the cursor. |
 
 ![The demo pair compared: the pitch of both flights lined up at arming,

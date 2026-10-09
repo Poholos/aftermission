@@ -4213,13 +4213,13 @@ mod tests {
                 "ATC_RAT_RLL_P",
                 "LOG_BITMASK",
                 "MIS_TOTAL",
-                "WPNAV_SPEED",
+                "WP_SPD",
             ] {
                 harness.get_by_label_contains(name);
             }
             assert!(harness.query_by_label_contains("FENCE_RADIUS").is_none());
-            // the speed ends at 1000 in both, marked as apart at boot
-            harness.get_by_label("1000 *");
+            // the speed ends at 10 in both, marked as apart at boot
+            harness.get_by_label("10 *");
             // the learned values wait for their toggle
             harness.get_by_label("In one log only (0)");
             assert!(harness.query_by_label_contains("MOT_THST_HOVER").is_none());
@@ -4280,7 +4280,7 @@ mod tests {
         harness.run();
         harness.get_by_label("Changed after boot").click();
         harness.run();
-        harness.get_by_label_contains("WPNAV_SPEED").click();
+        harness.get_by_label_contains("WP_SPD").click();
         harness.run();
         harness.get_by_label_contains("4:10.000").click();
         harness.run();
@@ -4917,7 +4917,7 @@ mod tests {
         app.open_demo(&ctx);
         wait(&mut app, &ctx);
         let fault = event_time(&app, "GPS: unhealthy");
-        let speed_change = event_time(&app, "WPNAV_SPEED 800 -> 1000");
+        let speed_change = event_time(&app, "WP_SPD 8 -> 10");
         let turn = event_time(&app, "Mission: 4 WP");
         // the events list's scroll animates over a few frames
         let mut harness = Harness::builder()
@@ -4959,8 +4959,8 @@ mod tests {
         harness.get_by_label_contains("GPS: resolved");
         shoot(&mut harness, &out, "overview");
 
-        // The speed over the flight above the parameter table on WPNAV,
-        // the speed parameter unfolded to its history and its change
+        // The speed over the flight above the parameter table filtered to
+        // WP_, the speed parameter unfolded to its history and its change
         // clicked, the side panel folded away and the table dragged taller.
         harness.get_by_label_contains("ATT (").click();
         harness.get_by_label_contains("CTUN (").click();
@@ -4974,9 +4974,9 @@ mod tests {
         harness.run();
         harness.get_by_label("Parameters").click();
         harness.run();
-        harness.state_mut().params_mut().set_filter("WPNAV");
+        harness.state_mut().params_mut().set_filter("WP_");
         harness.run();
-        harness.get_by_label("\u{25b8} WPNAV_SPEED").click();
+        harness.get_by_label("\u{25b8} WP_SPD").click();
         harness.run();
         drag_bottom_panel(&mut harness, -120.0);
         harness.get_by_label_contains("14:34:10").click();
