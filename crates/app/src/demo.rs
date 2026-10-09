@@ -16,10 +16,14 @@
 //! from the same field two hours later: armed 12 s sooner after boot, it
 //! flies out to a survey laid 250 m north of A's at the speed A ends on,
 //! in a stronger wind, with no fault, on retuned rate gains and the hover
-//! throttle and ground pressure the autopilot learned since.
+//! throttle and ground pressure the autopilot learned since. For the
+//! retune, PID logging is back on, which A had turned off, so B logs the
+//! rate controllers' and the vertical acceleration's PID loops, `PIDR`,
+//! `PIDP`, `PIDY` and `PIDA`, which A does not.
 //!
-//! The flight path is integrated with sums, products and square roots
-//! only, which every platform rounds the same way, so the record counts
+//! The flight path is integrated with sums, products, quotients and
+//! square roots only, which every platform rounds the same way, so the
+//! record counts
 //! and the event times are the same everywhere. The logged values also
 //! go through the platform's sine, cosine and arc tangent, whose last
 //! bit can differ, so the bytes may not. Within each 10 ms step the
@@ -77,6 +81,13 @@ const SURVEY_ALT: f64 = 50.0;
 const LAND_SWITCH_ALT: f64 = 20.0;
 /// How close to a waypoint counts as reaching it.
 const WP_RADIUS: f64 = 1.0;
+/// Seconds: close to its target the copter closes on it no faster than
+/// the distance over this, so it settles there rather than overshooting
+/// by a hair each step and dithering across it. The cap binds below
+/// `2.0 * ACCEL * SETTLE * SETTLE`, 0.75 m, inside `WP_RADIUS` (checked
+/// below), so it shapes only the hover over home.
+const SETTLE: f64 = 0.5;
+const _: () = assert!(2.0 * ACCEL * SETTLE * SETTLE < WP_RADIUS);
 /// Degrees per second, the turn toward a new heading.
 const YAW_RATE: f64 = 60.0;
 /// The lag of the attitude behind the lean the acceleration asks for.
@@ -217,6 +228,14 @@ const TYPES: [(&str, &str, &str, &str, &str); 17] = [
     ),
 ];
 
+/// The PID loops' messages, which only a flight with PID logging on
+/// writes, defined after the types above; the four share a format.
+const PID_TYPES: [&str; 4] = ["PIDR", "PIDP", "PIDY", "PIDA"];
+const PID_FORMAT: &str = "QffffffffffB";
+const PID_LABELS: &str = "TimeUS,Tar,Act,Err,P,I,D,FF,DFF,Dmod,SRate,Flags";
+const PID_UNITS: &str = "s-----------";
+const PID_MULTIPLIERS: &str = "F-----------";
+
 /// The unit ids the types above use, named as ArduPilot names them.
 const UNITS: [(char, &str); 23] = [
     ('-', ""),
@@ -257,11 +276,19 @@ const MULTIPLIERS: [(char, f32); 8] = [
     ('G', 1e-7),
 ];
 
+/// `LOG_BITMASK`'s bit for the PID loops, `MASK_LOG_PID`.
+const MASK_LOG_PID: u32 = 1 << 12;
+/// The logging bitmask with the PID loops off: 4.7.0's default less
+/// `MASK_LOG_PID`.
+const LOG_BITMASK: u32 = 176_126;
+const _: () = assert!(LOG_BITMASK | MASK_LOG_PID == 180_222);
+
 /// The parameter dump: name, value, default; NaN where the firmware
 /// logs none. Every value invented; the off-default ones are the trims
 /// and offsets a calibration leaves, the battery's setup, the flight
 /// mode switch, the hover throttle the copter learned, the mission's
-/// length and the survey speed.
+/// length, the survey speed, and the logging bitmask, with PID logging
+/// turned off.
 const PARAMS: [(&str, f64, f64); 107] = [
     ("ACRO_RP_RATE", 360.0, 360.0),
     ("ACRO_YAW_P", 4.5, 4.5),
@@ -324,7 +351,8 @@ const PARAMS: [(&str, f64, f64); 107] = [
     ("INS_USE2", 1.0, 1.0),
     ("LAND_SPEED", 50.0, 50.0),
     ("LAND_SPEED_HIGH", 0.0, 0.0),
-    ("LOG_BITMASK", 176_126.0, 176_126.0),
+    // the flight's: `Variant::param`; 4.7.0's default logs the PID loops
+    ("LOG_BITMASK", 176_126.0, 180_222.0),
     ("LOG_DISARMED", 0.0, 0.0),
     ("LOG_FILE_BUFSIZE", 200.0, 200.0),
     // this value and those of MOT_THST_HOVER and WPNAV_SPEED stand for
@@ -404,8 +432,8 @@ impl Flight {
 }
 
 /// What sets the two flights apart, the knobs the script reads. Flight
-/// A's are the constants it has always had, so its arithmetic, and its
-/// log, stay as they were.
+/// A's are the script's own constants, so a knob added for B leaves A's
+/// arithmetic, and its log, as they were.
 struct Variant {
     /// The milliseconds into the GPS week at boot.
     gps_ms_at_boot: u64,
@@ -428,6 +456,9 @@ struct Variant {
     wind: [f64; 3],
     /// The throttle that hovers.
     hover: f64,
+    /// The PID loops are logged, and the dump's `LOG_BITMASK` has the
+    /// PID bit set: see [`Variant::param`].
+    pid_logging: bool,
     /// Values of the parameter dump set apart from A's, besides those
     /// the knobs above set; see [`Variant::param`].
     params: &'static [(&'static str, f64)],
@@ -443,18 +474,32 @@ impl Variant {
 
     /// The dump's value for `name` where the flight sets it: the
     /// mission's items, home, the waypoints and the RTL after them, its
-    /// speed and its hover throttle, as the flight flies them; else where
-    /// `params` sets it apart from A's.
+    /// speed, its hover throttle and the logging bitmask, as the flight
+    /// flies and logs them; else where `params` sets it apart from A's.
     fn param(&self, name: &str) -> Option<f64> {
         match name {
             "MIS_TOTAL" => return Some((self.waypoints() + 1) as f64),
             "WPNAV_SPEED" => return Some(self.cruise * 100.0),
             "MOT_THST_HOVER" => return Some(self.hover),
+            "LOG_BITMASK" => {
+                let pids = if self.pid_logging { MASK_LOG_PID } else { 0 };
+                return Some(f64::from(LOG_BITMASK | pids));
+            }
             _ => {}
         }
         self.params
             .iter()
             .find_map(|&(n, value)| (n == name).then_some(value))
+    }
+
+    /// The value the flight's dump logs for `name`, one of [`PARAMS`].
+    fn dump(&self, name: &str) -> f64 {
+        self.param(name).unwrap_or_else(|| {
+            PARAMS
+                .iter()
+                .find_map(|&(n, value, _)| (n == name).then_some(value))
+                .expect("a parameter of the dump")
+        })
     }
 }
 
@@ -471,6 +516,7 @@ const VARIANT_A: Variant = Variant {
     cruise: 8.0,
     wind: [0.8, 0.25, 0.15],
     hover: HOVER,
+    pid_logging: false,
     params: &[],
     seed: 0x9E37_79B9_7F4A_7C15,
 };
@@ -494,6 +540,7 @@ const VARIANT_B: Variant = Variant {
     cruise: 10.0,
     wind: [1.4, 0.35, 0.25],
     hover: B_HOVER,
+    pid_logging: true,
     params: &[
         ("ATC_RAT_PIT_P", 0.15),
         ("ATC_RAT_RLL_P", 0.15),
@@ -527,6 +574,113 @@ fn waypoint(index: usize, v: &Variant) -> [f64; 2] {
     let leg = (index / 2) as f64;
     let east = if matches!(index % 4, 1 | 2) { LEG } else { 0.0 };
     [v.north + leg * SPACING, east]
+}
+
+/// A PID loop's gains and its integrator's limit.
+#[derive(Clone, Copy)]
+struct Gains {
+    p: f64,
+    i: f64,
+    d: f64,
+    imax: f64,
+}
+
+/// The limit of the rate loops' integrators and the yaw rate's D gain,
+/// which the dump does not log: 4.7.0's defaults.
+const RATE_IMAX: f64 = 0.5;
+const RATE_YAW_D: f64 = 0.0;
+/// The vertical acceleration loop's gains, which the dump does not log
+/// under their 4.7.0 names (`PSC_D_ACC_*`): 4.7.0's defaults for a
+/// copter. The loop works in m/s/s, down-positive.
+const ACCEL_GAINS: Gains = Gains {
+    p: 0.05,
+    i: 0.1,
+    d: 0.0,
+    imax: 0.8,
+};
+/// Seconds, the lag of the flown rate behind the one asked for.
+const LOOP_LAG: f64 = 0.03;
+
+/// How a PID loop's integrator runs, in the air and on the ground.
+#[derive(Clone, Copy)]
+enum Integrator {
+    /// A rate loop's: the error integrated in the air, within the limit,
+    /// and zero on the ground, as Copter resets the rate loops' I terms
+    /// while landed.
+    Integrated,
+    /// The vertical acceleration loop's. 4.7.0 sends the motors the
+    /// hover throttle less the loop's output (`D_update_controller`), so
+    /// in the air its integrator holds what the throttle asks beyond the
+    /// hover throttle, P and D, as `D_init_controller` sets it; on the
+    /// ground, where the landed modes relax it with a zero throttle
+    /// (`D_relax_controller(0)`), the hover throttle.
+    Throttle { hover: f64 },
+}
+
+/// One PID loop as `PIDR`, `PIDP`, `PIDY` or `PIDA` log it, stepped with
+/// the simulation so its lag and integrator run at 100 Hz whatever rate
+/// it is logged at; a record writes it as it stands, so `Err` is always
+/// `Tar` minus `Act` and `P` the gain times `Err`.
+#[derive(Clone, Copy)]
+struct PidLoop {
+    gains: Gains,
+    integrates: Integrator,
+    /// What the loop is asked for and what was flown, noise included.
+    target: f64,
+    actual: f64,
+    /// What was flown, before the noise: the target, lagged.
+    flown: f64,
+    /// The error of the last step on which the copter flew, which the D
+    /// term differences; zero on the ground.
+    last_error: f64,
+    integrator: f64,
+    derivative: f64,
+}
+
+impl PidLoop {
+    fn new(gains: Gains, integrates: Integrator) -> Self {
+        Self {
+            gains,
+            integrates,
+            target: 0.0,
+            actual: 0.0,
+            flown: 0.0,
+            last_error: 0.0,
+            integrator: 0.0,
+            derivative: 0.0,
+        }
+    }
+
+    fn error(&self) -> f64 {
+        self.target - self.actual
+    }
+
+    /// One step toward `target`, `noise` on what is flown, `throttle_in`
+    /// the throttle the climb asks before the lean's boost. On the
+    /// ground the last error is held at zero, so the D term starts afresh
+    /// at the takeoff; the integrator runs as `integrates` says.
+    fn step(&mut self, target: f64, noise: f64, flying: bool, throttle_in: f64) {
+        self.target = target;
+        self.flown += (target - self.flown) * (DT / LOOP_LAG);
+        self.actual = self.flown + noise;
+        let error = self.error();
+        if flying {
+            self.derivative = (error - self.last_error) / DT;
+            self.last_error = error;
+        } else {
+            self.derivative = 0.0;
+            self.last_error = 0.0;
+        }
+        let Gains { p, i, d, imax } = self.gains;
+        self.integrator = match (self.integrates, flying) {
+            (Integrator::Integrated, true) => (self.integrator + i * error * DT).clamp(-imax, imax),
+            (Integrator::Integrated, false) => 0.0,
+            (Integrator::Throttle { hover }, true) => {
+                (hover - throttle_in - p * error - d * self.derivative).clamp(-imax, imax)
+            }
+            (Integrator::Throttle { hover }, false) => hover,
+        };
+    }
 }
 
 /// Where the flight is, for what the step does.
@@ -588,6 +742,11 @@ struct Demo {
     /// The receiver reports a fault.
     fault: bool,
     landed_at: Option<u64>,
+    /// The PID loops, roll, pitch, yaw and the vertical acceleration,
+    /// where the flight logs them, and the noise they draw: a generator
+    /// of their own, so the flight's other records keep their values.
+    pids: Option<[PidLoop; 4]>,
+    pid_noise: Noise,
 }
 
 impl Demo {
@@ -618,6 +777,24 @@ impl Demo {
             used_wh: 0.0,
             fault: false,
             landed_at: None,
+            pids: v.pid_logging.then(|| {
+                let rate = |axis: &str, d: f64| {
+                    let gains = Gains {
+                        p: v.dump(&format!("ATC_RAT_{axis}_P")),
+                        i: v.dump(&format!("ATC_RAT_{axis}_I")),
+                        d,
+                        imax: RATE_IMAX,
+                    };
+                    PidLoop::new(gains, Integrator::Integrated)
+                };
+                [
+                    rate("RLL", v.dump("ATC_RAT_RLL_D")),
+                    rate("PIT", v.dump("ATC_RAT_PIT_D")),
+                    rate("YAW", RATE_YAW_D),
+                    PidLoop::new(ACCEL_GAINS, Integrator::Throttle { hover: v.hover }),
+                ]
+            }),
+            pid_noise: Noise(0xA076_1D64_78BD_642F),
         }
     }
 
@@ -663,7 +840,18 @@ impl Demo {
                 .define(id, name, format, &labels)
                 .expect("the demo's definitions are valid");
         }
+        if self.v.pid_logging {
+            let labels: Vec<&str> = PID_LABELS.split(',').collect();
+            for (id, name) in (Self::FIRST_PID_ID..).zip(PID_TYPES) {
+                self.w
+                    .define(id, name, PID_FORMAT, &labels)
+                    .expect("the demo's definitions are valid");
+            }
+        }
     }
+
+    /// The id of the first PID type, after [`TYPES`].
+    const FIRST_PID_ID: u8 = TYPES.len() as u8 + 1;
 
     /// The units, multipliers and their assignment per type, as a log's
     /// first records.
@@ -689,7 +877,16 @@ impl Demo {
                 ],
             );
         }
-        for (id, (_, _, _, units, multipliers)) in (1u64..).zip(TYPES) {
+        let pid_types = if self.v.pid_logging {
+            PID_TYPES.len()
+        } else {
+            0
+        };
+        let tables = TYPES
+            .iter()
+            .map(|&(_, _, _, units, multipliers)| (units, multipliers))
+            .chain(std::iter::repeat_n((PID_UNITS, PID_MULTIPLIERS), pid_types));
+        for (id, (units, multipliers)) in (1u64..).zip(tables) {
             self.record(
                 "FMTU",
                 &[
@@ -868,7 +1065,27 @@ impl Demo {
             }
         }
         self.attitude();
+        self.pid_loops();
         self.power();
+    }
+
+    /// The PID loops one step on, where the flight logs them: the body
+    /// rates the attitude turned at, in rad/s, and the vertical
+    /// acceleration, in m/s/s and down-positive, as 4.7.0's loops take
+    /// them, with the throttle the climb asks of the vertical one.
+    fn pid_loops(&mut self) {
+        let flying = self.flying();
+        let throttle_in = self.throttle_in();
+        let targets = [self.rates[0], self.rates[1], self.rates[2], -self.vz_acc];
+        let n = &mut self.pid_noise;
+        if let Some(pids) = &mut self.pids {
+            for (pid, (target, spread)) in pids
+                .iter_mut()
+                .zip(targets.into_iter().zip([0.01, 0.01, 0.008, 0.05]))
+            {
+                pid.step(target, n.gauss() * spread, flying, throttle_in);
+            }
+        }
     }
 
     /// At the survey's next waypoint, on to the one after it or home; at
@@ -897,8 +1114,12 @@ impl Demo {
         let dn = target[0] - self.pos[0];
         let de = target[1] - self.pos[1];
         let distance = (dn * dn + de * de).sqrt();
-        // the speed from which the copter can still stop at the target
-        let speed = self.cruise.min((2.0 * ACCEL * distance).sqrt());
+        // the speed from which the copter can still stop at the target,
+        // and settle on it
+        let speed = self
+            .cruise
+            .min((2.0 * ACCEL * distance).sqrt())
+            .min(distance / SETTLE);
         let want = if distance > 1e-6 {
             [dn / distance * speed, de / distance * speed]
         } else {
@@ -979,7 +1200,7 @@ impl Demo {
         } else if !self.flying() {
             SPIN_ARM
         } else {
-            (self.v.hover * (G + self.vz_acc) / G / self.tilt()).clamp(0.1, 0.9)
+            (self.throttle_in() / self.tilt()).clamp(0.1, 0.9)
         };
         self.current = if !self.armed {
             0.8
@@ -991,6 +1212,12 @@ impl Demo {
         // amperes over a step into mAh, and into Wh
         self.used_mah += self.current * DT / 3.6;
         self.used_wh += self.volt() * self.current * DT / 3600.0;
+    }
+
+    /// The throttle the climb asks for in the air, before the boost for
+    /// the lean: the hover throttle, scaled by the vertical acceleration.
+    fn throttle_in(&self) -> f64 {
+        self.v.hover * (G + self.vz_acc) / G
     }
 
     /// The share of the thrust that holds the copter up at its lean,
@@ -1014,6 +1241,7 @@ impl Demo {
         }
         if self.tick.is_multiple_of(10) {
             self.att_record(560);
+            self.pid_records(570);
             self.baro(600);
             self.ctun(640);
             self.rcou(680);
@@ -1191,6 +1419,34 @@ impl Demo {
         let mut values = vec![self.us(offset)];
         values.extend(channels.map(Value::U64));
         self.record("RCOU", &values);
+    }
+
+    /// The PID loops as they stand, where the flight logs them, 5
+    /// microseconds apart from `offset` on.
+    fn pid_records(&mut self, offset: u64) {
+        let Some(pids) = self.pids else {
+            return;
+        };
+        for ((name, pid), at) in PID_TYPES.iter().zip(pids).zip((offset..).step_by(5)) {
+            let error = pid.error();
+            self.record(
+                name,
+                &[
+                    self.us(at),
+                    Value::F64(pid.target),
+                    Value::F64(pid.actual),
+                    Value::F64(error),
+                    Value::F64(pid.gains.p * error),
+                    Value::F64(pid.integrator),
+                    Value::F64(pid.gains.d * pid.derivative),
+                    Value::F64(0.0),
+                    Value::F64(0.0),
+                    Value::F64(1.0),
+                    Value::F64(0.0),
+                    Value::U64(0),
+                ],
+            );
+        }
     }
 
     /// Degrees of latitude and longitude of a point `north` and `east`
@@ -1395,8 +1651,13 @@ mod tests {
             let first = bytes(flight);
             let again = bytes(flight);
             assert!(first.iter().eq(again.iter()), "the bytes differ");
+            // B's PID loops take it past A's 3.5 MB
+            let most = match flight {
+                Flight::A => 3_500_000,
+                Flight::B => 4_000_000,
+            };
             assert!(
-                (2_000_000..3_500_000).contains(&first.len()),
+                (2_000_000..most).contains(&first.len()),
                 "{} bytes",
                 first.len()
             );
@@ -1585,7 +1846,10 @@ mod tests {
             .iter()
             .filter(|p| p.off_default(None) == Some(true))
             .count();
-        assert_eq!(off_default, 16);
+        assert_eq!(off_default, 17);
+        // PID logging turned off, against 4.7.0's default
+        let bitmask = log.params.iter().find(|p| p.name == "LOG_BITMASK").unwrap();
+        assert_eq!(bitmask.off_default(None), Some(true));
         let no_default = log.params.iter().filter(|p| p.default.is_none()).count();
         assert_eq!(no_default, 1, "BARO1_GND_PRESS");
     }
@@ -1787,19 +2051,206 @@ mod tests {
             })
             .map(|(pa, _)| pa.name.as_str())
             .collect();
-        // the retuned gains and the ground pressure, and what the transit,
-        // the speed and the hover throttle set
+        // the retuned gains, the ground pressure and the PID logging, and
+        // what the transit, the speed and the hover throttle set
         assert_eq!(
             differ,
             [
                 "ATC_RAT_PIT_P",
                 "ATC_RAT_RLL_P",
                 "BARO1_GND_PRESS",
+                "LOG_BITMASK",
                 "MIS_TOTAL",
                 "MOT_THST_HOVER",
                 "WPNAV_SPEED"
             ]
         );
         assert!(close(param("MIS_TOTAL").initial.into(), 14.0));
+        // PID logging back at 4.7.0's default
+        assert_eq!(param("LOG_BITMASK").off_default(None), Some(false));
+    }
+
+    /// The series of `log`'s field `field` of `type_name`, a type logged
+    /// as one instance.
+    fn field_series(log: &LoadedLog, type_name: &str, field: &str) -> crate::model::Series {
+        log.series(&SeriesKey {
+            type_name: type_name.into(),
+            field: field.into(),
+            instance: None,
+        })
+        .unwrap()
+    }
+
+    /// When `log`'s mission reached each waypoint, as its "Mission: N WP"
+    /// lines say, and the moment halfway along the leg between the
+    /// second and the third, the first leg east of flight B.
+    fn waypoint_times(log: &LoadedLog) -> (Vec<f64>, f64) {
+        let times: Vec<f64> = log
+            .events
+            .iter()
+            .filter(|e| e.text.starts_with("Mission:") && e.text.ends_with(" WP"))
+            .map(|e| e.time)
+            .collect();
+        let leg = f64::midpoint(times[1], times[2]);
+        (times, leg)
+    }
+
+    #[test]
+    fn flight_b_logs_its_pid_loops_and_a_does_not() {
+        let a = loaded();
+        let b = flight(Flight::B);
+        let series = |type_name: &str, field: &str| field_series(&b, type_name, field);
+        let duration = b.duration().unwrap();
+        for name in PID_TYPES {
+            assert!(a.type_named(name).is_none(), "A logs {name}");
+            let count = b.type_named(name).unwrap().count;
+            assert!((count as f64 / 10.0 - duration).abs() < 1.0, "{name}");
+        }
+        // A's types are the ones it always had
+        assert!(
+            a.types
+                .iter()
+                .all(|t| TYPES.iter().any(|&(name, ..)| name == t.name) || t.name == "FMT"),
+            "{:?}",
+            a.types.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+        // what only B has, as the side panel lists it, the four whole
+        let only: Vec<String> = crate::tree::only_in(&b, &a)
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(only, ["PIDA", "PIDP", "PIDR", "PIDY"], "by name");
+        // each dump's bitmask says whether the PID loops are logged
+        for log in [&a, &b] {
+            let bitmask = log.params.iter().find(|p| p.name == "LOG_BITMASK");
+            let bitmask = f64::from(bitmask.unwrap().last());
+            let pids = close(bitmask, f64::from(LOG_BITMASK | MASK_LOG_PID));
+            assert!(pids || close(bitmask, f64::from(LOG_BITMASK)), "{bitmask}");
+            assert_eq!(pids, log.type_named("PIDR").is_some(), "{}", log.name);
+        }
+        // B's file, its PID records among the streams, in time order
+        assert!(b.timeline.windows(2).all(|w| w[1] >= w[0]));
+
+        // the units and multipliers the tables give them: none but time's
+        let pidr = b.type_named("PIDR").unwrap();
+        let tar = pidr.field("Tar").unwrap();
+        assert_eq!(tar.title(), "Tar");
+        assert_eq!(tar.multiplier, None);
+        assert_eq!(pidr.field("TimeUS").unwrap().title(), "TimeUS (s)");
+
+        // the yaw rate holds the turn's rate, in rad/s, for over a second
+        // after each waypoint, a 90-degree turn taking 1.5 s
+        let turn = YAW_RATE.to_radians();
+        let yaw = series("PIDY", "Tar");
+        let (waypoints, leg) = waypoint_times(&b);
+        assert_eq!(waypoints.len(), WAYPOINTS);
+        for &at in &waypoints {
+            let held = yaw
+                .xs
+                .iter()
+                .zip(&yaw.ys)
+                .filter(|&(&x, &y)| (at..at + 2.5).contains(&x) && (y.abs() - turn).abs() < 1e-5)
+                .count();
+            assert!(held >= 10, "{held} samples at the turn after {at} s");
+        }
+        // and none between turns, halfway along the first leg east
+        let mid = yaw.xs.partition_point(|&x| x < leg);
+        assert!(yaw.ys[mid].abs() < 0.02, "{}", yaw.ys[mid]);
+
+        // the lean's steps spike roll and pitch, on either axis by the
+        // heading, but briefly: never half the turn's rate for half a
+        // second, five samples, which tells them from the yaw
+        for name in ["PIDR", "PIDP"] {
+            let ys = series(name, "Tar").ys;
+            let longest = ys
+                .split(|y| y.abs() <= turn / 2.0)
+                .map(<[f64]>::len)
+                .max()
+                .unwrap_or(0);
+            assert!(longest < 5, "{name}: {longest} samples");
+            let peak = ys.iter().fold(0.0f64, |peak, y| peak.max(y.abs()));
+            assert!(peak > 0.3, "{name}: no spike, {peak}");
+        }
+    }
+
+    #[test]
+    fn flight_b_s_pid_records_hold_together() {
+        let b = flight(Flight::B);
+        let series = |type_name: &str, field: &str| field_series(&b, type_name, field);
+        let (_, leg) = waypoint_times(&b);
+
+        // the vertical acceleration asked for, in m/s/s and down-positive:
+        // the takeoff's climb speeding up at 1 m/s/s from 38 s, until it
+        // reaches 2.5 m/s
+        let accel = series("PIDA", "Tar");
+        let climbing: Vec<f64> = accel
+            .xs
+            .iter()
+            .zip(&accel.ys)
+            .filter(|&(&x, _)| (38.5..40.0).contains(&x))
+            .map(|(_, &y)| y)
+            .collect();
+        assert!(!climbing.is_empty());
+        assert!(
+            climbing.iter().all(|&y| (y + 1.0).abs() < 1e-3),
+            "{climbing:?}"
+        );
+        let mid = accel.xs.partition_point(|&x| x < leg);
+        assert!(accel.ys[mid].abs() < 0.05, "{}", accel.ys[mid]);
+
+        // P is B's retuned roll gain times the error, record by record
+        let gain = f64::from(
+            b.params
+                .iter()
+                .find(|p| p.name == "ATC_RAT_RLL_P")
+                .unwrap()
+                .last(),
+        );
+        assert!(close(gain, f64::from(0.15f32)));
+        let (err, p) = (series("PIDR", "Err").ys, series("PIDR", "P").ys);
+        assert!(err.iter().zip(&p).all(|(e, p)| (p - gain * e).abs() < 1e-6));
+        assert!(err.iter().any(|e| e.abs() > 1e-3), "an error to scale");
+        // and Tar - Act is Err
+        let (tar, act) = (series("PIDR", "Tar").ys, series("PIDR", "Act").ys);
+        assert!(
+            tar.iter()
+                .zip(&act)
+                .zip(&err)
+                .all(|((t, a), e)| (t - a - e).abs() < 1e-6)
+        );
+
+        // the rate loops' integrators rest on the ground, before the
+        // takeoff and after the landing, and work in the air
+        let landed = b
+            .events
+            .iter()
+            .find(|e| e.text == "Land complete")
+            .unwrap()
+            .time;
+        let on_ground = |x: f64| x < 38.0 || x > landed;
+        for name in ["PIDR", "PIDP", "PIDY"] {
+            let i = series(name, "I");
+            assert!(
+                i.xs.iter()
+                    .zip(&i.ys)
+                    .all(|(&x, &y)| !on_ground(x) || close(y, 0.0)),
+                "{name}"
+            );
+            assert!(i.ys.iter().any(|y| y.abs() > 1e-4), "{name}");
+        }
+        // the vertical loop's holds the hover throttle on the ground, and
+        // in the air what the throttle asks beyond it, P and D (none):
+        // in the climb's first seconds, the hover throttle's share of
+        // 1 m/s/s, below the hover throttle
+        let hover = b.params.iter().find(|p| p.name == "MOT_THST_HOVER");
+        let hover = f64::from(hover.unwrap().last());
+        let (i, p) = (series("PIDA", "I"), series("PIDA", "P").ys);
+        for ((&x, &y), &p) in i.xs.iter().zip(&i.ys).zip(&p) {
+            if on_ground(x) {
+                assert!((y - hover).abs() < 1e-6, "{x} s: {y}");
+            } else if (38.5..40.0).contains(&x) {
+                assert!((y + p + hover / G).abs() < 1e-6, "{x} s: {y} and {p}");
+            }
+        }
     }
 }

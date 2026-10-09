@@ -27,8 +27,9 @@ the date included. File > Open demo log opens it, as do the Demo button
 of the empty window and `?demo` on the web page's address: [the demo
 in the browser](https://aftermission.poholos.com/?demo). File > Open demo
 pair opens it beside a second sortie from the same field two hours later,
-flown on retuned gains in a stronger wind, to try comparing two logs: [the
-pair in the browser](https://aftermission.poholos.com/?compare). Map
+flown on retuned gains in a stronger wind with PID logging on, which the
+first does not have, to try comparing two logs: [the pair in the
+browser](https://aftermission.poholos.com/?compare). Map
 tiles © [OpenStreetMap](https://www.openstreetmap.org/copyright)
 contributors.
 
@@ -38,12 +39,12 @@ contributors.
 | The speed parameter unfolded to its history; a click on its change put the cursor there, where the ground speed rises from 8 to 10 m/s. | One turn of the survey zoomed in: the roll the controller asked for against the roll flown, read out at the cursor. |
 
 ![The demo pair compared: the pitch of both flights lined up at arming,
-the second one's line lighter, over the four parameters whose values
+the second one's line lighter, over the five parameters whose values
 differ between them](assets/hero/compare.png)
 
 The demo pair compared: both flights' pitch lined up at arming, the second
 sortie's lighter line leaning further into its stronger wind, read out
-with the difference at the cursor, over the four parameters whose values
+with the difference at the cursor, over the five parameters whose values
 differ between the two.
 
 ## Downloads
@@ -151,11 +152,11 @@ The tool is early. What works today:
   values differ at boot or at the end, with the values the autopilot
   learns by itself from flight to flight, such as the hover throttle, and
   the names only one log has, each added by a toggle of its own. What B
-  logs and A does not, a newer firmware's messages and fields, is listed
-  under A's types as Only in B, to plot from B alone. The map draws B's
-  track beside A's in a lighter orange with a marker of its own, the
-  events list can take B's events in at their places, and a second lane
-  names B's flight modes.
+  logs and A does not, such as a newer firmware's messages and fields or
+  those a logging setting adds, is listed under A's types as Only in B,
+  to plot from B alone. The map draws B's track beside A's in a lighter
+  orange with a marker of its own, the events list can take B's events
+  in at their places, and a second lane names B's flight modes.
 - **Playback**: the bar under the plot plays the log back at 0.25 to 60
   times its pace, 5 at first, steps a second back or forward (ten with
   Shift), and scrubs with its slider; Space, Left, Right, `[` and `]` do

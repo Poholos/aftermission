@@ -4203,12 +4203,18 @@ mod tests {
         with_ui(&mut app, |harness| {
             harness.get_by_label("demo2.bin");
             // the table narrows to the settings apart: the rate gains, the
-            // mission's length, and the survey speed B starts at and A
-            // ends at
-            harness.get_by_label("4 differ");
+            // PID logging B turned back on for the retune, the mission's
+            // length, and the survey speed B starts at and A ends at
+            harness.get_by_label("5 differ");
             harness.get_by_label("Differences").click();
             harness.run();
-            for name in ["ATC_RAT_PIT_P", "ATC_RAT_RLL_P", "MIS_TOTAL", "WPNAV_SPEED"] {
+            for name in [
+                "ATC_RAT_PIT_P",
+                "ATC_RAT_RLL_P",
+                "LOG_BITMASK",
+                "MIS_TOTAL",
+                "WPNAV_SPEED",
+            ] {
                 harness.get_by_label_contains(name);
             }
             assert!(harness.query_by_label_contains("FENCE_RADIUS").is_none());
@@ -4222,19 +4228,38 @@ mod tests {
             harness.run();
             harness.get_by_label_contains("MOT_THST_HOVER");
             harness.get_by_label_contains("BARO1_GND_PRESS");
-            harness.get_by_label("6 differ");
+            harness.get_by_label("7 differ");
             // Differences off takes its additions with it, so the count
             // is what the toggle shows when turned on again
             harness.get_by_label("Differences").click();
             harness.run();
             assert!(harness.query_by_label("Learned values (2)").is_none());
-            harness.get_by_label("4 differ");
+            harness.get_by_label("5 differ");
             harness.get_by_label("Differences").click();
             harness.run();
             harness.get_by_label("Learned values (2)");
-            harness.get_by_label("4 differ");
+            harness.get_by_label("5 differ");
             assert!(harness.query_by_label_contains("MOT_THST_HOVER").is_none());
         });
+
+        // what B logs and A does not, its PID loops, is listed under A's
+        // types, and a tick plots one from B
+        let pidr = app.log_b().unwrap().type_named("PIDR").unwrap().count;
+        with_ui(&mut app, |harness| {
+            harness.get_by_label("Only in B (4)").click();
+            harness.run();
+            harness.get_by_label(&format!("PIDR ({pidr})")).click();
+            harness.run();
+            harness.get_by_label("Tar").click();
+            harness.run();
+            harness.get_by_label("B PIDR.Tar");
+        });
+        assert!(app.plot().is_selected_b(&crate::model::SeriesKey {
+            type_name: "PIDR".into(),
+            field: "Tar".into(),
+            instance: None,
+        }));
+        assert_eq!(app.plot().showing().count(), 0, "B's, no A series");
     }
 
     #[test]
@@ -4988,8 +5013,9 @@ mod tests {
     /// The README's picture of two logs compared, rendered from the demo
     /// pair by the real UI, as [`hero_shots`] renders the others and into
     /// the same folder: the pitch of both flights lined up at arming, B's
-    /// stronger wind leaning it further on the legs, over the parameters
-    /// that differ. The map stays closed, so nothing is downloaded:
+    /// stronger wind leaning it further on the legs, over the five
+    /// parameters that differ. The map stays closed, so nothing is
+    /// downloaded:
     /// `cargo test --release -p aftermission -- --ignored hero_shot_compare`
     #[test]
     #[ignore = "renders a README picture; run on demand"]
@@ -5040,7 +5066,8 @@ mod tests {
         harness.event(egui::Event::PointerGone);
         harness.state_mut().plot.seek(moment);
         harness.run();
-        harness.get_by_label("4 differ");
+        harness.get_by_label("5 differ");
+        harness.get_by_label_contains("LOG_BITMASK");
         shoot(&mut harness, &out, "compare");
     }
 
