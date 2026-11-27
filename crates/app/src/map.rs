@@ -7,7 +7,10 @@
 use dflog::time::TimeBase;
 use egui::{Color32, Painter, Pos2, Rect, Stroke};
 use walkers::sources::OpenStreetMap;
-use walkers::{HttpOptions, HttpTiles, Map, MapMemory, Position, Projector, Tiles, lat_lon};
+use walkers::{
+    HttpOptions, HttpTiles, Map, MapMemory, MercatorProjection, Position, Projection, Projector,
+    Tiles, lat_lon,
+};
 
 use crate::model::{Bounds, LoadedLog, Track, nearest_within};
 use crate::settings::TimeAxis;
@@ -409,7 +412,7 @@ fn within(track: &Track, time: f64) -> Option<usize> {
 /// one point gets the close look.
 fn fit_zoom(bounds: Bounds, size: egui::Vec2) -> f64 {
     // at zoom 0 the world is one 256 px tile, and each level doubles it
-    let corner = |lat: f64, lon: f64| walkers::mercator::project(lat_lon(lat, lon), 0.0);
+    let corner = |lat: f64, lon: f64| MercatorProjection.project(lat_lon(lat, lon), 0.0);
     let a = corner(bounds.north, bounds.west);
     let b = corner(bounds.south, bounds.east);
     let fit = |px: f32, span: f64| {

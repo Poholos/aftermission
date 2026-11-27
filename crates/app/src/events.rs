@@ -620,6 +620,7 @@ mod tests {
         // holds it there while events pass
         harness.event(egui::Event::MouseWheel {
             unit: egui::MouseWheelUnit::Point,
+            source: egui::MouseWheelSource::Wheel,
             delta: egui::vec2(0.0, 10_000.0),
             phase: egui::TouchPhase::Move,
             modifiers: egui::Modifiers::NONE,

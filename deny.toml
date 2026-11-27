@@ -61,4 +61,15 @@ ignore = [
     # window decorations, Linux only. Goes away when winit moves ab_glyph
     # forward; see https://github.com/harfbuzz/ttf-parser/issues/217.
     "RUSTSEC-2026-0192",
+    # `chrono` via dflog -> parquet -> arrow: the Parquet export, native
+    # only. Goes away when arrow moves off chrono; see
+    # https://github.com/chronotope/chrono/issues/1768.
+    "RUSTSEC-2026-0543",
+    # `zvariant`, `zbus_names` and `zvariant_derive` via eframe ->
+    # accesskit_unix -> atspi -> zbus 5: screen-reader support, Linux only.
+    # zbus 6 holds them itself; they go away when accesskit_unix moves to
+    # it. See https://github.com/z-galaxy/zbus/issues/2043.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]

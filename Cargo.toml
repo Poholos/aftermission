@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/app"]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.98"
 authors = ["Ivan Petrouchtchak"]
@@ -16,16 +16,19 @@ publish = false
 # since the browser hands a log over as bytes.
 dflog = { version = "0.2.0", default-features = false }
 
-eframe = { version = "0.36", features = ["persistence"] }
-egui = "0.36"
-egui_plot = "0.37"
-egui_extras = "0.36"
-egui_kittest = "0.36"
-rfd = "0.17"
-walkers = "0.60"
+eframe = { version = "0.37", features = ["persistence"] }
+# The emoji fonts egui bundled by default before 0.37: the transport's
+# glyphs then look alike on every platform and in the browser, and the
+# tests, which load no system fonts, can draw them.
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+egui_plot = "0.38"
+egui_extras = "0.37"
+egui_kittest = "0.37"
+rfd = "0.18"
+walkers = "0.66"
 
 serde = { version = "1.0.229", features = ["derive"] }
-ron = "0.12.2"
+ron = "0.12.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tempfile = "3.27.0"
@@ -33,14 +36,14 @@ tempfile = "3.27.0"
 # The icon: `image` paints it in `examples/icon.rs`, `winresource` embeds
 # it into the Windows executable.
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-winresource = "0.1.31"
+winresource = "0.1.34"
 
 # Browser build only. The file input, the files it yields and their
 # bytes, and the tab's title; for downloads, the blob, its URL and the
 # link that saves it.
-wasm-bindgen-futures = "0.4.79"
-js-sys = "0.3.106"
-web-sys = { version = "0.3.106", features = [
+wasm-bindgen-futures = "0.4.80"
+js-sys = "0.3.107"
+web-sys = { version = "0.3.107", features = [
     "Blob",
     "BlobPropertyBag",
     "Document",
@@ -65,6 +68,8 @@ redundant_lifetimes = "warn"
 trivial_numeric_casts = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_lifetimes = "warn"
+# The app has no `unsafe` of its own; keep it that way (G-UNSAFE-ISOLATED).
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 cargo = { level = "warn", priority = -1 }

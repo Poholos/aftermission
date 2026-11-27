@@ -5,12 +5,13 @@
 //! too, lighter and moved onto A's clock, and the readout reads both.
 
 use std::fmt::Write as _;
+use std::hash::Hash;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use egui::{Align2, Color32, Id, Pos2, Rect, Shape, Stroke, pos2};
 use egui_plot::{
-    AxisHints, Corner, GridMark, HPlacement, Legend, Line, Plot, PlotBounds, PlotGeometry,
+    AxisHints, Corner, GridMark, HPlacement, ItemId, Legend, Line, Plot, PlotBounds, PlotGeometry,
     PlotItem, PlotItemBase, PlotMemory, PlotPoint, PlotPoints, PlotTransform, Span,
 };
 
@@ -300,7 +301,7 @@ pub struct PlotPanel {
     reset_view: bool,
     /// The series hidden through the legend, by the id their line carries,
     /// as of the last frame; they stay out of the readout.
-    hidden: Vec<Id>,
+    hidden: Vec<ItemId>,
     /// A time to bring into view on the next frame.
     pending_seek: Option<f64>,
     /// A seek the events list has yet to bring into view: it may be on
@@ -323,14 +324,25 @@ pub struct PlotPanel {
 /// The plot's id, fixed so its memory can be read back.
 const PLOT_ID: &str = "aftermission_plot";
 
+/// What a series' line is hashed from into the id it carries. The plot
+/// hashes it itself, so the line takes this, not the id.
+fn line_source(key: &SeriesKey) -> impl Hash + '_ {
+    key
+}
+
+/// What a series' line of B's is hashed from into its id.
+fn line_source_b(key: &SeriesKey) -> impl Hash + '_ {
+    (key, "B")
+}
+
 /// The id a series' line carries, which the legend hides it by.
-fn line_id(key: &SeriesKey) -> Id {
-    Id::new(key)
+fn line_id(key: &SeriesKey) -> ItemId {
+    ItemId::new(line_source(key))
 }
 
 /// The id of a series' line of B's, which the legend hides by itself.
-fn line_id_b(key: &SeriesKey) -> Id {
-    Id::new((key, "B"))
+fn line_id_b(key: &SeriesKey) -> ItemId {
+    ItemId::new(line_source_b(key))
 }
 
 /// How much of a series' color B's line keeps: half its opacity.
@@ -477,7 +489,7 @@ impl PlotPanel {
             // B's lines keep their ids from one B to the next, and a pair
             // is set up afresh
             self.show_b_lines = true;
-            let shown: Vec<Id> = self.selected.iter().map(|s| line_id_b(&s.key)).collect();
+            let shown: Vec<ItemId> = self.selected.iter().map(|s| line_id_b(&s.key)).collect();
             self.hidden.retain(|id| !shown.contains(id));
         }
         self.refresh_readout();
@@ -511,8 +523,8 @@ impl PlotPanel {
         self.b = Some(PlotB { log: b, offset });
         // the readout reads the swapped sides until the next frame reads
         // the plot's memory, swapped the same way then
-        let mut hidden: Vec<Id> = self.hidden.iter().map(|id| self.other_side(*id)).collect();
-        hidden.sort_unstable_by_key(Id::value);
+        let mut hidden: Vec<ItemId> = self.hidden.iter().map(|id| self.other_side(*id)).collect();
+        hidden.sort_unstable_by_key(|id| id.value());
         self.hidden = hidden;
         let range = a.time_range();
         let held = |time: f64| match &range {
@@ -631,7 +643,7 @@ impl PlotPanel {
     /// while the view follows the data and shows all of it.
     #[must_use]
     pub fn zoomed_range(&self, ctx: &egui::Context) -> Option<RangeInclusive<f64>> {
-        let memory = PlotMemory::load(ctx, Id::new(PLOT_ID))?;
+        let memory = PlotMemory::load(ctx, Id::unique(PLOT_ID))?;
         (!memory.auto_bounds.x && !self.reset_view).then(|| memory.bounds().range_x())
     }
 
@@ -646,7 +658,7 @@ impl PlotPanel {
     /// has drawn.
     #[cfg(test)]
     pub(crate) fn zoom_to(ctx: &egui::Context, range: RangeInclusive<f64>) {
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let mut memory = PlotMemory::load(ctx, id).expect("the plot has drawn");
         let [_, bottom] = memory.bounds().min();
         let [_, top] = memory.bounds().max();
@@ -665,7 +677,7 @@ impl PlotPanel {
     /// drawn.
     #[cfg(test)]
     pub(crate) fn thin_all(&self, ctx: &egui::Context) -> usize {
-        let Some(memory) = PlotMemory::load(ctx, Id::new(PLOT_ID)) else {
+        let Some(memory) = PlotMemory::load(ctx, Id::unique(PLOT_ID)) else {
             return 0;
         };
         let transform = memory.transform();
@@ -888,7 +900,7 @@ impl PlotPanel {
     /// series whose A line it is, or the reverse; `id` itself where it is
     /// no line of a series on the plot. What a swap does to the hidden
     /// lines, in the readout's set and in the plot's memory alike.
-    fn other_side(&self, id: Id) -> Id {
+    fn other_side(&self, id: ItemId) -> ItemId {
         for s in &self.selected {
             let (a, b) = (line_id(&s.key), line_id_b(&s.key));
             if id == a {
@@ -904,7 +916,7 @@ impl PlotPanel {
     /// Show the lines of B's the legend hid in the plot's memory, which
     /// the legend reads its ticks from.
     fn show_b_lines_in_memory(&self, ctx: &egui::Context) {
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let Some(mut memory) = PlotMemory::load(ctx, id) else {
             return;
         };
@@ -918,7 +930,7 @@ impl PlotPanel {
     /// plot's memory, and move a zoomed view by `offset` onto the new A's
     /// clock; a view that follows the data fits the new A by itself.
     fn swap_in_memory(&self, ctx: &egui::Context, offset: f64) {
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let Some(mut memory) = PlotMemory::load(ctx, id) else {
             return;
         };
@@ -985,10 +997,10 @@ impl PlotPanel {
     /// them only while its legend has an entry, and kept, it would hide
     /// the line again when the series comes back.
     fn sync_hidden(&mut self, ctx: &egui::Context, reset: bool) {
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let mut hidden = Vec::new();
         if !reset && let Some(mut memory) = PlotMemory::load(ctx, id) {
-            let lines: Vec<Id> = self
+            let lines: Vec<ItemId> = self
                 .selected
                 .iter()
                 .flat_map(|s| [line_id(&s.key), line_id_b(&s.key)])
@@ -1001,7 +1013,7 @@ impl PlotPanel {
             }
         }
         // sorted, so the same set always compares equal
-        hidden.sort_unstable_by_key(Id::value);
+        hidden.sort_unstable_by_key(|id| id.value());
         if hidden != self.hidden {
             self.hidden = hidden;
             self.refresh_readout();
@@ -1184,7 +1196,7 @@ impl Lines<'_> {
     /// Thin the sides of `s` that no frame thinned for this range, width
     /// and map yet, and keep them on `s`; a line in `hidden` is left as
     /// it is, since nothing of it is drawn. The count of lines thinned.
-    fn refresh(&self, s: &mut Selected, hidden: &[Id]) -> usize {
+    fn refresh(&self, s: &mut Selected, hidden: &[ItemId]) -> usize {
         let mut misses = 0;
         let key = self.key(s, false);
         if !hidden.contains(&line_id(&s.key))
@@ -1212,7 +1224,7 @@ impl Lines<'_> {
         &self,
         plot_ui: &mut egui_plot::PlotUi<'p>,
         selected: &'p mut [Selected],
-        hidden: &[Id],
+        hidden: &[ItemId],
     ) -> usize {
         let mut misses = 0;
         for s in selected.iter_mut() {
@@ -1232,8 +1244,11 @@ impl Lines<'_> {
     /// its id before it sizes the view or draws, so its points never
     /// matter, but a line with none it drops at once (`PlotUi::line`),
     /// and with it the legend entry that would show the line again.
-    fn draw<'p>(&self, plot_ui: &mut egui_plot::PlotUi<'p>, s: &'p Selected, hidden: &[Id]) {
-        let points = |entry: &'p Option<Thinning>, id: Id| -> &'p [PlotPoint] {
+    fn draw<'p>(&self, plot_ui: &mut egui_plot::PlotUi<'p>, s: &'p Selected, hidden: &[ItemId]) {
+        // The lines come thinned to about two points a pixel, which the
+        // plot would merge into a filled band that leaves a spike faint:
+        // each is drawn as the stroke it is.
+        let points = |entry: &'p Option<Thinning>, id: ItemId| -> &'p [PlotPoint] {
             if hidden.contains(&id) {
                 HIDDEN_STAND_IN
             } else {
@@ -1248,7 +1263,8 @@ impl Lines<'_> {
                     PlotPoints::Borrowed(points(&s.thinned_b, id)),
                 )
                 .color(s.color.gamma_multiply(B_OPACITY))
-                .id(id),
+                .allow_band(false)
+                .id(line_source_b(&s.key)),
             );
         }
         if !s.only_b() {
@@ -1259,7 +1275,8 @@ impl Lines<'_> {
                     PlotPoints::Borrowed(points(&s.thinned, id)),
                 )
                 .color(s.color)
-                .id(id),
+                .allow_band(false)
+                .id(line_source(&s.key)),
             );
         }
     }
@@ -1272,7 +1289,7 @@ impl Lines<'_> {
 /// otherwise the view, `visible`.
 fn lines_range(
     selected: &[Selected],
-    hidden: &[Id],
+    hidden: &[ItemId],
     b_offset: Option<f64>,
     auto_x: bool,
     visible: &RangeInclusive<f64>,
@@ -1295,7 +1312,7 @@ fn lines_range(
 fn readout_at(
     selected: &[Selected],
     cursor: f64,
-    hidden: &[Id],
+    hidden: &[ItemId],
     offset: Option<f64>,
 ) -> Vec<Readout> {
     selected
@@ -1383,13 +1400,17 @@ fn unit(log: &LoadedLog, key: &SeriesKey) -> Option<String> {
 /// The earliest to the latest sample over the series shown, those whose
 /// line ids are in `hidden` left out, as the plot leaves them out of the
 /// bounds it fits.
-fn full_range(selected: &[Selected], hidden: &[Id]) -> Option<RangeInclusive<f64>> {
+fn full_range(selected: &[Selected], hidden: &[ItemId]) -> Option<RangeInclusive<f64>> {
     span(selected, hidden, 0.0, |s| (line_id(&s.key), Some(&s.data)))
 }
 
 /// The earliest to the latest sample of B's lines shown, moved onto A's
 /// clock by `offset`.
-fn full_range_b(selected: &[Selected], hidden: &[Id], offset: f64) -> Option<RangeInclusive<f64>> {
+fn full_range_b(
+    selected: &[Selected],
+    hidden: &[ItemId],
+    offset: f64,
+) -> Option<RangeInclusive<f64>> {
     span(selected, hidden, offset, |s| {
         (line_id_b(&s.key), s.data_b.as_ref())
     })
@@ -1400,9 +1421,9 @@ fn full_range_b(selected: &[Selected], hidden: &[Id], offset: f64) -> Option<Ran
 /// `hidden` or that have no samples left out, moved by `offset`.
 fn span(
     selected: &[Selected],
-    hidden: &[Id],
+    hidden: &[ItemId],
     offset: f64,
-    side: impl Fn(&Selected) -> (Id, Option<&Series>),
+    side: impl Fn(&Selected) -> (ItemId, Option<&Series>),
 ) -> Option<RangeInclusive<f64>> {
     selected
         .iter()
@@ -1810,7 +1831,7 @@ fn new_plot(
         timefmt::clock(time_base, mark.value, mark.step_size)
     };
     let mut plot = Plot::new(PLOT_ID)
-        .id(Id::new(PLOT_ID))
+        .id(Id::unique(PLOT_ID))
         .height(height)
         .legend(Legend::default().position(Corner::LeftTop))
         .x_axis_formatter(x_formatter)
@@ -2404,7 +2425,7 @@ mod tests {
 
     /// The plot's frame on screen and its transform, as last drawn.
     fn transform(harness: &egui_kittest::Harness<'_, (PlotPanel, bool)>) -> PlotTransform {
-        PlotMemory::load(&harness.ctx, Id::new(PLOT_ID))
+        PlotMemory::load(&harness.ctx, Id::unique(PLOT_ID))
             .expect("the plot has drawn")
             .transform()
     }
@@ -2705,7 +2726,7 @@ mod tests {
         );
 
         // zoomed, the view is a range to export
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
         memory.auto_bounds.x = false;
         memory.store(&harness.ctx, id);
@@ -2973,7 +2994,7 @@ mod tests {
         let mut harness = roll_plot(&log, &settings);
         harness.state_mut().0.set_b(Some((b_log(), -8.0)));
         harness.run();
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
         memory.hidden_items.insert(line_id(&roll()));
         memory.store(&harness.ctx, id);
@@ -3656,7 +3677,7 @@ mod tests {
         harness.state_mut().0.set_b(Some((Arc::clone(&b), -8.0)));
         harness.run();
         // A's roll hidden, the view on 2 s to 3 s, the playhead at 2.1 s
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
         memory.hidden_items.insert(line_id(&roll()));
         memory.store(&harness.ctx, id);
@@ -3763,7 +3784,7 @@ mod tests {
         assert_eq!(plot.selected[1].extent_b, Some((50.0, 100.0)));
         // hiding lines through the legend changes nothing of it, on either
         // side, so no other line moves
-        let hidden: Vec<Id> = plot
+        let hidden: Vec<ItemId> = plot
             .selected
             .iter()
             .flat_map(|s| [line_id(&s.key), line_id_b(&s.key)])
@@ -3820,7 +3841,7 @@ mod tests {
         let settings = Settings::default();
         let mut harness = roll_plot(&log, &settings);
         harness.state_mut().0.set_b(Some((b_log(), -8.0)));
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
         memory.hidden_items.insert(line_id(&roll()));
         memory.store(&harness.ctx, id);
@@ -3844,7 +3865,7 @@ mod tests {
             .0
             .set_b(Some((Arc::clone(&first), -8.0)));
         harness.run();
-        let id = Id::new(PLOT_ID);
+        let id = Id::unique(PLOT_ID);
         let mut memory = PlotMemory::load(&harness.ctx, id).unwrap();
         memory.hidden_items.insert(line_id_b(&roll()));
         memory.store(&harness.ctx, id);

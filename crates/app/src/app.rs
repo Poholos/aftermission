@@ -265,6 +265,10 @@ pub struct AftermissionApp {
     /// A log about to be indexed: one the browser read, or the demo.
     #[cfg(any(target_arch = "wasm32", test))]
     armed: Option<Armed>,
+    /// The scopes of the window's `Ui` and the central panel's, as last
+    /// drawn: a panel stores its state under the scope it is shown in.
+    #[cfg(test)]
+    scopes: Option<(egui::Id, egui::Id)>,
 }
 
 impl AftermissionApp {
@@ -1015,6 +1019,8 @@ impl AftermissionApp {
 
     /// The whole window.
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        #[cfg(test)]
+        let window_scope = ui.scope_id();
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         #[cfg(any(target_arch = "wasm32", test))]
@@ -1044,7 +1050,11 @@ impl AftermissionApp {
                     egui::ScrollArea::vertical().show(ui, |ui| self.side_ui(ui));
                 });
         }
-        egui::CentralPanel::default().show(ui, |ui| self.central_ui(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            #[cfg(test)]
+            let _ = self.scopes.replace((window_scope, ui.scope_id()));
+            self.central_ui(ui);
+        });
         self.about_ui(&ctx);
         self.csv_dialog_ui(&ctx);
         self.param_dialog_ui(&ctx);
@@ -1500,7 +1510,8 @@ impl AftermissionApp {
                         egui::Slider::new(&mut time, start..=end)
                             .show_value(false)
                             .trailing_fill(true),
-                    );
+                    )
+                    .on_hover_text("Seek through the log");
                     // a drag pauses while it lasts; a click seeks
                     if slider.drag_started() {
                         self.playback.begin_scrub();
@@ -1902,7 +1913,7 @@ impl AftermissionApp {
         let rect = ctx.content_rect();
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
-            egui::Id::new("drop_overlay"),
+            egui::Id::unique("drop_overlay"),
         ));
         painter.rect_filled(rect, 0.0, Color32::from_black_alpha(140));
         painter.text(
@@ -2429,12 +2440,8 @@ mod tests {
         let mut harness = Harness::builder()
             .with_size(egui::vec2(1400.0, 900.0))
             .build_ui_state(|ui, app: &mut AftermissionApp| app.show(ui), app);
-        let height = |harness: &Harness<'_, AftermissionApp>| {
-            egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new("bottom_panel"))
-                .expect("the bottom panel has drawn")
-                .size()
-                .y
-        };
+        let height =
+            |harness: &Harness<'_, AftermissionApp>| panel_rect(harness, "bottom_panel").height();
         // a table that scrolls does not grow the panel past its default
         harness.run();
         harness.get_by_label_contains("TEST_P000");
@@ -2516,7 +2523,7 @@ mod tests {
         with_ui(&mut app, |harness| {
             harness.get_by_label("File").click();
             harness.run();
-            harness.get_by_label("Export \u{23F5}").hover();
+            harness.get_by_label("Export").hover();
             harness.run();
             assert!(
                 harness
@@ -2532,7 +2539,7 @@ mod tests {
         with_ui(&mut app, |harness| {
             harness.get_by_label("File").click();
             harness.run();
-            harness.get_by_label("Export \u{23F5}").hover();
+            harness.get_by_label("Export").hover();
             harness.run();
             harness
                 .get_by_label("Plotted series as CSV\u{2026}")
@@ -2917,7 +2924,7 @@ mod tests {
             with_ui(app, |harness| {
                 harness.get_by_label("File").click();
                 harness.run();
-                harness.get_by_label("Export \u{23F5}").hover();
+                harness.get_by_label("Export").hover();
                 harness.run();
                 disabled = harness
                     .get_by_label("Whole log as Parquet\u{2026}")
@@ -2975,7 +2982,7 @@ mod tests {
         with_ui(&mut app, |harness| {
             harness.get_by_label("File").click();
             harness.run();
-            harness.get_by_label("Export \u{23F5}").hover();
+            harness.get_by_label("Export").hover();
             harness.run();
             harness.get_by_label("Parameters as .param\u{2026}");
             assert!(
@@ -3024,7 +3031,7 @@ mod tests {
         with_ui(&mut app, |harness| {
             harness.get_by_label("File").click();
             harness.run();
-            harness.get_by_label("Export \u{23F5}").hover();
+            harness.get_by_label("Export").hover();
             harness.run();
             assert!(
                 harness
@@ -3139,7 +3146,7 @@ mod tests {
         let export_items = |harness: &mut Harness<'_>| -> Vec<bool> {
             harness.get_by_label("File").click();
             harness.run_ok();
-            harness.get_by_label("Export \u{23F5}").hover();
+            harness.get_by_label("Export").hover();
             harness.run_ok();
             let mut items = vec![
                 "Plotted series as CSV\u{2026}",
@@ -3953,7 +3960,7 @@ mod tests {
             "Compare with\u{2026}",
             "Open demo log",
             "Open demo pair",
-            "Open recent \u{23F5}",
+            "Open recent",
             "Close B",
         ];
         let enabled = |harness: &mut Harness<'_>| -> Vec<bool> {
@@ -4783,9 +4790,12 @@ mod tests {
         harness.key_press(egui::Key::Space);
         harness.step();
         assert!(playing(&harness));
+        // a menu, and each submenu, shows a frame after it opens
         harness.get_by_label("File").click();
         harness.step();
-        harness.get_by_label("Export \u{23F5}").hover();
+        harness.step();
+        harness.get_by_label("Export").hover();
+        harness.step();
         harness.step();
         harness
             .get_by_label("Plotted series as CSV\u{2026}")
@@ -5286,10 +5296,16 @@ mod tests {
 
     /// Where the panel `id` was drawn, as it stores it: the edges come from
     /// here, since the central panel's margin keeps a panel off the
-    /// window's edge.
+    /// window's edge. A panel stores its state under the scope of the
+    /// `Ui` it is shown in, the window's or the central panel's.
     fn panel_rect(harness: &Harness<'_, AftermissionApp>, id: &str) -> egui::Rect {
-        egui::containers::panel::PanelState::load(&harness.ctx, egui::Id::new(id))
-            .expect("the panel has drawn")
+        let (window, central) = harness.state().scopes.expect("the app has drawn");
+        [window, central]
+            .into_iter()
+            .find_map(|scope| {
+                egui::containers::panel::PanelState::load(&harness.ctx, scope.with(id))
+            })
+            .unwrap_or_else(|| panic!("no panel {id} has drawn in the window or the central panel"))
             .outer_rect
     }
 

@@ -137,6 +137,7 @@ const PLANE_MODES: &[(u8, &str)] = &[
     (24, "Thermal"),
     (25, "Loiter to QLand"),
     (26, "AutoLand"),
+    (27, "Glide"),
 ];
 
 const ROVER_MODES: &[(u8, &str)] = &[
@@ -186,6 +187,8 @@ const BLIMP_MODES: &[(u8, &str)] = &[
     (2, "Velocity"),
     (3, "Loiter"),
     (4, "RTL"),
+    (5, "Auto"),
+    (6, "Hold"),
 ];
 
 #[cfg(test)]
@@ -223,8 +226,12 @@ mod tests {
         assert_eq!(Vehicle::Rover.mode_label(10), "Auto");
         assert_eq!(Vehicle::Copter.mode_label(6), "RTL");
         assert_eq!(Vehicle::Plane.mode_label(11), "RTL");
+        assert_eq!(Vehicle::Plane.mode_label(27), "Glide");
+        assert_eq!(Vehicle::Blimp.mode_label(5), "Auto");
+        assert_eq!(Vehicle::Blimp.mode_label(6), "Hold");
         // gaps in the enumerations and unknown vehicles fall back to the number
         assert_eq!(Vehicle::Copter.mode_label(8), "Mode 8");
+        assert_eq!(Vehicle::Blimp.mode_label(7), "Mode 7");
         assert_eq!(Vehicle::Copter.mode_label(200), "Mode 200");
         assert_eq!(Vehicle::Unknown.mode_label(0), "Mode 0");
         assert_eq!(Vehicle::Unknown.name(), "unknown vehicle");

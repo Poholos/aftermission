@@ -1,6 +1,6 @@
 //! The numbers ArduPilot logs in its `EV` and `ERR` records, and the names
 //! the firmware gives them: the `LogEvent` and `LogErrorSubsystem`
-//! enumerations of `AP_Logger/LogStructure.h`, as of the firmware of 2026.
+//! enumerations of `AP_Logger/AP_Logger.h`, as of the firmware of 2026.
 
 use crate::modes::Vehicle;
 
@@ -57,6 +57,7 @@ pub fn event_name(id: u8) -> Option<&'static str> {
         65 => "Proximity avoidance enabled",
         66 => "Proximity avoidance disabled",
         67 => "Primary GPS changed",
+        // 68 to 70 are retired upstream, but older logs carry them
         68 => "Winch relaxed",
         69 => "Winch length control",
         70 => "Winch rate control",
@@ -65,15 +66,28 @@ pub fn event_name(id: u8) -> Option<&'static str> {
         73 => "Land repositioning active",
         74 => "Standby enabled",
         75 => "Standby disabled",
+        76 => "Max altitude fence enabled",
+        77 => "Max altitude fence disabled",
+        78 => "Circle fence enabled",
+        79 => "Circle fence disabled",
+        80 => "Min altitude fence enabled",
+        81 => "Min altitude fence disabled",
+        82 => "Polygon fence enabled",
+        83 => "Polygon fence disabled",
+        85 => "EKF3 sources set to primary",
+        86 => "EKF3 sources set to secondary",
+        87 => "EKF3 sources set to tertiary",
+        90 => "Primary airspeed changed",
         163 => "Surfaced",
         164 => "Not surfaced",
         165 => "Bottomed",
         166 => "Not bottomed",
+        167 => "EKF compass offsets saved",
         _ => return None,
     })
 }
 
-/// The event's name, or `Event 85` for one without.
+/// The event's name, or `Event 200` for one without.
 #[must_use]
 pub fn event_label(id: u8) -> String {
     event_name(id).map_or_else(|| format!("Event {id}"), str::to_string)
@@ -219,6 +233,11 @@ mod tests {
         assert_eq!(event_label(10), "Armed");
         assert_eq!(event_label(62), "EKF yaw reset");
         assert_eq!(event_label(25), "Home set");
+        assert_eq!(event_label(76), "Max altitude fence enabled");
+        assert_eq!(event_label(85), "EKF3 sources set to primary");
+        assert_eq!(event_label(90), "Primary airspeed changed");
+        assert_eq!(event_label(167), "EKF compass offsets saved");
+        assert_eq!(event_label(84), "Event 84");
         assert_eq!(event_label(200), "Event 200");
         let copter = Vehicle::Copter;
         assert_eq!(error_label(3, 0, copter), "Compass: resolved");
